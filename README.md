@@ -19,6 +19,7 @@ Run commands from the repository root (assumes UNIX-like system for most things)
 ```sh
 scripts/run.sh (run.bat on Windows)
 scripts/test.sh [--filter <substring>] [--rom-source <path-to-nds-or-zip-file>]
+scripts/build-macos.sh (builds a double-clickable .app under .cache/build for macOS play testing)
 ```
 
 All the extracted data and save files stay under `.cache/` in the checkout.

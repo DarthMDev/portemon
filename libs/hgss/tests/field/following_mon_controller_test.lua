@@ -258,6 +258,91 @@ local function driveScriptedWalk(w, direction, speed)
   return vacated
 end
 
+-- One production-ordered ordinary tick: the session advances the player
+-- (which starts the step inside the same update) and the follower observes
+-- and advances afterwards. Answers true on the player's commit tick.
+local function ordinaryTick(w, direction)
+  w.player:updateFixed({ pressedDirection = direction })
+  if w.player.motion == "idle" then
+    return true
+  end
+  w.controller:update()
+  return false
+end
+
+-- Drives one ordinary player step over its whole production epoch, holding
+-- the follower update on the commit tick exactly like the runtime does when
+-- a presented battle claims the field there.
+local function driveOrdinaryStep(w, direction)
+  for _ = 1, 32 do
+    if ordinaryTick(w, direction) then
+      return
+    end
+  end
+  error("the fixture step never committed")
+end
+
+local function settleTrail(w)
+  for _ = 1, 12 do
+    w.controller:update()
+  end
+end
+
+-- A lead swap arriving mid-trail reseats the replacement behind the player:
+-- the presented battle that fainted the leader returns with the follower's
+-- walk one tick short of its commit, and the new follower must neither start
+-- a second tile behind nor catch up by teleporting a whole tile per step.
+function T.lead_swap_mid_walk_reseats_the_replacement_and_keeps_interpolated_steps()
+  local w = world()
+  w.svc:setLead(0, mon("CHIKORITA", 0x12345678))
+  tick(w, 2)
+  local partnerId = assert(w.mgr:partnerId(), "setup installs the partner")
+  driveOrdinaryStep(w, "south")
+  settleTrail(w)
+  local resting = assert(w.mgr:getById(partnerId)):getFieldPosition()
+  Assert.equal(resting.fieldZ, w.player.fieldZ - 1, "setup settles one tile behind the player")
+
+  -- The next step is in flight when the battle takes the field; the walk is
+  -- still owed when the field returns with the next alive mon installed.
+  driveOrdinaryStep(w, "south")
+  w.svc:setLead(1, mon("TOTODILE", 0x55667788))
+  w.controller:update()
+  local swapped = assert(w.mgr:getById(partnerId), "the replacement follower publishes in place")
+  Assert.equal(
+    swapped:getFieldPosition().fieldZ,
+    w.player.fieldZ - 1,
+    "the replacement follower stands behind the player, never a tile further back"
+  )
+
+  -- The following steps trail one tile with the walk's own interpolation:
+  -- the follower never jumps a whole tile between fixed ticks.
+  for _ = 1, 3 do
+    local vacatedZ = w.player.fieldZ
+    local startZ = swapped:getWorldPosition().z
+    local sawIntermediate = false
+    for _ = 1, 32 do
+      local committed = ordinaryTick(w, "south")
+      local worldZ = swapped:getWorldPosition().z
+      Assert.isTrue(
+        math.abs(worldZ - startZ) <= 1,
+        "the follower travels at most one tile per step, never a teleport"
+      )
+      if committed then
+        break
+      end
+      if math.abs(worldZ - startZ) > 0 and math.abs(worldZ - startZ) < 1 then
+        sawIntermediate = true
+      end
+    end
+    Assert.isTrue(sawIntermediate, "the follower walk interpolates between its tiles")
+    settleTrail(w)
+    swapped = assert(w.mgr:getById(partnerId), "the follower survives the trail")
+    Assert.equal(swapped:getFieldPosition().fieldZ, vacatedZ, "the follower settles on the vacated tile")
+    Assert.isTrue(w.controller:isMovementSettled(), "the trail settles before the next step")
+  end
+  w.mgr:dispose()
+end
+
 -- A stationary follower owns no presentation action: idling never starts a
 -- scripted movement, never leaves an in-flight obligation, and never makes
 -- the controller report busy. The partner actor animates through its own
@@ -631,6 +716,66 @@ function T.party_swap_replaces_atomically_and_keeps_pause()
   Assert.equal(w.assets.references[20153] or 0, 0, "the old visual releases after publication")
   Assert.isTrue(w.controller:isMovementSettled(), "swap clears the queue without motion")
   w.controller:setMovementPaused(false)
+  w.mgr:dispose()
+end
+
+-- A coordinate script resets the follower on the player's commit tick,
+-- before the follower's own update commits its trail walk. Settling lands
+-- the walk on its destination; rolling it back would leave the follower a
+-- second tile behind with a permanent one-tile lag.
+function T.reset_on_the_commit_tick_settles_the_walk_on_its_destination()
+  local w = world()
+  w.svc:setLead(0, mon())
+  tick(w, 2)
+  driveOrdinaryStep(w, "south")
+  settleTrail(w)
+  local vacated = { fieldX = w.player.fieldX, fieldZ = w.player.fieldZ }
+  driveOrdinaryStep(w, "south")
+  w.controller:resetMovement()
+  w.controller:update()
+  local position = assert(w.mgr:getById("field:partner")):getFieldPosition()
+  Assert.equal(position.fieldX, vacated.fieldX, "the settled walk lands on the vacated tile")
+  Assert.equal(position.fieldZ, vacated.fieldZ, "the settled walk lands on the vacated tile")
+  Assert.isTrue(w.controller:isMovementSettled(), "the reset leaves no trail obligation")
+  settleTrail(w)
+  position = assert(w.mgr:getById("field:partner")):getFieldPosition()
+  Assert.equal(position.fieldZ, vacated.fieldZ, "no stale anchor replays after the reset")
+  w.mgr:dispose()
+end
+
+-- A lead swap resets the follower the way a map change does: whatever trail
+-- the old lead still owed is dropped and the replacement stands behind the
+-- player. Setup pauses movement so the paused follower lags further back than
+-- one tile, so a replayed backlog would be visible as a stale catch-up.
+function T.lead_swap_from_a_paused_lag_drops_the_owed_trail()
+  local w = world()
+  w.svc:setLead(0, mon("CHIKORITA"))
+  tick(w, 2)
+  w.controller:setMovementPaused(true)
+  stepSouth(w)
+  tick(w, 2)
+  stepSouth(w)
+  tick(w, 2)
+  local actor = assert(w.mgr:getById("field:partner"))
+  Assert.equal(actor:getFieldPosition().fieldZ, 4, "setup: the paused follower lags behind its owed trail")
+
+  w.svc:setLead(1, mon("TOTODILE", 0x55667788))
+  tick(w, 1)
+  actor = assert(w.mgr:getById("field:partner"), "the replacement publishes")
+  Assert.equal(actor.spriteId, 20154, "the new lead visual publishes")
+  Assert.equal(actor:getFieldPosition().fieldX, w.player.fieldX, "the replacement stands behind the player")
+  Assert.equal(actor:getFieldPosition().fieldZ, w.player.fieldZ - 1, "the replacement stands behind the player")
+  Assert.isTrue(w.controller:isMovementSettled(), "the replacement owes no trail")
+
+  w.controller:setMovementPaused(false)
+  tick(w, 30)
+  actor = assert(w.mgr:getById("field:partner"))
+  Assert.equal(actor:getFieldPosition().fieldZ, w.player.fieldZ - 1, "no stale trail replays after the swap")
+  local vacatedZ = w.player.fieldZ
+  driveOrdinaryStep(w, "south")
+  settleTrail(w)
+  actor = assert(w.mgr:getById("field:partner"))
+  Assert.equal(actor:getFieldPosition().fieldZ, vacatedZ, "the next step trails exactly one tile")
   w.mgr:dispose()
 end
 
@@ -1011,6 +1156,61 @@ function T.transition_b_replays_the_remembered_command_instead_of_steering()
   Assert.equal(steered:getFieldPosition().fieldZ, steeringVacated.fieldZ, "steering settles onto the vacated tile")
   Assert.isTrue(steering.controller:isMovementSettled(), "the steering step settles")
   steering.mgr:dispose()
+end
+
+-- A door arrival publishes the follower hidden on the player's tile and the
+-- first trail step owns the reveal. That first step can be driven by a script
+-- in a transition movement mode (the source scenes set the mode right before
+-- walking the player), so the reveal cannot live only in free-follow steering:
+-- here the follower already stands on the vacated tile and never needs to walk
+-- to satisfy the obligation.
+function T.arrival_rejoin_reveals_on_a_transition_mode_trail_step()
+  for _, movementType in ipairs({ "follow_transition_a", "follow_transition_b" }) do
+    local w = world()
+    w.svc:setLead(0, mon())
+    tick(w, 3)
+    local partnerId = assert(w.mgr:partnerId(), "setup installs the partner")
+    w.controller:rejoin("egress")
+    Assert.isFalse(w.mgr:isVisible(partnerId), movementType .. " starts from the hidden arrival state")
+    w.controller:setMovementType(movementType)
+    driveScriptedWalk(w, "south", "normal")
+    Assert.isTrue(
+      w.mgr:isVisible(partnerId),
+      movementType .. " must reveal the hidden arrival on its trail step"
+    )
+    Assert.isTrue(w.controller:isMovementSettled(), movementType .. " settles after the scripted step")
+    w.mgr:dispose()
+  end
+end
+
+-- A committed follower step publishes its destination facts exactly once so
+-- the composition can spawn that step's source terrain responses (tall grass)
+-- at the follower's own tile. The manager owns the publication for every map
+-- object; the partner's placement spec supplies the source shape nibble that
+-- also disturbs the tile behind an east/west step.
+function T.committed_follower_step_publishes_its_destination_facts_once()
+  local w = world()
+  w.svc:setLead(0, mon())
+  tick(w, 3)
+  local partnerId = assert(w.mgr:partnerId(), "setup installs the partner")
+  Assert.isNil(w.mgr:takeCommittedSteps(), "installation commits no step")
+
+  local vacated = driveScriptedWalk(w, "south", "normal")
+  local steps = assert(w.mgr:takeCommittedSteps(), "the completed follower step is observable")
+  local commit
+  for _, step in ipairs(steps) do
+    if step.actorId == partnerId and step.fieldX == vacated.fieldX and step.fieldZ == vacated.fieldZ then
+      commit = step
+    end
+  end
+  Assert.notNil(commit, "the follower committed onto the vacated tile")
+  Assert.equal(commit.mapId, 61)
+  Assert.equal(commit.facing, "south")
+  Assert.equal(commit.visible, true, "the visible partner reports its step")
+  Assert.equal(commit.large, true, "the fixture lead carries a nonzero source shape nibble")
+  Assert.isTrue(type(commit.worldY) == "number", "the committed step carries its world height")
+  Assert.isNil(w.mgr:takeCommittedSteps(), "the observation is consumed exactly once")
+  w.mgr:dispose()
 end
 
 -- An arriving walk start begins the real trail in the same update without

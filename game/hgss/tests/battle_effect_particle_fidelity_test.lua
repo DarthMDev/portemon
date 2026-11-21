@@ -174,6 +174,7 @@ local function productionEnvelope(cache, host)
   local windows = {}
   function windows.drawWindow(_, _, _) end
   return FieldBattlePresentation.new({
+    splRandomState = { state = 0 },
     cacheFs = cache,
     windows = windows,
     text = text,
@@ -246,6 +247,7 @@ local function probeEffectRecord(archivePath, texturePath, archiveIdentity, text
       },
     },
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
 end
 
@@ -413,6 +415,16 @@ function T.production_particle_lease_decodes_staged_records_and_completes()
     audio = audio,
     resources = journaledHolderServices(owned, effect, journal),
     tasks = Factory,
+    splRandomState = { state = 0 },
+    services = {
+      onNativeFrame = function(phase, sourceTick)
+        if phase == "draw" then
+          local BattleParticleSystems = require("libs.hgss.src.presentation.BattleParticleSystems")
+          BattleParticleSystems.stepSourceDrawPhase(scene, sourceTick)
+          scene:stepAnimationPictures(sourceTick)
+        end
+      end,
+    },
   }))
   local handle = assert(player:start(productionPlayback("TACKLE"), effect.program))
   local sawSystem, sawEmitter = false, false
@@ -424,10 +436,12 @@ function T.production_particle_lease_decodes_staged_records_and_completes()
       local emitters = systems[1].simulation.emitters
       if #emitters > 0 then
         sawEmitter = true
+        -- Fresh occurrences default all systems to perspective projection,
+        -- so the emitter takes the perspective (second staged) vector.
         Assert.equal(
           emitters[1].x,
-          BattleParticleLeaseFixture.payload().placements["solo-enemy"][1][1].x,
-          "the emitter takes the defender placement"
+          BattleParticleLeaseFixture.payload().placements["solo-enemy"][1][2].x,
+          "the emitter takes the defender placement under default perspective"
         )
         Assert.equal(player:status(handle), "waiting", "the effects wait holds while the emitter lives")
       end
@@ -513,8 +527,12 @@ function T.cancelled_production_system_releases_every_lease_exactly_once()
   local Factory = effectFactoryModule()
   local scene = sceneWithPair()
   local journal = { acquired = {}, released = {} }
-  local services =
-    { scene = scene, audio = {}, resources = journaledHolderServices(probe.owned, probe.effect, journal) }
+  local services = {
+    scene = scene,
+    audio = {},
+    resources = journaledHolderServices(probe.owned, probe.effect, journal),
+    splRandomState = { state = 0 },
+  }
   local task = assert(
     Factory.create(
       "battle-particle-system",
@@ -555,7 +573,8 @@ function T.failed_texture_rolls_back_the_production_system()
   local Factory = effectFactoryModule()
   local scene = sceneWithPair()
   local journal = { acquired = {}, released = {} }
-  local services = { scene = scene, audio = {}, resources = journaledHolderServices(owned, effect, journal) }
+  local services =
+    { scene = scene, audio = {}, resources = journaledHolderServices(owned, effect, journal), splRandomState = { state = 0 } }
   local built, failure = pcall(
     Factory.create,
     "battle-particle-system",

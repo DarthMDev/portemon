@@ -82,6 +82,12 @@ local T = {
       "battle-effect:SCRATCH",
       "battle-effect:FORESIGHT",
       "battle-effect:DEFENSE_CURL",
+      -- Applied stage changes admit their own stat feedback roots
+      -- (BATTLE_ANIMATION_STAT_BOOST for DEFENSE_CURL, STAT_DROP for
+      -- GROWL, TAIL_WHIP, LEER, and SAND_ATTACK), so both roots stage
+      -- beside the executed move programs instead of wedging pending.
+      "battle-effect:BATTLE_ANIMATION_STAT_BOOST",
+      "battle-effect:BATTLE_ANIMATION_STAT_DROP",
       -- Presented launches demand only their selected leaves: the player
       -- backpic and the lead ball behind every leg. Foe fronts and the
       -- evolution bundle extend this list exactly as journeys name them.
@@ -240,8 +246,13 @@ local function recordingGraphics()
     local canvas = {}
     function canvas.release() end
     function canvas.setFilter(_, _) end
+    function canvas.setWrap(_, _, _) end
     return canvas
   end
+  function graphics.getStencilTest()
+    return "always", 0
+  end
+  function graphics.setStencilTest(_, _) end
   function graphics.newMesh(_, _, _, _)
     local mesh = {}
     function mesh.release() end
@@ -421,6 +432,7 @@ end
 local function bindEnvelope(game, versionId, measurement, overrides)
   local doubles = { audio = recordingAudio(), windows = recordingWindows(), text = recordingText() }
   local options = {
+    splRandomState = { state = 0 },
     cacheFs = CacheFs.forVersion(versionId),
     graphics = uploadCapableGraphics(),
     imagePool = scriptedPool(),
@@ -1452,6 +1464,7 @@ function T.tests.completion_port_rejects_stale_and_replayed_results()
   }
   local measurement = dualMeasurement("completion-identity:dual")
   local screen = BattleScreenState.new({
+    splRandomState = { state = 0 },
     launchId = "launch-completion-identity",
     manifest = manifest,
     model = Model,
@@ -1580,6 +1593,7 @@ function T.tests.pending_facade_forwards_completion_through_the_live_screen()
   )
   local sceneKey = assert(manifest.scenes[1].key, "the staged manifest names its first scene")
   local envelope = Presentation.new({
+    splRandomState = { state = 0 },
     cacheFs = cacheFs,
     windows = recordingWindows(),
     text = recordingText(),
@@ -1803,6 +1817,7 @@ function T.tests.evolution_completion_runs_its_exclusive_lane_to_terminal_restor
   }
   local seals = 0
   local screen = BattleScreenState.new({
+    splRandomState = { state = 0 },
     launchId = "launch-evolution-lane",
     manifest = manifest,
     model = Model,

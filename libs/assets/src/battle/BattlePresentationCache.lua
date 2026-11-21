@@ -110,17 +110,14 @@ BattlePresentationCache.TIMES = { "day", "evening", "night" }
 
 ---@class BattlePresentationCache.EncounterParticleSet
 ---@field startTick integer encounter animation tick the set starts on
----@field seed integer particle random seed
 ---@field emitters table<string, unknown>[] compiled emitter records
 ---@field textures BattlePresentationCache.EncounterParticleTexture[]
 
 ---@class BattlePresentationCache.BallParticleSet
----@field seed integer particle random seed
 ---@field emitters table<string, unknown>[] compiled emitter records
 ---@field textures BattlePresentationCache.EncounterParticleTexture[]
 
 ---@class BattlePresentationCache.EvolutionParticleSet
----@field seed integer particle random seed
 ---@field emitters table<string, unknown>[] retail EvolutionScene emitters, in source order
 ---@field textures BattlePresentationCache.EncounterParticleTexture[] staged texture metadata
 
@@ -146,8 +143,14 @@ BattlePresentationCache.TIMES = { "day", "evening", "night" }
 ---@field clickEmitter integer burst emitter the capture click plays alone and the opening burst skips
 ---@field burstStartTick integer ticks after the ball starts opening until the burst emits
 
+---@class BattlePresentationCache.BallOpening
+---@field playMode string source play mode of the opening animation
+---@field loopStartFrameIdx integer
+---@field frames { drawableKey: string, image: string, width: integer, height: integer, durationTicks: integer, sourceIndices: BattlePresentationCache.SourceIndices }[]
+
 ---@class BattlePresentationCache.BallEntry
----@field frames { drawableKey: string, image: string, width: integer, height: integer, sourceIndices: BattlePresentationCache.SourceIndices }[]
+---@field frames { drawableKey: string, image: string, width: integer, height: integer, durationTicks: integer, sourceIndices: BattlePresentationCache.SourceIndices }[]
+---@field opening BattlePresentationCache.BallOpening
 ---@field fadeColor integer
 ---@field particles BattlePresentationCache.BallParticles|nil
 
@@ -234,6 +237,36 @@ function BattlePresentationCache.globalSourceIndexPath(name)
   assert(type(name) == "string" and name ~= "", "global source-index name is required")
   assert(name:find("/", 1, true) == nil, "global source-index names stay flat: " .. name)
   return ASSET_DIR .. "/" .. name .. ".source-index.rgba8"
+end
+
+---@param slug string party page slug after "party:page/", e.g. "summary"
+---@param layer integer 1 or 2 LoadPageTilemaps tilemap layer
+---@return string cache-relative staged party page layer image path
+function BattlePresentationCache.partyPageImagePath(slug, layer)
+  assert(
+    type(slug) == "string" and slug:match("^[a-z][a-z%-]*$") ~= nil,
+    "party page slugs are path-safe: " .. tostring(slug)
+  )
+  assert(layer == 1 or layer == 2, "party pages stage their two tilemap layers")
+  return BattlePresentationCache.globalImagePath("party-page-" .. slug .. "-" .. layer)
+end
+
+---@param button integer BattlePartyButton order 0-33
+---@param frame integer zero-based staged face frame
+---@param variant string "self" or "partner" mon button variant
+---@return string cache-relative staged party button face image path
+function BattlePresentationCache.partyButtonImagePath(button, frame, variant)
+  assert(
+    type(button) == "number" and button % 1 == 0 and button >= 0 and button <= 33,
+    "party button faces name their button"
+  )
+  assert(
+    type(frame) == "number" and frame % 1 == 0 and frame >= 0 and frame <= 3,
+    "party button faces name their frame"
+  )
+  assert(variant == "self" or variant == "partner", "party button faces name their variant")
+  local suffix = variant == "partner" and "p" or ""
+  return BattlePresentationCache.globalImagePath(("party-button-%d-%d%s"):format(button, frame, suffix))
 end
 
 ---@param resourceKey string semantic resource key
@@ -939,17 +972,26 @@ end
 ---@return boolean true only when every staged frame and particle texture parses
 local function hasBallImageClosure(cacheFs, record)
   local entry = record.entry
-  for _, frame in ipairs(entry.frames) do
-    for _, variant in pairs(frame.sourceIndices.variants) do
-      local pixels = cacheFs:read(variant.path)
-      if type(pixels) ~= "string" or #pixels ~= frame.width * frame.height * 4 then
+  local function cellsComplete(cells)
+    for _, frame in ipairs(cells) do
+      for _, variant in pairs(frame.sourceIndices.variants) do
+        local pixels = cacheFs:read(variant.path)
+        if type(pixels) ~= "string" or #pixels ~= frame.width * frame.height * 4 then
+          return false
+        end
+      end
+      local width, height = PngWriter.completeDimensions(cacheFs:read(frame.image))
+      if width ~= frame.width or height ~= frame.height then
         return false
       end
     end
-    local width, height = PngWriter.completeDimensions(cacheFs:read(frame.image))
-    if width ~= frame.width or height ~= frame.height then
-      return false
-    end
+    return true
+  end
+  if not cellsComplete(entry.frames) then
+    return false
+  end
+  if not cellsComplete(assert(entry.opening, "a staged ball carries its opening animation").frames) then
+    return false
   end
   local particles = entry.particles
   if particles ~= nil then

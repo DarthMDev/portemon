@@ -7,6 +7,7 @@ local FieldPlayer = require("libs.hgss.src.actors.FieldPlayer")
 local FieldPlayerVisual = require("libs.hgss.src.actors.FieldPlayerVisual")
 local FieldTransition = require("libs.hgss.src.transition.FieldTransition")
 local SurfaceResolver = require("libs.hgss.src.world.SurfaceResolver")
+local WarpSystem = require("libs.hgss.src.transition.WarpSystem")
 
 ---@class FieldWorldSwapCoordinator
 ---@field runtime FieldRuntime
@@ -180,6 +181,78 @@ function FieldWorldSwapCoordinator:publishSpecialSpawn(runtime, resolution)
   })
 end
 
+-- Blackout-spawn publication owns the durable heal point the source
+-- field control refreshes on every non-connection map entry
+-- (FieldSystem_InitMapOnEnter via MapHeader_GetSpawnIdForDeathWarp):
+-- entering a compiled death destination (a Pokemon Center interior, the
+-- mother house, and the other listed death maps) records its spawn key
+-- on the travel owner. Any other destination leaves the record
+-- untouched, and a missing cache or travel owner never fails the swap.
+---@param self FieldWorldSwapCoordinator
+---@param runtime table<string, unknown> the live runtime surface (travel, cacheFs)
+---@param resolution table<string, unknown>
+function FieldWorldSwapCoordinator:publishBlackoutSpawn(runtime, resolution)
+  local travel = runtime.fieldTravel
+  if travel == nil or type(travel.setLastHealSpawn) ~= "function" then
+    return
+  end
+  local destinationMap = resolution.destinationMap
+  if type(destinationMap) ~= "table" or type(destinationMap.mapSymbol) ~= "string" then
+    return
+  end
+  local cacheFs = runtime.cacheFs
+  if cacheFs == nil or type(cacheFs.loadLua) ~= "function" then
+    return
+  end
+  local FieldMapDataCache = require("libs.assets.src.field.FieldMapDataCache")
+  local spawnKey = FieldMapDataCache.spawnKeyForDeathMap(cacheFs, destinationMap.mapSymbol)
+  if spawnKey ~= nil then
+    travel:setLastHealSpawn(spawnKey)
+  end
+end
+
+-- Dynamic-warp entrance publication owns the saved dynamic destination the
+-- source refreshes on an arrival whose own anchor warp event is 0x100
+-- (FieldSystem_EnterLocation): the arriving map's anchor tile records the
+-- entrance position, so the next warp through that anchor leaves for the map
+-- the player entered from. The record is the source's map-local tile and the
+-- trigger-time entrance facing (FieldSystem_MapConnection stores
+-- PlayerAvatar_GetFacingDirection when the warp triggers), which the
+-- transition carries on its resolution; the live player has already been
+-- turned by the departure choreography and is never re-read here. Every other
+-- arrival leaves the record untouched, while a qualifying arrival requires the
+-- travel owner and the source entrance state the retail operation always has.
+---@param self FieldWorldSwapCoordinator
+---@param runtime table<string, unknown>
+---@param resolution table<string, unknown>
+function FieldWorldSwapCoordinator:publishDynamicWarpEntrance(runtime, resolution)
+  local destinationWarp = resolution.destinationWarp
+  if type(destinationWarp) ~= "table" or destinationWarp.destinationWarpId ~= WarpSystem.DYNAMIC_WARP_SENTINEL then
+    return
+  end
+  local travel = assert(runtime.fieldTravel, "dynamic warp entrance recording needs the travel owner")
+  assert(
+    type(travel.setDynamicWarp) == "function",
+    "dynamic warp entrance recording needs FieldTravelState.setDynamicWarp"
+  )
+  local sourceMap = assert(resolution.sourceMap, "dynamic warp entrance recording needs the source map")
+  assert(type(sourceMap.mapSymbol) == "string", "dynamic warp entrance recording needs the source map symbol")
+  local sourceWarp = assert(resolution.sourceWarp, "dynamic warp entrance recording needs the source warp record")
+  assert(type(sourceWarp.index) == "number", "dynamic warp entrance recording needs the source warp index")
+  assert(type(sourceWarp.x) == "number", "dynamic warp entrance recording needs the source warp tile")
+  assert(type(sourceWarp.z) == "number", "dynamic warp entrance recording needs the source warp tile")
+  local direction =
+    assert(resolution.sourceFacing, "dynamic warp entrance recording needs the trigger-time source facing")
+  local localX, localZ = FieldCoordinates.fieldToLocal(sourceMap, sourceWarp.x, sourceWarp.z)
+  travel:setDynamicWarp({
+    map = sourceMap.mapSymbol,
+    fieldX = localX,
+    fieldZ = localZ,
+    warpId = sourceWarp.index,
+    direction = direction,
+  })
+end
+
 ---@param self FieldWorldSwapCoordinator
 ---@param resolution table<string, unknown>
 ---@param _ FieldDirection
@@ -188,6 +261,8 @@ function FieldWorldSwapCoordinator:commit(resolution, _, prepared)
   local runtime = self.runtime
   local sourceMap, sourcePlayer = runtime.runtimeMap, runtime.player
   self:publishSpecialSpawn(runtime, resolution)
+  self:publishBlackoutSpawn(runtime, resolution)
+  self:publishDynamicWarpEntrance(runtime, resolution)
   local runtimeMap = resolution.destinationMap
   local physical = (prepared and prepared.physical) or resolution.physical
   local residency = assert(prepared and prepared.residency, "prepared residency transaction required")
@@ -294,12 +369,30 @@ end
 ---@param resolveDestination function
 ---@return FieldTransition
 function FieldWorldSwapCoordinator:createTransition(runtime, doorAt, escalatorAt, resolveDestination)
+  -- The saved dynamic destination: read late through the travel owner so a
+  -- script's SetDynamicWarp between two transitions is always visible.
+  local function savedDynamicWarp()
+    local travel = runtime.fieldTravel
+    if travel == nil or type(travel.dynamicWarp) ~= "function" then
+      return nil
+    end
+    return travel:dynamicWarp()
+  end
+  local transition ---@type FieldTransition
   local function onStart(sourceMap, trigger)
     -- Start destination compilation under the emerging cover. Readiness stays
     -- gated at load_destination, so this early demand never blocks or commits.
-    runtime.mapLoader:requestWarp(sourceMap, trigger.warp)
+    -- The transition resolved the saved destination once at start; the same
+    -- record names a dynamic anchor's destination map.
+    local dynamicWarp = transition.dynamicWarp
+    runtime.mapLoader:requestWarp(sourceMap, trigger.warp, dynamicWarp)
     if runtime.audio then
-      runtime.audio:beginWarp(trigger.warp.destinationMapId)
+      local destination = trigger.warp.destinationMapId
+      if trigger.warp.destinationWarpId == WarpSystem.DYNAMIC_WARP_SENTINEL and dynamicWarp ~= nil then
+        -- The sentinel header names no map: the saved record does.
+        destination = dynamicWarp.map
+      end
+      runtime.audio:beginWarp(destination)
     end
   end
   local function playSound(soundRef)
@@ -389,7 +482,7 @@ function FieldWorldSwapCoordinator:createTransition(runtime, doorAt, escalatorAt
     followingMon:rejoin(reason)
   end
   local follower = { isPresent = followerPresent, recall = followerRecall, rejoin = followerRejoin }
-  return FieldTransition.new({
+  transition = FieldTransition.new({
     loader = runtime.mapLoader,
     prepare = prepare,
     disposePrepared = disposePrepared,
@@ -397,6 +490,7 @@ function FieldWorldSwapCoordinator:createTransition(runtime, doorAt, escalatorAt
     doorAt = doorAt,
     escalatorAt = escalatorAt,
     resolveDestination = resolveDestination,
+    dynamicWarp = savedDynamicWarp,
     onStart = onStart,
     playSound = playSound,
     stopSound = stopSound,
@@ -406,6 +500,7 @@ function FieldWorldSwapCoordinator:createTransition(runtime, doorAt, escalatorAt
     selectPreview = selectPreview,
     follower = follower,
   })
+  return transition
 end
 
 return FieldWorldSwapCoordinator

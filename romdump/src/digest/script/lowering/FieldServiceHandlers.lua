@@ -1,6 +1,6 @@
--- Field service, lifecycle, query, prop-animation, and heal lowerings.
--- They live here so their names never become more file-scoped locals
--- in the main field-handler chunk.
+-- Field service, lifecycle, menu-builder, query, prop-animation, and heal
+-- lowerings. They live here so their names never become more file-scoped
+-- locals in the main field-handler chunk.
 
 local Errors = require("libs.errors.src.Errors")
 local Operands = require("romdump.src.digest.script.lowering.Operands")
@@ -33,6 +33,35 @@ end
 
 function FieldServiceHandlers.strengthFlagAction(ins)
   return FieldServiceHandlers.flagAction(ins, "FLAG_STRENGTH_ACTIVE")
+end
+
+-- ScrCmd_SetTrainerFlag/ClearTrainerFlag/CheckTrainerFlag (36/37/38) read one
+-- ScriptGetVar trainer number into the same numeric event flags as every other
+-- flag command, because the retail trainer flag is TRAINER_FLAG_BASE + trainer
+-- (src/script_manager.c::TrainerFlagSet/Check/Clear). Set and clear are
+-- same-tick writes, and the check publishes that flag's native comparison
+-- state against 1 (ctx->comparisonResult) for the following branch, never a
+-- result variable.
+local function trainerFlagValue(ins)
+  return { value = "trainer_flag_id", trainer = Operands.varRef(ins.operands[1]) }
+end
+
+function FieldServiceHandlers.setTrainerFlag(ins)
+  return { op = "set_flag", flag = trainerFlagValue(ins) }
+end
+
+function FieldServiceHandlers.clearTrainerFlag(ins)
+  return { op = "clear_flag", flag = trainerFlagValue(ins) }
+end
+
+function FieldServiceHandlers.checkTrainerFlag(ins)
+  return { op = "compare", left = { value = "flag_value", flag = trainerFlagValue(ins) }, right = 1 }
+end
+
+-- ScrCmd_NameRival (143) blocks the parent script on the shared field naming
+-- screen and returns the native no-input result to its destination variable.
+function FieldServiceHandlers.nameRival(ins)
+  return { op = "rival_naming", result = Operands.varRef(ins.operands[1]) }
 end
 
 -- ScrCmd_CheckEscortMode reads FLAG_HAVE_FOLLOWER into its result variable.
@@ -123,6 +152,18 @@ end
 -- ScrCmd_Capitalize upper-cases the first character of one message buffer.
 function FieldServiceHandlers.bufferCapitalize(ins)
   return { op = "buffer_capitalize", slot = Operands.operandValue(ins.operands[1]) }
+end
+
+-- ScrCmd_BufferDeptStoreFloorNo reads both operands as source bytes and buffers
+-- the storey's own label: src/message_format.c::BufferDeptStoreFloorNo reads
+-- generated floor-label bank 191, where floor 0 is the basement and floors 1..6
+-- are 1F..6F.
+function FieldServiceHandlers.bufferDeptStoreFloorNo(ins)
+  return {
+    op = "buffer_text",
+    slot = Operands.operandValue(ins.operands[1]),
+    value = { text = "dept_store_floor_no", floor = Operands.operandValue(ins.operands[2]) },
+  }
 end
 
 -- ScrCmd_GiveEgg species, gift-location offset: both operands resolve
@@ -304,7 +345,7 @@ function FieldServiceHandlers.screenShake(ins)
         Operands.operandValue(ins.operands[4]),
       },
       sourceOffset = ins.offset,
-      reason = "ScrCmd_561 variable shake operands are unsupported",
+      reason = "ScrCmd_ScreenShake variable shake operands are unsupported",
     }
   end
   return {
@@ -318,6 +359,26 @@ end
 
 function FieldServiceHandlers.followMonResetMovement(_)
   return { op = "follower_reset_movement" }
+end
+
+function FieldServiceHandlers.followerHopIntoBall(_)
+  return { op = "yield_tick" }
+end
+
+function FieldServiceHandlers.followerMoveToPlayer(_)
+  return { op = "follower_move_to_player" }
+end
+
+function FieldServiceHandlers.gameVersion(ins)
+  return { op = "game_version", result = Operands.varRef(ins.operands[1]) }
+end
+
+function FieldServiceHandlers.setMysteryGiftActive(_)
+  return { op = "set_mystery_gift_active" }
+end
+
+function FieldServiceHandlers.loadEventSoundEffects(_)
+  return { op = "load_event_sound_effects" }
 end
 
 function FieldServiceHandlers.processSoundplate()
@@ -420,6 +481,57 @@ function FieldServiceHandlers.pokemonCenterHeal(ins)
   return { op = "pokemon_center_heal", count = Operands.varRef(ins.operands[1]) }
 end
 
+-- Source money commands (scrcmd_money.c) move the one live profile wallet:
+-- AddMoney and SubMoneyImmediate read a u32 amount, SubMoneyVar and
+-- HasEnoughMoneyVar read their amount through ScriptGetVar, and both money
+-- checks read their result pointer before the amount. ShowMoneyBox carries two
+-- source tile coordinates, while hide and update carry no operand. Every
+-- command returns in the same tick.
+function FieldServiceHandlers.addMoney(ins)
+  return { op = "money_change", action = "add", amount = Operands.operandValue(ins.operands[1]) }
+end
+
+function FieldServiceHandlers.subtractMoneyImmediate(ins)
+  return { op = "money_change", action = "subtract", amount = Operands.operandValue(ins.operands[1]) }
+end
+
+function FieldServiceHandlers.subtractMoneyVar(ins)
+  return { op = "money_change", action = "subtract", amount = Operands.varRef(ins.operands[1]) }
+end
+
+function FieldServiceHandlers.hasEnoughMoneyImmediate(ins)
+  return {
+    op = "money_check",
+    amount = Operands.operandValue(ins.operands[2]),
+    result = Operands.varRef(ins.operands[1]),
+  }
+end
+
+function FieldServiceHandlers.hasEnoughMoneyVar(ins)
+  return {
+    op = "money_check",
+    amount = Operands.varRef(ins.operands[2]),
+    result = Operands.varRef(ins.operands[1]),
+  }
+end
+
+function FieldServiceHandlers.showMoneyBox(ins)
+  return {
+    op = "money_box",
+    action = "show",
+    tileX = Operands.varRef(ins.operands[1]),
+    tileY = Operands.varRef(ins.operands[2]),
+  }
+end
+
+function FieldServiceHandlers.hideMoneyBox()
+  return { op = "money_box", action = "hide" }
+end
+
+function FieldServiceHandlers.updateMoneyBox()
+  return { op = "money_box", action = "update" }
+end
+
 function FieldServiceHandlers.martOpen(kind, selector)
   local step = { op = "mart_open", kind = kind }
   if selector ~= nil then
@@ -458,12 +570,135 @@ function FieldServiceHandlers.martBuy(ins)
   return FieldServiceHandlers.martOpen("standard")
 end
 
+-- ScrCmd_MysteryGift (489) source variants (scrcmd_mystery_gift.c): the
+-- session framing and the waiting-gift query are executable, while the
+-- delivery variants need the Mystery Gift distribution system this product
+-- does not have. BEGIN/END open and close the queued-gift buffer, which
+-- stays empty, so they erase; HAS_GIFT writes through its own operation.
+local MYSTERY_GIFT_BEGIN, MYSTERY_GIFT_HAS_GIFT, MYSTERY_GIFT_END = 0, 1, 7
+
+function FieldServiceHandlers.mysteryGift(ins)
+  local variant = Operands.operandValue(ins.operands[1])
+  if variant == MYSTERY_GIFT_BEGIN or variant == MYSTERY_GIFT_END then
+    return { op = "noop" }
+  end
+  if variant == MYSTERY_GIFT_HAS_GIFT then
+    return { op = "mystery_gift_has_gift", result = Operands.varRef(ins.operands[2]) }
+  end
+  local arguments = {}
+  for index, operand in ipairs(ins.operands) do
+    arguments[index] = Operands.operandValue(operand)
+  end
+  return {
+    op = "unsupported",
+    command = ins.opcode,
+    originalName = "ScrCmd_MysteryGift",
+    arguments = arguments,
+    sourceOffset = ins.offset,
+    reason = "unimplemented part (mystery_gift): Mystery Gift delivery needs its distribution system",
+  }
+end
+
 function FieldServiceHandlers.martAthleteAvailable(ins)
   return { op = "mart_query", kind = "athlete_available", result = Operands.varRef(ins.operands[1]) }
 end
 
 function FieldServiceHandlers.martCardPrefix(ins)
   return { op = "mart_query", kind = "card_prefix", result = Operands.varRef(ins.operands[1]) }
+end
+
+-- ScrCmd_MultichoiceSetAnchorRight reads one immediate selector and mutates the
+-- pending foreground menu builder; the source command returns TRUE, so the
+-- caller waits a source phase before the window is executed.
+function FieldServiceHandlers.multichoiceSetAnchorRight(ins)
+  return { op = "menu_anchor_right", enabled = Operands.operandValue(ins.operands[1]) ~= 0 }
+end
+
+-- ScrCmd_ChangeObjectMovement reads the object id through ScriptGetVar and the
+-- movement selector as an immediate halfword, then reinitializes the object's
+-- own movement. An object the current map does not carry is the source's
+-- intentional no-op, which the runtime keeps distinct from SetObjectMovementType.
+function FieldServiceHandlers.changeObjectMovement(ins)
+  return {
+    op = "set_object_movement_type",
+    actor = Operands.actorRef(ins.operands[1]),
+    movementType = Operands.movementType(ins),
+    changeMovement = true,
+  }
+end
+
+-- ScrCmd_SetObjectFacingAndUpdateDraw reads both operands through ScriptGetVar.
+-- The actor manager's facing is the orientation its draw path samples every
+-- frame, so the facing write is also the source command's immediate draw
+-- refresh; no separate draw request exists.
+function FieldServiceHandlers.setObjectFacingAndUpdateDraw(ins)
+  return {
+    op = "set_object_facing",
+    actor = Operands.actorRef(ins.operands[1]),
+    direction = Operands.directionRef(ins.operands[2]),
+  }
+end
+
+-- ScrCmd_SetDynamicWarp reads map, warp, x, y and direction through
+-- ScriptGetVar into the saved LocalFieldData destination.
+function FieldServiceHandlers.setDynamicWarp(ins)
+  return {
+    op = "set_dynamic_warp",
+    map = Operands.varRef(ins.operands[1]),
+    warpId = Operands.varRef(ins.operands[2]),
+    fieldX = Operands.varRef(ins.operands[3]),
+    fieldZ = Operands.varRef(ins.operands[4]),
+    direction = Operands.directionRef(ins.operands[5]),
+  }
+end
+
+-- ScrCmd_GetDynamicWarpFloorNo answers the saved destination's source floor.
+function FieldServiceHandlers.getDynamicWarpFloorNo(ins)
+  return { op = "get_dynamic_warp_floor", result = Operands.varRef(ins.operands[1]) }
+end
+
+-- ScrCmd_MoveWarp relocates one warp event of the current map.
+function FieldServiceHandlers.moveWarp(ins)
+  return {
+    op = "move_warp_event",
+    warpId = Operands.varRef(ins.operands[1]),
+    fieldX = Operands.varRef(ins.operands[2]),
+    fieldZ = Operands.varRef(ins.operands[3]),
+  }
+end
+
+-- ScrCmd_ElevatorCurFloorBox reads the tile placement as bytes and the floor as
+-- a script variable; the result operand is the variable pointer the window's
+-- lifetime observes, not a value the command writes.
+function FieldServiceHandlers.elevatorCurFloorBox(ins)
+  return {
+    op = "floor_window_show",
+    tileX = Operands.operandValue(ins.operands[1]),
+    tileY = Operands.operandValue(ins.operands[2]),
+    result = Operands.varRef(ins.operands[3]),
+    floor = Operands.varRef(ins.operands[4]),
+  }
+end
+
+function FieldServiceHandlers.elevatorAnim(ins)
+  return {
+    op = "elevator_anim",
+    direction = Operands.varRef(ins.operands[1]),
+    length = Operands.varRef(ins.operands[2]),
+  }
+end
+
+function FieldServiceHandlers.getCurrentHour(ins)
+  return { op = "field_clock_hour", result = Operands.varRef(ins.operands[1]) }
+end
+
+-- ScrCmd_ScriptOverlayCmd only loads or unloads Nintendo DS overlays: the
+-- command has no gameplay effect in this port, where the generated runtime
+-- already carries those providers. Both the load and the unload action, and a
+-- selector outside the source overlay table, lower to the same inert same-tick
+-- step with the original source instruction in its provenance.
+function FieldServiceHandlers.scriptOverlayCmd(_)
+  return { op = "noop" }
 end
 
 return FieldServiceHandlers

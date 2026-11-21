@@ -175,6 +175,9 @@ function FakeGraphics.new(opts)
       canvas.setFilter = function(_, min, mag)
         canvas.filters[#canvas.filters + 1] = { min = min, mag = mag }
       end
+      canvas.setWrap = function(_, horizontal, vertical)
+        canvas.wrap = { horizontal = horizontal, vertical = vertical }
+      end
       canvas.getWidth = function()
         return canvas.width
       end
@@ -268,10 +271,10 @@ function FakeGraphics.new(opts)
     getColor = function()
       return state.color[1], state.color[2], state.color[3], state.color[4]
     end,
-    draw = function(image, quad, x, y, rotation, sx, sy)
+    draw = function(image, quad, x, y, rotation, sx, sy, ox, oy)
       drawCalls = drawCalls + 1
       if type(quad) == "number" then
-        quad, x, y, rotation, sx, sy = nil, quad, x, y, rotation, sx or rotation
+        quad, x, y, rotation, sx, sy, ox, oy = nil, quad, x, y, rotation, sx or rotation, sy, ox
       end
       local record = {
         kind = "draw",
@@ -282,6 +285,8 @@ function FakeGraphics.new(opts)
         rotation = rotation,
         sx = sx,
         sy = sy,
+        ox = ox,
+        oy = oy,
         color = state.color,
       }
       if type(image) == "table" and image.drawMode ~= nil then
@@ -360,6 +365,12 @@ function FakeGraphics.new(opts)
     end,
     setMeshCullMode = function(mode)
       state.cullMode = mode
+    end,
+    getStencilTest = function()
+      return state.stencilMode or "always", state.stencilValue or 0
+    end,
+    setStencilTest = function(mode, value)
+      state.stencilMode, state.stencilValue = mode, value
     end,
     getScissor = function()
       if not state.scissor then

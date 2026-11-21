@@ -51,6 +51,7 @@ local TransitionFamilyFactory = require("libs.hgss.src.transition.TransitionFami
 ---@field _warmFailure string? last attributable idle warmup diagnostic, never raised into field update
 ---@field _manifestDocs table<string, table<string, unknown>> parsed staged documents by cache-relative path
 ---@field _launchManifest table<string, unknown>? shallow per-launch battle view over the verified core
+---@field _portraitSources table<string, table<string, unknown>>? per-selector immutable CPU portrait sources behind single sidecar reads
 ---@field _launchLeafRecords { trainerPictures: table<string, table<string, unknown>>, battleBalls: table<string, table<string, unknown>>, evolution: table<string, unknown>? } per-launch staged leaf entries, released with the launch
 ---@field _measureDisplay fun(): table<string, unknown> live display facts
 ---@field _graphics table<string, unknown>? host graphics namespace enabling GPU upload, nil for data descriptors
@@ -77,6 +78,9 @@ local TransitionFamilyFactory = require("libs.hgss.src.transition.TransitionFami
 ---@field _musicBankIds integer[]? admission snapshot behind the gated music start, refreshed while empty
 ---@field _musicRole string? chosen battle-music symbol behind the exact demand closure
 ---@field _resultMusicPlayed boolean true once the result music swap was attempted for the launch
+---@field _captureAnimationRng (fun(): table<string, unknown>) | nil detached visual-launch capture closure behind the shared seed
+---@field _splRandomState table<string, integer>? borrowed boot stream record shared by one boot
+---@field _animationRngState { state: integer, calls: number }? captured visual-launch generator state behind the shared seed
 ---@field _pool table<string, unknown>? borrowed shared generated-image owner, required once graphics resolve pixels
 ---@field _leases table<string, FieldBattlePresentation.PooledHandle> shared-owner leases by drawable key
 ---@field _warmParticles table<string, FieldBattlePresentation.ParticleEntry[]> encounter particle textures each scene group holding or acquiring pins must carry
@@ -117,6 +121,8 @@ FieldBattlePresentation.MAX_CATCH_UP = 6
 ---@field fieldRenderer table<string, unknown>? field-local native plane compositor
 ---@field fieldCamera fun(): table<string, unknown>? current field camera provider
 ---@field captureFieldLayers fun(): table<string, unknown>? fresh launch-owned native field planes
+---@field captureAnimationRng (fun(): table<string, unknown>) | nil detached visual-launch capture closure behind the shared seed
+---@field splRandomState table<string, integer>? borrowed boot stream record shared by one boot
 ---@field overrides table<string, unknown>? per-instance scene, frame, and case inputs
 
 ---@class FieldBattlePresentation.PooledHandle
@@ -175,7 +181,16 @@ end
 ---@field menus { command: FieldBattlePresentation.MenuSection, moves: FieldBattlePresentation.MenuSection, target: FieldBattlePresentation.MenuSection, twoOption: FieldBattlePresentation.MenuSection, lower: { pulseMask: string } }
 ---@field bag { pages: { image: string, x: integer, y: integer, width: integer, height: integer }[], finger: { image: string, width: integer, height: integer }, cursor: table<string, { image: string, width: integer, height: integer }>, buttons: table<integer, { button: integer, frame: integer, bank: integer, image: string }> }
 ---@field messages { roles: table<string, { font: string }> }
+---@field party FieldBattlePresentation.StagedPartySection
 ---@field audioRoles { wild: string, trainer: string, rival: string, select: string }
+
+--- Retail battle-party wrapper art (battle_party_menu.c LoadPageTilemaps,
+-- GetButtonTilemap, DrawExpBar): the staged page layer pairs, button
+-- faces, and experience-bar tiles this module resolves.
+---@class FieldBattlePresentation.StagedPartySection
+---@field pages { key: string, layers: { image: string, x: integer, y: integer, width: integer, height: integer }[] }[]
+---@field buttons { button: integer, frame: integer, variant: "self"|"partner", image: string }[]
+---@field expTiles { level: integer, image: string }[]
 
 -- The one staged/planning decision. BattlePresentationCache.load answers
 -- either a verified manifest that passed
@@ -345,12 +360,29 @@ local function particleEntries(sceneKey, record)
       local slot = (repeats[setIndex] or {})[
         texture.id --[[@as integer]]
       ]
+      -- Tiled viewports take their compiled header wrap per axis:
+      -- mirrored-repeat quarter tiles mirror to the full viewport, while
+      -- untiled textures keep the shared clamped sampler.
+      local sampler = POOLED_SAMPLER
+      if slot ~= nil and (slot.s or slot.t) then
+        local staged = texture.sampler --[[@as table<string, unknown>?]]
+        local function validWrap(value)
+          return value == "clamp" or value == "repeat" or value == "mirroredrepeat"
+        end
+        if type(staged) == "table" and validWrap(staged.wrapX) and validWrap(staged.wrapY) then
+          local wrapX = slot.s and staged.wrapX or "clamp"
+          local wrapY = slot.t and staged.wrapY or "clamp"
+          sampler = { wrapX = wrapX, wrapY = wrapY, minFilter = "nearest", magFilter = "nearest" }
+        else
+          sampler = REPEAT_SAMPLER
+        end
+      end
       entries[#entries + 1] = {
         key = "scene-particle:" .. sceneKey .. ":" .. setIndex .. ":" .. texture.id,
         path = texture.image,
         set = setIndex,
         texture = texture,
-        sampler = (slot ~= nil and (slot.s or slot.t)) and REPEAT_SAMPLER or POOLED_SAMPLER,
+        sampler = sampler,
       }
     end
   end
@@ -840,17 +872,21 @@ local function checkTrainerPictures(envelope, selectors)
   return true
 end
 
--- Every staged image of one ball entry: its animation frames, then the
--- textures of its seal and burst particle sets.
+-- Every staged image of one ball entry: its throw and opening animation
+-- cells, then the textures of its seal and burst particle sets.
 ---@param entry table<string, unknown> staged ball entry with validated frames
 ---@return string[] paths cache-relative image paths
 local function ballImagePaths(entry)
   local paths = {}
-  for _, frame in
-    ipairs(entry.frames --[[@as table<string, unknown>[] ]])
-  do
-    paths[#paths + 1] = frame.image --[[@as string]]
+  local function addCells(cells)
+    for _, frame in
+      ipairs(cells --[[@as table<string, unknown>[] ]])
+    do
+      paths[#paths + 1] = frame.image --[[@as string]]
+    end
   end
+  addCells(entry.frames)
+  addCells(assert(entry.opening, "a staged ball carries its opening animation").frames)
   local particles = entry.particles --[[@as { seal: table<string, unknown>, burst: table<string, unknown> }?]]
   if particles ~= nil then
     for _, set in ipairs({ particles.seal, particles.burst }) do
@@ -948,6 +984,13 @@ function FieldBattlePresentation.new(opts)
   if opts.summary ~= nil then
     assert(type(opts.summary) == "table", "battle evolution borrows the composed Summary application")
   end
+  if opts.captureAnimationRng ~= nil then
+    assert(type(opts.captureAnimationRng) == "function", "the visual launch seed arrives as a detached capture closure")
+  end
+  assert(
+    opts.splRandomState == nil or type(opts.splRandomState) == "table",
+    "the presented battle envelope borrows the boot stream record"
+  )
   local envelope = setmetatable({
     _cacheFs = opts.cacheFs,
     _text = opts.text,
@@ -986,6 +1029,9 @@ function FieldBattlePresentation.new(opts)
     _musicBankIds = nil,
     _musicRole = nil,
     _resultMusicPlayed = false,
+    _captureAnimationRng = opts.captureAnimationRng,
+    _splRandomState = opts.splRandomState,
+    _animationRngState = nil,
     _fieldRenderer = opts.fieldRenderer,
     _fieldCamera = opts.fieldCamera,
     _captureFieldLayers = opts.captureFieldLayers,
@@ -1010,6 +1056,7 @@ function FieldBattlePresentation.new(opts)
     _launchLeafRecords = { trainerPictures = {}, battleBalls = {}, evolution = nil },
     _pool = opts.imagePool,
     _leases = {},
+    _portraitSources = {},
     _warmParticles = {},
   }, FieldBattlePresentation)
   -- Pool interface validation stays at composition: graphical resolution
@@ -1191,11 +1238,11 @@ end
 -- Resolves one catalog-selected image, tolerating legitimate waits.
 -- Missing reads and pending pool borrows answer nil with no latched
 -- failure; only a reported failure latches. Answers the image on success.
-local function resolveCatalogImage(envelope, graphics, images, failures, cacheFs, key, path)
+local function resolveCatalogImage(envelope, graphics, images, failures, cacheFs, key, path, sampler)
   local image = nil
   local failure = nil
   if envelope._pool ~= nil then
-    image, failure = acquirePooled(envelope, key, path)
+    image, failure = acquirePooled(envelope, key, path, nil, sampler)
   else
     local bytes = cacheFs:read(path)
     if type(bytes) == "string" then
@@ -1259,6 +1306,23 @@ local function uploadEffectTexture(graphics, effectKey, resourceKey, path, paylo
   local textureWidth = width --[[@as integer]]
   local textureHeight = height --[[@as integer]]
   local textureBytes = rgba --[[@as string]]
+  -- Particle quads tile their texture by repeat powers (texRepeat), so the
+  -- handle must wrap instead of clamping: with clamp sampling a 2x2 repeat
+  -- shows only its top-left tile while the remaining viewport clamps to the
+  -- transparent edge. The staged sampler names the hardware wrap per axis:
+  -- a mirrored-repeat quarter-wave must mirror to reconstruct the full wave,
+  -- not repeat its top-left quadrant four times. Payloads without a sampler
+  -- (older caches) keep the repeat borrow; the particle system corrects
+  -- handles from its compiled sampler afterwards.
+  local sampler = type(payload) == "table" and payload.sampler or nil
+  local wrapX, wrapY = "repeat", "repeat"
+  if
+    type(sampler) == "table"
+    and (sampler.wrapX == "clamp" or sampler.wrapX == "repeat" or sampler.wrapX == "mirroredrepeat")
+    and (sampler.wrapY == "clamp" or sampler.wrapY == "repeat" or sampler.wrapY == "mirroredrepeat")
+  then
+    wrapX, wrapY = sampler.wrapX, sampler.wrapY
+  end
   local ok, imageOrErr = pcall(function()
     local pixels = love.image.newImageData(textureWidth, textureHeight)
     local at = 1
@@ -1276,12 +1340,44 @@ local function uploadEffectTexture(graphics, effectKey, resourceKey, path, paylo
     local uploaded = graphics.newImage(pixels)
     assert(uploaded ~= nil, "the graphics driver handed out no image")
     uploaded:setFilter("nearest", "nearest")
+    if type(uploaded.setWrap) == "function" then
+      uploaded:setWrap(wrapX, wrapY)
+    end
     return uploaded
   end)
   if ok and imageOrErr ~= nil then
     return imageOrErr
   end
   return invalid(ok and "empty image handle" or tostring(imageOrErr))
+end
+
+-- Loads one portrait's exact CPU source beside its raster, cached per
+-- selector so preparation reads each sidecar once and host drawing never
+-- touches the disk. A missing or malformed sidecar fails the portrait
+-- with the selector and sidecar path instead of staging guessed pixels.
+---@param envelope FieldBattlePresentation envelope carrying the versioned derived cache
+---@param selector string canonical staged portrait selector
+---@return table<string, unknown>? immutable CPU source record
+---@return string? terminal failure naming the selector and sidecar path
+local function portraitCpuSource(envelope, selector)
+  local cached = envelope._portraitSources
+  if cached == nil then
+    cached = {}
+    envelope._portraitSources = cached
+  end
+  if cached[selector] ~= nil then
+    return cached[selector]
+  end
+  local portraits = stagedDoc(envelope, MonCache.portraitManifestPath())
+  if type(portraits) ~= "table" then
+    return nil, "battle image mon:" .. tostring(selector) .. " source read failed: portrait manifest is missing"
+  end
+  local source, cause = MonCache.loadPortraitSource(envelope._cacheFs, portraits, selector)
+  if source == nil then
+    return nil, "battle image mon:" .. tostring(selector) .. " source read failed: " .. tostring(cause)
+  end
+  cached[selector] = source
+  return source
 end
 
 -- Uploads one staged portrait cell for a canonical portrait selector:
@@ -1339,6 +1435,11 @@ local function uploadPortraitCell(graphics, envelope, selector)
     return { frames = frames }
   end)
   if ok and handleOrErr ~= nil then
+    local source, sourceCause = portraitCpuSource(envelope, selector)
+    if source == nil then
+      return nil, tostring(sourceCause)
+    end
+    handleOrErr.source = source
     return handleOrErr
   end
   local cause = ok and "empty portrait handle" or tostring(handleOrErr)
@@ -1438,8 +1539,16 @@ local function borrowPortraitCell(envelope, graphics, key, selector)
   end
   -- Battler portraits stay launch-owned: pages vary per battle while
   -- the shared owner keeps idle pages resident under its own budget,
-  -- so no envelope pin grows without bound here.
-  envelope._leases[key] = { lease = lease, handle = { frames = frames } }
+  -- so no envelope pin grows without bound here. The handle keeps the
+  -- exact CPU source beside its frames for native copy operations.
+  local source, sourceCause = portraitCpuSource(envelope, selector)
+  if source == nil then
+    return nil,
+      "battle image mon:" .. tostring(selector) .. " " .. tostring(pagePath) .. " upload failed: " .. tostring(
+        sourceCause
+      )
+  end
+  envelope._leases[key] = { lease = lease, handle = { frames = frames, source = source } }
   return envelope._leases[key].handle
 end
 
@@ -2323,8 +2432,7 @@ function FieldBattlePresentation:_preparationServices()
           end
           local particleSets = {}
           for setIndex, set in ipairs(record.encounterParticles) do
-            particleSets[setIndex] =
-              { startTick = set.startTick, seed = set.seed, emitters = set.emitters, textures = {} }
+            particleSets[setIndex] = { startTick = set.startTick, emitters = set.emitters, textures = {} }
           end
           for _, entry in ipairs(particles) do
             local drawable, failure = acquirePooled(envelope, entry.key, entry.path, nil, entry.sampler)
@@ -2338,6 +2446,10 @@ function FieldBattlePresentation:_preparationServices()
               width = entry.texture.width,
               height = entry.texture.height,
               drawable = drawable,
+              -- The staged descriptor's exact coverage flags ride into
+              -- the scene layer: the particle owners preserve them for
+              -- the shared depth/blend classification.
+              alphaUsage = entry.texture.alphaUsage,
             }
           end
           stagedSceneKey = sceneKey
@@ -2463,6 +2575,30 @@ function FieldBattlePresentation:_preparationServices()
         local path = fixedArt(staged, FIXED_ART[key])
         if type(path) == "string" then
           enrollUpload(envelope, path)
+        end
+      end
+      -- Party wrapper backgrounds decode alongside fixed art so opening
+      -- Summary/Check Moves never serializes behind its first drawable:
+      -- each demanded party:page key enrolls both staged layers.
+      local partySection = type(staged.party) == "table" and staged.party or nil
+      local partyPages = type(partySection) == "table" and partySection.pages or nil
+      if type(partyPages) == "table" then
+        local wantedPages = type(demand.partyPages) == "table" and demand.partyPages or {}
+        for _, wantedKey in ipairs(wantedPages) do
+          for _, page in ipairs(partyPages) do
+            if type(page) == "table" and page.key == wantedKey then
+              local layers = page.layers
+              if type(layers) == "table" then
+                for _, layer in ipairs(layers) do
+                  local imagePath = type(layer) == "table" and layer.image or nil
+                  if type(imagePath) == "string" then
+                    enrollUpload(envelope, imagePath)
+                  end
+                end
+              end
+              break
+            end
+          end
         end
       end
       -- Cry and music banks stage through the same provisioner seam so
@@ -2687,6 +2823,47 @@ function FieldBattlePresentation:_preparationServices()
       end
       return drawable
     end
+    -- Battle-party button faces (battle_party_menu.c GetButtonTilemap
+    -- through BuildButtonTilemap): the staged press, selected, and
+    -- disabled patches repaint over the rest page raster. Missing
+    -- staged art keeps the page under the existing pending path.
+    local faceButton, faceFrame = tostring(key):match("^party:button:(%d+):(%d+)$")
+    if faceButton ~= nil then
+      local staged = stagedManifest(envelope._manifest)
+      local party = type(staged) == "table" and staged.party or nil
+      local buttons = type(party) == "table" and party.buttons or nil
+      if type(buttons) == "table" then
+        local button = tonumber(faceButton)
+        local frame = tonumber(faceFrame)
+        for _, entry in ipairs(buttons) do
+          if type(entry) == "table" and entry.button == button and entry.frame == frame and entry.variant == "self" then
+            if type(entry.image) == "string" then
+              return resolveStagedImage(envelope, graphics, images, failures, cacheFs, key, entry.image)
+            end
+            return nil
+          end
+        end
+      end
+      return nil
+    end
+    -- Retail summary experience-bar tiles (battle_party_menu.c
+    -- DrawExpBar): the staged per-level tile repaints its track cell.
+    -- Missing staged art keeps the empty track the page raster carries.
+    local expLevel = tostring(key):match("^party:exp:(%d+)$")
+    if expLevel ~= nil then
+      local staged = stagedManifest(envelope._manifest)
+      local party = type(staged) == "table" and staged.party or nil
+      local tiles = type(party) == "table" and party.expTiles or nil
+      if type(tiles) == "table" then
+        local level = tonumber(expLevel)
+        for _, entry in ipairs(tiles) do
+          if type(entry) == "table" and entry.level == level and type(entry.image) == "string" then
+            return resolveStagedImage(envelope, graphics, images, failures, cacheFs, key, entry.image)
+          end
+        end
+      end
+      return nil
+    end
     -- Catching-tutorial finger art (battle_bag_menu.c
     -- BattleFinger_LoadResources from NARC_a_1_6_4): the staged idle
     -- frame centers on its per-page spot while the tutorial auto-plays.
@@ -2705,7 +2882,7 @@ function FieldBattlePresentation:_preparationServices()
     -- frames center on the focused box corners while the cursor is
     -- active, advanced by tick like BattleCursor_Update. Missing
     -- staged art keeps the rows under the existing pending path.
-    local cursorCorner = tostring(key):match("^battle:cursor%-(tl|tr|bl|br)$")
+    local cursorCorner = tostring(key):match("^battle:cursor%-([tb][lr])$")
     if cursorCorner ~= nil then
       local staged = stagedManifest(envelope._manifest)
       local bag = staged ~= nil and staged.bag or nil
@@ -2720,15 +2897,15 @@ function FieldBattlePresentation:_preparationServices()
     -- rest frames ride the staged page raster): the staged press and
     -- disabled patches repaint the pressed or empty button. Missing
     -- staged art keeps the page under the existing pending path.
-    local faceButton, faceFrame, faceBank = tostring(key):match("^bag:button:(%d+):(%d+):(%d+)$")
-    if faceButton ~= nil then
+    local bagButton, bagFrame, bagBank = tostring(key):match("^bag:button:(%d+):(%d+):(%d+)$")
+    if bagButton ~= nil then
       local staged = stagedManifest(envelope._manifest)
       local bag = staged ~= nil and staged.bag or nil
       local buttons = type(bag) == "table" and bag.buttons or nil
       if type(buttons) == "table" then
-        local button = tonumber(faceButton)
-        local frame = tonumber(faceFrame)
-        local bank = tonumber(faceBank)
+        local button = tonumber(bagButton)
+        local frame = tonumber(bagFrame)
+        local bank = tonumber(bagBank)
         for _, entry in ipairs(buttons) do
           if type(entry) == "table" and entry.button == button and entry.frame == frame and entry.bank == bank then
             if type(entry.image) == "string" then
@@ -2739,6 +2916,103 @@ function FieldBattlePresentation:_preparationServices()
         end
       end
       return nil
+    end
+    -- Retail battle-party page backgrounds (battle_party_menu.c
+    -- LoadPageTilemaps): each staged page pairs two SUB_BG layers that
+    -- composite back-to-front at the pane origin. LoadPageTilemaps loads
+    -- files[0] to the front layer (GF_BG_LYR_SUB_2, priority 2) and
+    -- files[1] to the back layer (GF_BG_LYR_SUB_3, priority 3), so the
+    -- second staged layer (cream background, header bars) paints first
+    -- and the first staged layer (button faces, move panels) paints over
+    -- it. The renderer draws one drawable per wrapper page, so the
+    -- envelope composites both staged layers behind the single
+    -- party:page key in that order. Missing staged art keeps
+    -- the page under the existing pending path. Legacy wrapper ids
+    -- (moves/move_detail) resolve to their dash slugs.
+    local partySlug = tostring(key):match("^party:page/(.+)$")
+    if partySlug ~= nil then
+      if partySlug == "moves" then
+        partySlug = "check-moves"
+      elseif partySlug == "move_detail" then
+        partySlug = "move-detail"
+      end
+      local partyKey = "party:page/" .. partySlug
+      local stagedParty = stagedManifest(envelope._manifest)
+      local partySection = type(stagedParty) == "table" and stagedParty.party or nil
+      local partyPages = type(partySection) == "table" and partySection.pages or nil
+      local pageEntry = nil
+      if type(partyPages) == "table" then
+        for _, page in ipairs(partyPages) do
+          if type(page) == "table" and page.key == partyKey then
+            pageEntry = page
+            break
+          end
+        end
+      end
+      if pageEntry == nil then
+        return nil
+      end
+      local layers = pageEntry.layers
+      if type(layers) ~= "table" or #layers ~= 2 then
+        return nil
+      end
+      local firstImage = type(layers[1]) == "table" and layers[1].image or nil
+      local secondImage = type(layers[2]) == "table" and layers[2].image or nil
+      if type(firstImage) ~= "string" or type(secondImage) ~= "string" then
+        return nil
+      end
+      local firstHandle, firstFailure =
+        resolveStagedImage(envelope, graphics, images, failures, cacheFs, key .. "#layer1", firstImage)
+      if firstHandle == nil then
+        if firstFailure ~= nil then
+          failures[key] = firstFailure
+          return nil, firstFailure
+        end
+        return nil
+      end
+      local secondHandle, secondFailure =
+        resolveStagedImage(envelope, graphics, images, failures, cacheFs, key .. "#layer2", secondImage)
+      if secondHandle == nil then
+        if secondFailure ~= nil then
+          failures[key] = secondFailure
+          return nil, secondFailure
+        end
+        return nil
+      end
+      local composite = { width = 256, height = 192, layers = { firstHandle, secondHandle } }
+      function composite:getDimensions()
+        return 256, 192
+      end
+      local function drawLayer(handle, drawGraphics, x, y, quad, ...)
+        if type(handle) == "table" and type(handle.drawQuad) == "function" then
+          if quad ~= nil then
+            return handle:drawQuad(drawGraphics, quad, x, y, ...)
+          end
+          return handle:draw(drawGraphics, x, y, ...)
+        end
+        local inner = type(handle) == "table" and handle.lease or nil
+        if type(inner) == "table" and type(inner.drawQuad) == "function" then
+          if quad ~= nil then
+            return inner:drawQuad(drawGraphics, quad, x, y, ...)
+          end
+          return inner:draw(drawGraphics, x, y, ...)
+        end
+        local pixels = type(handle) == "table" and (handle.image or inner) or handle
+        if quad ~= nil then
+          return drawGraphics.draw(pixels, quad, x, y, ...)
+        end
+        return drawGraphics.draw(pixels, x, y, ...)
+      end
+      function composite:draw(drawGraphics, x, y, ...)
+        drawLayer(self.layers[2], drawGraphics, x, y, nil, ...)
+        drawLayer(self.layers[1], drawGraphics, x, y, nil, ...)
+      end
+      function composite:drawQuad(drawGraphics, quad, x, y, ...)
+        drawLayer(self.layers[2], drawGraphics, x, y, quad, ...)
+        drawLayer(self.layers[1], drawGraphics, x, y, quad, ...)
+      end
+      images[key] = composite
+      return composite
     end
     -- Production drawables are real owned handles, legitimate waits, or
     -- terminal failures: staged bytes that fail decoding or GPU upload
@@ -2766,6 +3040,95 @@ function FieldBattlePresentation:_preparationServices()
         stagedToken = staged.token
       end
       return resolveStagedImage(envelope, graphics, images, failures, cacheFs, key, path, stagedToken)
+    end
+    local categoryKey = key:match("^battle:move%-category%-icon:([a-z%-]+)$")
+    if categoryKey ~= nil then
+      if moveIconManifest == nil then
+        moveIconManifest = MoveIconCache.loadManifest(cacheFs)
+      end
+      local categories = moveIconManifest.categories --[[@as table<string, table<string, unknown>>]]
+      local categoryVisual = type(categories) == "table" and categories[categoryKey] or nil
+      if type(categoryVisual) ~= "table" then
+        return nil
+      end
+      local categoryArtPath = assert(categoryVisual.image, "the generated move category icon names its staged image") --[[@as string]]
+      local categoryHandle, categoryFailure =
+        resolveStagedImage(envelope, graphics, images, failures, cacheFs, key, categoryArtPath)
+      if categoryHandle == nil then
+        return nil, categoryFailure
+      end
+      local categoryDrawable = {
+        lease = categoryHandle,
+        width = assert(categoryVisual.width, "generated move category icon carries its width"),
+        height = assert(categoryVisual.height, "generated move category icon carries its height"),
+        offset = categoryVisual.offset,
+      }
+      function categoryDrawable:getDimensions()
+        return self.width, self.height
+      end
+      function categoryDrawable:draw(drawGraphics, x, y, ...)
+        if type(self.lease.draw) == "function" then
+          return self.lease:draw(drawGraphics, x, y, ...)
+        end
+        return drawGraphics.draw(self.lease, x, y, ...)
+      end
+      function categoryDrawable:drawQuad(drawGraphics, quad, x, y, ...)
+        if type(self.lease.drawQuad) == "function" then
+          return self.lease:drawQuad(drawGraphics, quad, x, y, ...)
+        end
+        return drawGraphics.draw(self.lease, quad, x, y, ...)
+      end
+      if envelope._pool ~= nil then
+        leases[key].handle = categoryDrawable
+      else
+        images[key] = categoryDrawable
+      end
+      return categoryDrawable
+    end
+    local statusKey = key:match("^battle:status%-icon:([a-z%-]+)$")
+    if statusKey ~= nil then
+      local battleMenus = envelope._battleMenus --[[@as table<string, unknown>?]]
+      local party = type(battleMenus) == "table" and battleMenus.party or nil
+      local partyManifest = type(party) == "table" and party.manifest or nil
+      local visuals = type(partyManifest) == "table" and partyManifest.visuals or nil
+      local statusVisuals = type(visuals) == "table" and visuals.status or nil
+      local statusVisual = type(statusVisuals) == "table" and statusVisuals[statusKey] or nil
+      if type(statusVisual) ~= "table" then
+        return nil
+      end
+      local statusArtPath = assert(statusVisual.image, "the staged party status icon names its image") --[[@as string]]
+      local statusHandle, statusFailure =
+        resolveStagedImage(envelope, graphics, images, failures, cacheFs, key, statusArtPath)
+      if statusHandle == nil then
+        return nil, statusFailure
+      end
+      local statusDrawable = {
+        lease = statusHandle,
+        width = assert(statusVisual.width, "staged party status icon carries its width"),
+        height = assert(statusVisual.height, "staged party status icon carries its height"),
+        offset = statusVisual.offset,
+      }
+      function statusDrawable:getDimensions()
+        return self.width, self.height
+      end
+      function statusDrawable:draw(drawGraphics, x, y, ...)
+        if type(self.lease.draw) == "function" then
+          return self.lease:draw(drawGraphics, x, y, ...)
+        end
+        return drawGraphics.draw(self.lease, x, y, ...)
+      end
+      function statusDrawable:drawQuad(drawGraphics, quad, x, y, ...)
+        if type(self.lease.drawQuad) == "function" then
+          return self.lease:drawQuad(drawGraphics, quad, x, y, ...)
+        end
+        return drawGraphics.draw(self.lease, quad, x, y, ...)
+      end
+      if envelope._pool ~= nil then
+        leases[key].handle = statusDrawable
+      else
+        images[key] = statusDrawable
+      end
+      return statusDrawable
     end
     local typeKey = key:match("^battle:move%-type%-icon:([a-z%-]+)$")
     if typeKey ~= nil then
@@ -2920,19 +3283,40 @@ function FieldBattlePresentation:_preparationServices()
       local set = type(particles) == "table" and particles[particleKind] or nil
       local textureId = assert(tonumber(particleTexture), "ball particle drawable names a numeric texture")
       local path = nil
+      local sampler = nil
       for _, texture in ipairs(type(set) == "table" and set.textures or {}) do
         if texture.id == textureId then
           path = texture.image
+          sampler = texture.sampler
         end
       end
       if path == nil then
         return nil
       end
-      return resolveCatalogImage(envelope, graphics, images, failures, cacheFs, key, path)
+      return resolveCatalogImage(envelope, graphics, images, failures, cacheFs, key, path, sampler)
     end
     return nil
   end
   function services.release(key)
+    -- Party page composites own two staged layer borrows behind
+    -- suffixed sub-keys: releasing the page releases its layers so a
+    -- later resolution borrows them again instead of leaking.
+    if tostring(key):match("^party:page/") ~= nil then
+      for _, suffix in ipairs({ "#layer1", "#layer2" }) do
+        local subKey = tostring(key) .. suffix
+        local subLeases = envelope._leases --[[@as table<string, FieldBattlePresentation.PooledHandle>]]
+        local subPooled = subLeases[subKey]
+        if subPooled ~= nil then
+          subLeases[subKey] = nil
+          if envelope._warmPinned[subKey] == nil and envelope._pool ~= nil then
+            envelope._pool:release(subPooled.lease)
+          end
+        end
+        images[subKey] = nil
+        envelope._imageFailures[subKey] = nil
+      end
+      envelope._imageFailures[key] = nil
+    end
     -- Returned borrows rest resident under the shared owner until its own
     -- eviction: releasing forgets the borrow here so a later resolution
     -- borrows it again instead of drawing through a returned lease.
@@ -3768,6 +4152,7 @@ function FieldBattlePresentation:_admitLaunch(descriptor)
     local screen = self._screen
     self._screen = nil
     self._innerPort = nil
+    self._animationRngState = nil
     if screen ~= nil then
       local _, _ = pcall(function()
         return screen:dispose()
@@ -3998,6 +4383,17 @@ function FieldBattlePresentation:_buildPort(descriptor)
   assert(not self._disposed, "the presented battle envelope is disposed")
   assert(self._launchId == descriptor.launchId, "the envelope builds only its admitted launch")
   assert(self._screen == nil, "the envelope builds one screen per launch")
+  -- The detached visual launch seed is captured exactly once per launch
+  -- admission, before deferred preparation can advance the live owner:
+  -- frozen first-launch state cannot shift while resources prepare.
+  if self._animationRngState == nil and type(self._captureAnimationRng) == "function" then
+    local captured = self._captureAnimationRng()
+    assert(
+      type(captured) == "table" and type(captured.state) == "number",
+      "the launch capture carries its detached generator state"
+    )
+    self._animationRngState = { state = math.floor(captured.state), calls = captured.calls or 0 }
+  end
   local environment = descriptor.environment --[[@as table<string, unknown>]]
   local sceneKey = environment.sceneKey
   assert(type(sceneKey) == "string" and sceneKey ~= "", "launch environments resolve their scene identity")
@@ -4028,7 +4424,7 @@ function FieldBattlePresentation:_buildPort(descriptor)
   local function onResultMusic(word)
     return envelope:_startResultMusic(word)
   end
-  local screen = BattleScreenState.new({
+  local screenOpts = {
     launchId = descriptor.launchId,
     manifest = manifest,
     model = BattlePresentationModel,
@@ -4052,8 +4448,13 @@ function FieldBattlePresentation:_buildPort(descriptor)
     monIconProvider = self._monIconProvider,
     battleMenus = self._battleMenus,
     summary = self._summary,
+    splRandomState = self._splRandomState,
     overrides = { sceneKey = sceneKey },
-  })
+  }
+  if self._animationRngState ~= nil then
+    screenOpts.animationRngState = self._animationRngState
+  end
+  local screen = BattleScreenState.new(screenOpts)
   self._screen = screen
   return screen:presentationPort()
 end
@@ -4373,6 +4774,7 @@ function FieldBattlePresentation:_startTransition(descriptor)
       {
         camera = self._fieldCamera and self._fieldCamera() or nil,
         fieldRenderer = assert(self._fieldRenderer, "source camera transitions borrow the field compositor"),
+        splRandomState = self._splRandomState,
       },
       launchContext
     )
@@ -4416,9 +4818,27 @@ function FieldBattlePresentation:_stepTransition()
   end
   local ok, err = pcall(function()
     local phase = transition:status().phase
-    if phase == "new" or phase == "pending" then
-      local readiness = transition:prepare(assert(self._transitionContext))
+    if phase == "new" or phase == "pending" or phase == "ready" then
+      local readiness = phase
+      if phase ~= "ready" then
+        readiness = transition:prepare(assert(self._transitionContext))
+      end
       if readiness == "ready" then
+        -- The native effect starts only once its battle-music banks
+        -- stage: effect initialization voices the music on the same
+        -- tick, so a cold bank holds the visual instead of letting the
+        -- transition (and the cover handoff behind it) outrun the music.
+        if self._pendingFailed then
+          return
+        end
+        local musicReady, musicFailure = self:_battleMusicStaged()
+        if musicReady == nil then
+          self:_failMusic(assert(musicFailure, "music staging failures carry a reason"))
+          return
+        end
+        if musicReady == false then
+          return
+        end
         self:_startReadyTransition()
       end
       return
@@ -4647,14 +5067,19 @@ function FieldBattlePresentation:_stepCover()
       self:_startBattleMusic()
     end
     self:_stepCoverUp()
+    if self._transition == nil and self._cover >= FieldBattlePresentation.COVER_MAX then
+      -- Without a native effect the cover-full tick owns the music
+      -- start: the handoff below waits for the staged voice instead of
+      -- releasing the field under silence while cold banks still build.
+      self:_startBattleMusic()
+    end
     if
       self._cover >= FieldBattlePresentation.COVER_MAX
       and (self._transition == nil or self._transition:status().phase == "complete")
+      and self._musicStarted
+      and not self._pendingFailed
     then
       host.notify("cover-complete")
-    end
-    if self._transition == nil and self._cover >= FieldBattlePresentation.COVER_MAX then
-      self:_startBattleMusic()
     end
     return
   end
@@ -4772,6 +5197,28 @@ function FieldBattlePresentation:_portEnterReady()
   return ok and ready == true
 end
 
+-- Reports whether the launch battle-music voice can stage this tick:
+-- true once its track banks publish, false while the worker still
+-- builds them, nil with a terminal reason when the role or the banks
+-- fail closed. Side-effect free: the gated transition start holds on
+-- false without voicing, suspending field policy, or latching the
+-- one-shot music attempt, so the later voice still fires synchronously
+-- with the native effect initialization.
+---@return boolean? ready true when the music voice can stage, false while building
+---@return string? terminal failure, nil unless staging failed closed
+function FieldBattlePresentation:_battleMusicStaged()
+  local role = self._musicRole
+  if type(role) ~= "string" or role == "" then
+    return nil, "battle music needs its staged track role for launch " .. tostring(self._launchId)
+  end
+  local bankIds = self._musicBankIds
+  if bankIds == nil or #bankIds == 0 then
+    bankIds = self:_audioBanks()
+    self._musicBankIds = bankIds
+  end
+  return checkAudioBanks(self, { audio = { banks = bankIds, cries = {} } })
+end
+
 -- Starts the source-defined battle music role once its files stage: an
 -- unstaged bank holds the voice without failing the launch or silencing
 -- the field, and the covering ticks retry until staged. Field policy
@@ -4787,27 +5234,17 @@ function FieldBattlePresentation:_startBattleMusic()
   end
   local launchId = self._launchId
   local descriptor = self._descriptor
-  local role = self._musicRole
-  if type(role) ~= "string" or role == "" then
-    self._musicStarted = true
-    self:_failMusic("battle music needs its staged track role for launch " .. tostring(launchId))
-    return
-  end
-  local bankIds = self._musicBankIds
-  if bankIds == nil or #bankIds == 0 then
-    bankIds = self:_audioBanks()
-    self._musicBankIds = bankIds
-  end
-  local ready, failure = checkAudioBanks(self, { audio = { banks = bankIds, cries = {} } })
+  local ready, failure = self:_battleMusicStaged()
   if ready == nil then
     self._musicStarted = true
-    self:_failMusic(assert(failure, "music bank failures carry a reason"))
+    self:_failMusic(assert(failure, "music staging failures carry a reason"))
     return
   end
   if ready == false then
     return
   end
   self._musicStarted = true
+  local role = assert(self._musicRole, "staged battle music carries its track role")
   -- Field policy suspends on the same launch audio boundary the
   -- coordinator admits: in production the screen controller and the
   -- field controller are one object, while tests may substitute the

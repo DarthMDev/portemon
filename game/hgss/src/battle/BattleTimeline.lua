@@ -18,8 +18,12 @@ local Utf8Glyphs = require("libs.assets.src.Utf8Glyphs")
 
 ---@class BattleTimeline
 ---@field _effects table<string, unknown>? battle-private native-effect collaborator behind start/status/cancel/retire
----@field _nativeSeen table<string, boolean> claimed visual occurrences by launch, round, action, effect key, and source phase
----@field _announced table<string, boolean> narrated attack occurrences by the same occurrence identity
+---@field _ledger table<string, table<string, unknown>> selected request records by launch, event sequence, and source-call ordinal, including recorded omissions
+---@field _launchId string? owning launch identity behind the ledger, nil before the first delivery
+---@field _sourceBindings table<string, table<string, unknown>> known source-slot identity/appearance facts by declared side and position, refreshed in event order during the prepass
+---@field _slotGeometry table<integer, table<string, number>>? published native slot rows behind request selection, absent without a screen or fixture owner
+---@field _batchRequests table<string, table<integer, table<string, unknown>>>? frozen requests by event sequence and kind for the batch under translation, nil outside it
+---@field _batchDrained table<string, boolean>? drained source calls by action, kind, ordinal, and catalog key for the batch under translation, nil outside it
 ---@field _battleScene boolean frozen launch scene choice; false omits optional move-animation roots
 ---@field _motionFacts (fun(species: string, foe: boolean): { totalTicks: integer, cryDelay: integer }?)? staged send-out motion hold and cry delay by species, absent without staged motion data
 ---@field _pendingSounds table<integer, table<string, unknown>> queued one-shot sound cues for the screen drain
@@ -58,6 +62,8 @@ local Utf8Glyphs = require("libs.assets.src.Utf8Glyphs")
 ---@field _itemName (fun(item: string): string?)? borrowed item display-name resolver for use narration
 ---@field _battleItemUse (fun(item: string): table<string, unknown>?)? borrowed generated battle-use facts
 ---@field _ballFadeColor (fun(ballKey: string): integer)? Pokepic palette-fade target of a ball (sBallColors)
+---@field _ballOpening (fun(ballKey: string): { frames: { drawableKey: string, durationTicks: integer }[] }?)? staged opening animation of a ball
+---@field _ballThrow (fun(ballKey: string): { frames: { drawableKey: string, durationTicks: integer }[] }?)? staged throw animation of a ball
 ---@field _faintAppearance (fun(battler: table<string, unknown>): { height: integer, shadowHeight: integer }?)? source picture facts
 ---@field _messageText fun(context: unknown, key: string, substitutions: string[]): string source text resolver supplied by the battle screen or test fixture
 ---@field _messageTextContext unknown? owner passed to the source text resolver
@@ -106,16 +112,48 @@ BattleTimeline.THROW_EXIT_TICKS = 21
 -- so one staged frame duration lasts half as many ticks.
 BattleTimeline.TRAINER_ANIM_RATE = 2
 -- Player send-out ball after the windup release (kind 6/8/7): a 21-tick
--- arc phase (init plus the 20-tick flight at height 48) and an 18-tick
--- open phase (ThrowArcAndOpen steps around the arc). Foe send-outs open
--- in place and need no arc. Retail flashes the ball sprite white through
--- the open (RunThrowArc's palette blend); with no runtime blend path for
--- thrown sprites, the staged ball-open burst stands in at the same spot
--- and beat, matching the capture and recall opens.
+-- arc phase (init plus the 20-tick flight at height 48) and the source
+-- open phase around the landing. Foe send-outs open in place and need no
+-- arc. RunThrowArc blends the ball sprite's palette white through the
+-- open; the timeline publishes the source coefficient and the renderer
+-- applies the shared palette fade.
 BattleTimeline.THROW_ARC_TICKS = 21
 BattleTimeline.THROW_ARC_HEIGHT = 48
 BattleTimeline.THROW_OPEN_TICKS = 18
 BattleTimeline.THROW_ARC_MOTION_TICKS = 20
+-- RunThrowArc holds a player send-out ball (gOpponentBallKinds 6/8/7) for
+-- four frames past its arc midpoint: while modeFrames sits between
+-- arcDuration / 2 and arcDuration / 2 + 4 the kind gate skips
+-- BattleAnimUtil_UpdateLinearSinMotionSprite, so the twenty updates (and
+-- therefore the landing) finish four frames later than the plain arc.
+BattleTimeline.BALL_ARC_APEX_TICKS = 4
+-- gOpponentBallKinds selects a source kind per battler type. The
+-- player-side kinds (0/2/4 -> 6/8/7) spin and flash their palette during
+-- the throw; the foe-side kinds (1/3/5 -> 1/3/5) hold a static ball and
+-- flash where the opening animation reaches its fifth frame.
+BattleTimeline.BALL_KIND_BY_BATTLER_TYPE = { [0] = 6, [1] = 1, [2] = 8, [3] = 3, [4] = 7, [5] = 5 }
+BattleTimeline.BALL_FLASHING_KINDS = { [6] = true, [7] = true, [8] = true, [9] = true, [10] = true, [11] = true }
+-- RunThrowArc starts the blend at arcDuration / 2 + 10, four frames before
+-- the held arc lands, and ramps 0..14 in steps of two over seven frames.
+BattleTimeline.BALL_FLASH_LEAD_TICKS = 4
+BattleTimeline.BALL_FLASH_STEP = 2
+BattleTimeline.BALL_FLASH_FULL = 14
+-- Task_PokemonSendOut and Task_PokemonSlideIn report the ball opened and
+-- start their BallSealEffect, their BOWA2, and the figure growth where the
+-- source does. A flashing kind reports opened when its in-arc blend
+-- finishes, four ticks after the ball lands. The other kinds run two
+-- RunThrowArc setup steps, then the opening animation's sixth step runs
+-- `modeFrames == 5`, which forces the opened ball cell and starts the
+-- blend eight open ticks after landing; 16 open steps end the ball task.
+BattleTimeline.BALL_OPEN_SETUP_TICKS = 2
+BattleTimeline.BALL_OPEN_FLASH_TICKS = 6
+BattleTimeline.BALL_FLASHING_OPEN_TICKS = 4
+-- A foe send-out ball (gOpponentBallKinds 1/3/5) runs the same arc phase
+-- in place: BallThrow_InitThrowTarget keeps its target on the sprite's own
+-- position with zero height over twelve frames, and those kinds never
+-- spin. The open steps then follow, so the foe ball opens twenty ticks
+-- after its task starts.
+BattleTimeline.BALL_IN_PLACE_ARC_TICKS = 12
 -- BallThrow_InitThrowTarget for the player send-out kinds (6/8/7): the
 -- ball lands on the mon's screen spot plus 32 pixels, per side type.
 BattleTimeline.PLAYER_ARC_TARGETS = {
@@ -221,9 +259,12 @@ end
 ---@field encounterFadeColor "white"|"black" gBattleEncounterFadeColors entry of the scene background
 ---@field encounterSource BattleEncounterPalette.Source? staged source palette buffers and fill behind the encounter evaluator, absent without staged art
 ---@field ballFadeColor (fun(ballKey: string): integer)? source recall and send-out fade color of a ball
+---@field ballOpening (fun(ballKey: string): { frames: { drawableKey: string, durationTicks: integer }[] }?)? staged opening animation frames of a ball
+---@field ballThrow (fun(ballKey: string): { frames: { drawableKey: string, durationTicks: integer }[] }?)? staged throw animation frames of a ball
 ---@field motionFacts (fun(species: string, foe: boolean): { totalTicks: integer, cryDelay: integer }?)? staged send-out motion hold and cry delay by species, absent without staged motion data
 ---@field faintAppearance (fun(battler: table<string, unknown>): { height: integer, shadowHeight: integer }?)? source picture facts for fainting
 ---@field trainerPictures table<string, table<string, unknown>>? staged source trainer metadata
+---@field slotGeometry table<integer, table<string, number>>? published native slot rows behind request selection, supplied by the screen or test fixture
 ---@field messageText fun(context: unknown, key: string, substitutions: string[]): string staged retail battle message resolver
 ---@field messageTextContext unknown? explicit owner passed to the staged retail message resolver
 
@@ -253,6 +294,8 @@ function BattleTimeline.new(opts)
     _itemName = opts.itemName,
     _battleItemUse = opts.battleItemUse,
     _ballFadeColor = opts.ballFadeColor,
+    _ballOpening = opts.ballOpening,
+    _ballThrow = opts.ballThrow,
     _encounterFadeColor = opts.encounterFadeColor,
     _encounterSource = opts.encounterSource,
     _encounterPalette = nil,
@@ -267,8 +310,10 @@ function BattleTimeline.new(opts)
     _effects = opts.effects,
     _ballParticleStarts = {},
     _pendingCries = {},
-    _nativeSeen = {},
-    _announced = {},
+    _ledger = {},
+    _launchId = nil,
+    _sourceBindings = {},
+    _slotGeometry = opts.slotGeometry,
     _pendingSounds = {},
     _names = {},
     _addressing = {},
@@ -500,16 +545,27 @@ function BattleTimeline:reset(view)
   self._ballParticleStarts = {}
   self._pendingCries = {}
   self._captureBall = nil
-  -- A fresh opening starts new actions: occurrence and narration claims
-  -- never leak from the previous launch into the next one.
-  self._nativeSeen = {}
-  self._announced = {}
+  -- A fresh opening starts a new launch: the request ledger, its
+  -- launch identity, and the known source bindings never leak from
+  -- the previous launch into the next one.
+  self._ledger = {}
+  self._launchId = nil
+  self._sourceBindings = {}
+  self._batchRequests = nil
+  self._batchDrained = nil
 end
 
 -- Drops transient visual tracks when the owning battle screen is disposed.
+-- The request ledger and source bindings end with the launch: a
+-- cancelled launch never publishes a pending admission into a new one.
 function BattleTimeline:dispose()
   self._queue = {}
   self._active = nil
+  self._ledger = {}
+  self._launchId = nil
+  self._sourceBindings = {}
+  self._batchRequests = nil
+  self._batchDrained = nil
   self._openingPresentation = nil
   self._trainerSlideTracks = {}
   self._terrainSlideTracks = {}
@@ -579,17 +635,121 @@ end
 -- Forward send-out addressing: the opening thrower reads side types and
 -- the follower slot before their owners' definitions below.
 local battlerTypeOf, isFollowSendOut
--- Forward ball-burst start: the trainerless open fires it at cue start,
--- before the burst owner's definition below.
-local startBallBurst
+-- The staged drawable of one ball source cell: the throw animation's
+-- frames and the opening animation's frames share the ball's own palette.
+---@param ballKey string semantic ball key behind the sprite
+---@param frameIndex integer zero-based source throw-animation cell
+---@return string drawableKey
+local function ballCellKey(ballKey, frameIndex)
+  return "battle-ball:" .. ballKey .. ":" .. tostring(frameIndex)
+end
+
+-- The ball's current source frame during a throw. A flashing kind never
+-- plays the opening sequence: its throw cell whitens through the flight.
+-- The other kinds run the opening animation; the trainerless send-outs
+-- force the source's opened-ball cell at the flash tick instead of
+-- following the staged cell durations, while the trainer's own throw
+-- follows them.
+---@param cue table<string, unknown> open-phase ball throw cue
+---@return string? drawableKey of the shown opening frame, nil while the throw cell holds
+local function openBallFrameKey(cue)
+  local opening = cue.opening --[[@as { frames: { drawableKey: string, durationTicks: integer }[] }?]]
+  if opening == nil or cue.flashing == true then
+    return nil
+  end
+  local openElapsed = cue.openElapsed --[[@as integer]]
+  if cue.openingStyle == "forced" then
+    -- SetAnim lands one setup step after the arc; the sixth open step
+    -- forces the source's third cell (the opened ball halves) where the
+    -- flash starts.
+    if openElapsed < 2 then
+      return nil
+    end
+    if
+      openElapsed < cue.openEventTick --[[@as integer]]
+    then
+      return opening.frames[1].drawableKey
+    end
+    local forced = opening.frames[3] or opening.frames[#opening.frames]
+    return forced.drawableKey
+  end
+  local animTick = openElapsed - 1
+  if animTick < 1 then
+    return nil
+  end
+  local elapsed = 0
+  for _, frame in ipairs(opening.frames) do
+    elapsed = elapsed + frame.durationTicks
+    if animTick <= elapsed then
+      return frame.drawableKey
+    end
+  end
+  return opening.frames[#opening.frames].drawableKey
+end
+
+-- The source ball kind behind one battler type, and whether it blends its
+-- palette white during the throw.
+---@param self BattleTimeline
+---@param combatant integer battler under lookup
+---@return integer? kind
+local function ballKindOf(self, combatant)
+  return BattleTimeline.BALL_KIND_BY_BATTLER_TYPE[battlerTypeOf(self, combatant)]
+end
+
+---@param kind integer? source ball kind
+---@return boolean
+local function ballFlashes(kind)
+  return kind ~= nil and BattleTimeline.BALL_FLASHING_KINDS[kind] == true
+end
+
+-- The source blend coefficient at one tick of the open, or of the in-arc
+-- flash for the flashing kinds: a two-unit step toward fourteen every tick
+-- after the blend starts.
+---@param elapsed integer source tick relative to the blend start
+---@param startTick integer first tick of the blend
+---@return integer coefficient 0..14
+local function ballFlashCoefficient(elapsed, startTick)
+  local step = math.max(0, elapsed - startTick) * BattleTimeline.BALL_FLASH_STEP
+  return math.min(BattleTimeline.BALL_FLASH_FULL, step)
+end
+
+-- The throw animation's current source cell at one flight tick: the
+-- animation loops through its authored frame durations.
+---@param cue table<string, unknown> cue carrying the staged throw frames
+---@param elapsed integer flight tick since the release
+---@return string? drawableKey
+local function throwFrameKey(cue, elapsed)
+  local throw = cue.throwFrames --[[@as { frames: { drawableKey: string, durationTicks: integer }[] }?]]
+  local frames = throw ~= nil and throw.frames or nil
+  if frames == nil or #frames == 0 then
+    return nil
+  end
+  local total = 0
+  for _, frame in ipairs(frames) do
+    total = total + frame.durationTicks
+  end
+  if total <= 0 then
+    return frames[1].drawableKey
+  end
+  local tick = math.max(0, elapsed) % total
+  local accumulated = 0
+  for _, frame in ipairs(frames) do
+    accumulated = accumulated + frame.durationTicks
+    if tick < accumulated then
+      return frame.drawableKey
+    end
+  end
+  return frames[#frames].drawableKey
+end
 
 ---@param self BattleTimeline
 ---@param combatant integer battler receiving the source send-out
 ---@param role "player"|"foe" source side selected for the opening throw
 ---@return integer nominal throw ticks behind the settle math
+---@return boolean true when a queued ball-throw cue owns the ball's open beat
 local function enqueueBallThrow(self, combatant, role)
   if self._openingPresentation == nil then
-    return 0
+    return 0, false
   end
   local view = assert(self._latest, "send-out ball selection uses the newest detached battle view")
   local record = nil
@@ -610,6 +770,16 @@ local function enqueueBallThrow(self, combatant, role)
   local trainerSelector = nil
   local throwOffsets = nil
   local participant = nil
+  local pan = role == "player" and BattleAudio.SIDE_PAN.player or BattleAudio.SIDE_PAN.foe
+  -- Ball-throw cues own the ball's open beat: the cue plays the open sound,
+  -- starts the seal, and flashes where the source reports the ball opened.
+  local function enqueueThrow(cue)
+    cue.kind = "ball-throw"
+    cue.openPan = pan
+    cue.combatant = combatant
+    cue.throwAnimated = role == "player"
+    enqueue(self, cue)
+  end
   if role == "player" then
     local trainer = assert(view.playerTrainer, "player throws carry their trainer class") --[[@as table<string, unknown>]]
     trainerSelector = "back:" .. assert(trainer.classKey, "player throws carry their backpic selector") --[[@as string]]
@@ -625,14 +795,16 @@ local function enqueueBallThrow(self, combatant, role)
       -- with no windup (Task_PokemonSendOut), unless the follower slides
       -- in ball-free.
       if isFollowSendOut(self, combatant) then
-        return 0
+        return 0, false
       end
       local target = assert(
         BattleTimeline.PLAYER_ARC_TARGETS[battlerTypeOf(self, combatant)],
         "player send-outs arc to a staged side type"
       )
-      enqueue(self, {
-        kind = "ball-throw",
+      local arcTicks = BattleTimeline.THROW_ARC_TICKS + BattleTimeline.BALL_ARC_APEX_TICKS
+      local openTicks = ballFlashes(ballKindOf(self, combatant)) and BattleTimeline.BALL_FLASHING_OPEN_TICKS
+        or BattleTimeline.THROW_OPEN_TICKS
+      enqueueThrow({
         selector = "ball:" .. ballKey,
         requiresImage = "battle-ball:" .. ballKey .. ":0",
         trainerless = true,
@@ -640,9 +812,14 @@ local function enqueueBallThrow(self, combatant, role)
         fromY = BattleTimeline.PLAYER_ARC_START.y,
         targetX = target.x,
         targetY = target.y,
-        nominalTicks = BattleTimeline.THROW_ARC_TICKS + BattleTimeline.THROW_OPEN_TICKS,
+        -- Task_PokemonSendOut builds a kind 6/8/7 ball in mode 0:
+        -- RunThrowArc holds at the apex and reports opened as the in-arc
+        -- blend finishes, so the open phase is the blend tail.
+        arcTicks = arcTicks,
+        apexHoldTicks = BattleTimeline.BALL_ARC_APEX_TICKS,
+        nominalTicks = arcTicks + openTicks,
       })
-      return BattleTimeline.THROW_ARC_TICKS + BattleTimeline.THROW_OPEN_TICKS
+      return arcTicks + openTicks, true
     end
     local entry = assert(self._trainerPictures[trainerSelector], "player trainer backpic metadata is staged")
     assert(type(entry.animation) == "table", "player trainer backpic carries its sequence-zero compatibility record")
@@ -657,21 +834,23 @@ local function enqueueBallThrow(self, combatant, role)
       -- walks off (marking the throw handled so a doubles partner arcs
       -- from the release point), but no arc, open, or burst follows.
       playerTrack.throwQueued = true
-      enqueue(self, {
-        kind = "ball-throw",
+      enqueueThrow({
         trainerSelector = trainerSelector,
         noBall = true,
         nominalTicks = BattleTimeline.THROW_EXIT_TICKS,
       })
-      return BattleTimeline.THROW_EXIT_TICKS
+      return BattleTimeline.THROW_EXIT_TICKS, false
     end
     if playerTrack.throwQueued == true then
       -- Doubles partner: the trainer already left with the first ball, so
       -- only the arc and open run, from the release point the first throw
       -- stashes when it releases (resolved at cue start, not here: the
-      -- first throw has not run yet at enqueue time).
-      enqueue(self, {
-        kind = "ball-throw",
+      -- first throw has not run yet at enqueue time). The partner's own
+      -- kind 6/8/7 ball runs the same apex hold and in-arc blend.
+      local arcTicks = BattleTimeline.THROW_ARC_TICKS + BattleTimeline.BALL_ARC_APEX_TICKS
+      local openTicks = ballFlashes(ballKindOf(self, combatant)) and BattleTimeline.BALL_FLASHING_OPEN_TICKS
+        or BattleTimeline.THROW_OPEN_TICKS
+      enqueueThrow({
         selector = "ball:" .. ballKey,
         trainerSelector = trainerSelector,
         throwOffsets = throwOffsets,
@@ -679,9 +858,11 @@ local function enqueueBallThrow(self, combatant, role)
         arcOnly = true,
         targetX = target.x,
         targetY = target.y,
-        nominalTicks = BattleTimeline.THROW_ARC_TICKS + BattleTimeline.THROW_OPEN_TICKS,
+        arcTicks = arcTicks,
+        apexHoldTicks = BattleTimeline.BALL_ARC_APEX_TICKS,
+        nominalTicks = arcTicks + openTicks,
       })
-      return BattleTimeline.THROW_ARC_TICKS + BattleTimeline.THROW_OPEN_TICKS
+      return arcTicks + openTicks, true
     end
     playerTrack.throwQueued = true
   else
@@ -703,8 +884,7 @@ local function enqueueBallThrow(self, combatant, role)
         FOE_BALL_START_BY_BATTLER_TYPE[battlerTypeOf(self, combatant)],
         "foe send-outs open at a staged source ball position"
       )
-      enqueue(self, {
-        kind = "ball-throw",
+      enqueueThrow({
         selector = "ball:" .. ballKey,
         requiresImage = "battle-ball:" .. ballKey .. ":0",
         trainerless = true,
@@ -713,9 +893,9 @@ local function enqueueBallThrow(self, combatant, role)
         fromY = target.y,
         targetX = target.x,
         targetY = target.y,
-        nominalTicks = BattleTimeline.THROW_OPEN_TICKS,
+        nominalTicks = BattleTimeline.BALL_IN_PLACE_ARC_TICKS + BattleTimeline.THROW_OPEN_TICKS,
       })
-      return BattleTimeline.THROW_OPEN_TICKS
+      return BattleTimeline.BALL_IN_PLACE_ARC_TICKS + BattleTimeline.THROW_OPEN_TICKS, true
     end
     local start = assert(
       FOE_BALL_START_BY_BATTLER_TYPE[
@@ -723,17 +903,23 @@ local function enqueueBallThrow(self, combatant, role)
       ],
       "foe trainer type has a source ball start position"
     )
+    -- Task_ThrowPokeball walks the foe trainer off while the pre-created
+    -- kind 1/3/5 ball runs its own in-place open: the cue owns both, so
+    -- it runs the trainer's twenty-one exit frames and the ball's thirty
+    -- arc-plus-open frames.
     enqueue(self, {
       kind = "trainer-exit",
       role = "foe",
       participant = participant,
       selector = "ball:" .. ballKey,
+      combatant = combatant,
+      openPan = pan,
       ballX = start.x,
       ballY = start.y,
       requiresImage = "battle-ball:" .. ballKey .. ":0",
-      nominalTicks = BattleTimeline.THROW_EXIT_TICKS,
+      nominalTicks = BattleTimeline.BALL_IN_PLACE_ARC_TICKS + BattleTimeline.THROW_OPEN_TICKS,
     })
-    return BattleTimeline.THROW_EXIT_TICKS
+    return BattleTimeline.BALL_IN_PLACE_ARC_TICKS + BattleTimeline.THROW_OPEN_TICKS, false
   end
   local selector = "ball:" .. ballKey
   local releaseTicks = throwReleaseTicks(self, trainerSelector)
@@ -748,8 +934,7 @@ local function enqueueBallThrow(self, combatant, role)
     BattleTimeline.PLAYER_ARC_TARGETS[battlerTypeOf(self, combatant)],
     "player send-outs arc to a staged side type"
   )
-  enqueue(self, {
-    kind = "ball-throw",
+  enqueueThrow({
     selector = selector,
     trainerSelector = trainerSelector,
     throwOffsets = throwOffsets,
@@ -759,7 +944,7 @@ local function enqueueBallThrow(self, combatant, role)
     targetX = target.x,
     targetY = target.y,
   })
-  return nominalTicks
+  return nominalTicks, true
 end
 
 ---@param view table<string, unknown> detached view carrying semantic trainer keys
@@ -827,8 +1012,11 @@ local function openingTrainerSlides(self, view, wild)
       sourceBattlerType = sourceBattlerType,
     }
   end
-  addSlide("player", "back:" .. playerClassKey, 336, 112, -1, 64)
+  -- Wild battles send the lead out with no trainer on screen
+  -- (BtlCmd_PokemonSlideIn/PokemonSendOut player side); only trainer
+  -- battles show the player's backpic walking in and throwing.
   if not wild then
+    addSlide("player", "back:" .. playerClassKey, 336, 112, -1, 64)
     local trainers = view.foeTrainers --[[@as table<integer, table<string, unknown>>]]
     assert(type(trainers) == "table", "trainer openings carry foe class records")
     assert(#trainers > 0, "trainer openings carry at least one opponent trainer")
@@ -964,91 +1152,363 @@ local function cryCue(species, form, foe, pattern, waitForVoice)
   }
 end
 
----@param sequence unknown event sequence ordinal under visual seeding
----@return integer deterministic visual seed scoped to the event identity
-local function visualSeedFor(sequence)
-  local ordinal = 0
-  if type(sequence) == "number" and sequence % 1 == 0 and sequence >= 0 then
-    ordinal = sequence --[[@as integer]]
-  end
-  -- The canonical stream lives in PresentationFacts.visualSeedFor;
-  -- this mirrors its arithmetic so cue identities stay deterministic
-  -- without pulling the mechanics package into the cue player.
-  return (ordinal * 1103515245 + 12345) % 2147483648
+---@param launchId string owning launch identity behind the ledger entry
+---@param eventSequence integer kernel event sequence behind the ledger entry
+---@param ordinal integer selected source-call ordinal behind the ledger entry
+---@param kind string event kind behind the ledger entry, disambiguating reused sequence numbers
+---@return string ledger identity joining the frozen coordinates
+local function ledgerKeyOf(launchId, eventSequence, ordinal, kind)
+  return launchId .. "\0" .. tostring(eventSequence) .. "\0" .. tostring(ordinal) .. "\0" .. kind
 end
 
----@param event table<string, unknown> sanitized kernel event under inspection
----@return string? accepted semantic effect key, nil when the source names no effect
-local function nativeEffectKeyOf(event)
-  local key = event.effectKey
-  if type(key) == "string" and key ~= "" then
-    return key --[[@as string]]
-  end
-  return nil
-end
-
---- One visual occurrence belongs to one action and one source phase: the
---- launch, round, action identity, executed effect key, and move
---- phase. Every hit of a multi-hit sequence and every recipient of a
---- spread move shares the source action identity, while a distinct action
---- identity starts its own occurrence. The charged and struck halves of a
---- two-turn action stay distinct through their source phases, so the
---- strike half never collapses onto the charge cue. An action without an
---- identity (a strike-only legacy emission) falls back to its event
---- sequence; a present but mistyped action identity is malformed and
---- claims nothing rather than silently visualizing another user's action.
----@param launch string owning launch identity under emission
----@param event table<string, unknown> sanitized kernel event under emission
----@param packet table<string, unknown> delivery carrying event-time views
----@return string? action-scoped occurrence identity, nil when the source action identity is malformed
-local function occurrenceIdentityOf(launch, event, packet)
-  local action = event.actionId
-  if type(action) ~= "number" and type(action) ~= "string" then
-    if action ~= nil then
+-- Compares two frozen request records field by field: a redelivered
+-- occurrence must select byte-identical content, never a revised
+-- decision. Packet identities stay out of the comparison because
+-- delivery numbering is diagnostic only.
+---@param before table<string, unknown> ledgered request behind the comparison
+---@param after table<string, unknown> redelivered request behind the comparison
+---@return boolean identical true when the redelivery changes no earlier decision
+---@return string? mismatch human-readable first difference, nil when identical
+local function compareRequests(before, after)
+  local function compare(path, left, right)
+    if type(left) ~= type(right) then
+      return path .. " changes type from " .. type(left) .. " to " .. type(right)
+    end
+    if type(left) == "table" then
+      for key, value in pairs(left) do
+        if key ~= "packetId" then
+          local difference = compare(path .. "." .. tostring(key), value, right[key])
+          if difference ~= nil then
+            return difference
+          end
+        end
+      end
+      for key, _ in
+        pairs(right --[[@as table<string, unknown>]])
+      do
+        if key ~= "packetId" and left[key] == nil then
+          return path .. "." .. tostring(key) .. " appears only in the redelivery"
+        end
+      end
       return nil
     end
-    action = event.sequence
+    if left ~= right then
+      return path .. " changes from " .. tostring(left) .. " to " .. tostring(right)
+    end
+    return nil
   end
-  local phase = event.kind
-  local move = event.move --[[@as table<string, unknown>?]]
-  if type(move) == "table" and type(move.phase) == "string" then
-    phase = move.phase
-  end
-  local before = packet.before --[[@as table<string, unknown>?]]
-  local after = packet.after --[[@as table<string, unknown>?]]
-  local round = type(before) == "table" and before.round or nil
-  if round == nil and type(after) == "table" then
-    round = after.round
-  end
-  return launch
-    .. "\0"
-    .. tostring(round)
-    .. "\0"
-    .. tostring(action)
-    .. "\0"
-    .. tostring(event.effectKey)
-    .. "\0"
-    .. tostring(phase)
+  local mismatch = compare("request", before, after)
+  return mismatch == nil, mismatch
 end
 
----@param packet table<string, unknown> delivery carrying launch identity
----@return string owning launch identity under emission, empty when unnamed
-local function launchOf(packet)
-  if type(packet.launchId) == "string" then
-    return packet.launchId --[[@as string]]
+-- Records one selected request in the per-launch ledger, including
+-- recorded omissions. A repeated identity with identical content
+-- stays a silent no-op; a repeated identity with different content is
+-- an explicit presentation error instead of a revised decision.
+---@param self BattleTimeline
+---@param request table<string, unknown> frozen request behind the ledger entry
+---@param kind string event kind behind the ledger entry, disambiguating reused sequence numbers
+---@return boolean fresh true when the identity is recorded for the first time
+local function ledgerRecord(self, request, kind)
+  local identity = assert(request.identity, "ledgered requests carry their occurrence identity") --[[@as table<string, unknown>]]
+  local launchId = assert(identity.launchId, "ledgered requests name their launch") --[[@as string]]
+  local eventSequence = assert(identity.eventSequence, "ledgered requests name their event sequence") --[[@as integer]]
+  local ordinal = assert(identity.ordinal, "ledgered requests number their source call") --[[@as integer]]
+  local key = ledgerKeyOf(launchId, eventSequence, ordinal, kind)
+  local known = self._ledger[key]
+  if known ~= nil then
+    local identical, mismatch = compareRequests(known.request --[[@as table<string, unknown>]], request)
+    if not identical then
+      error(
+        "native request " .. key .. " for launch " .. launchId .. " reselects different content: " .. tostring(mismatch),
+        0
+      )
+    end
+    return false
   end
-  return ""
+  self._ledger[key] = {
+    identity = copyValue(identity),
+    disposition = request.disposition,
+    effectKey = request.effectKey,
+    request = copyValue(request),
+  }
+  return true
 end
 
--- Demands the exact selected effect the first time its source event is
--- admitted, once its announcement has played. The cue itself stays
--- ordered behind the event narration and ahead of its hit and health
--- work, and still holds every later cue until the player occurrence
--- actually completes. Emission is exactly once per launch, action,
--- executed effect key, and source phase: later hits, spread recipients,
--- and redeliveries of the same action queue nothing new. Generic impact
--- and effectiveness voices stay silent on this path because the selected
--- program owns audio timing.
+-- Defaulted legacy identity facts for one actor/target entry: records
+-- predating activation facts bind their native combatant identity, so
+-- long-standing emissions without activation keep resolving the same
+-- event-time slot. Records carrying real facts pass through
+-- untouched; nothing here invents an entry that is absent.
+---@param entry table<string, unknown> actor/target identity under selection
+local function defaultEntryIdentity(entry)
+  if entry.activation == nil then
+    entry.activation = entry.combatant
+  end
+  if entry.position == nil then
+    entry.position = entry.combatant
+  end
+end
+
+-- Defaulted legacy slot facts for one event-time view record: active
+-- records without activation or position bind their native combatant
+-- identity, matching the actor/target rule above. Benched reserves
+-- keep no slot facts: inventing positions from combatant identities
+-- would pollute the live side order with phantom slots.
+---@param record table<string, unknown> event-time view record under selection
+local function defaultViewRecord(record)
+  if record.active ~= false then
+    if record.activation == nil then
+      record.activation = record.combatant
+    end
+    if record.position == nil then
+      record.position = record.combatant
+    end
+  end
+end
+
+-- Detached selection input for one event: the event with defaulted
+-- legacy identity facts and detached views with defaulted legacy slot
+-- facts. Production facts already carry real activation and position
+-- values and pass through untouched; the packet itself is never
+-- mutated.
+---@param event table<string, unknown> sanitized event under selection
+---@param packet table<string, unknown> delivery carrying launch identity and event-time views
+---@return table<string, unknown> detached event behind selection
+---@return table<string, unknown> detached envelope behind selection
+local function selectionInput(event, packet)
+  local detached = copyValue(event) --[[@as table<string, unknown>]]
+  for _, group in ipairs({ "actors", "targets" }) do
+    local entries = detached[group]
+    if type(entries) == "table" then
+      for _, entry in
+        ipairs(entries --[[@as table<integer, table<string, unknown>>]])
+      do
+        if type(entry) == "table" then
+          defaultEntryIdentity(entry)
+        end
+      end
+    end
+  end
+  local envelope = {
+    launchId = packet.launchId,
+    packetId = packet.packetId,
+    before = copyValue(packet.before),
+    after = copyValue(packet.after),
+  } --[[@as table<string, unknown>]]
+  for _, name in ipairs({ "before", "after" }) do
+    local view = envelope[name] --[[@as table<string, unknown>?]]
+    if type(view) == "table" then
+      for _, group in ipairs({ "own", "foes" }) do
+        local records = view[group]
+        if type(records) == "table" then
+          for _, record in
+            ipairs(records --[[@as table<integer, table<string, unknown>>]])
+          do
+            if type(record) == "table" then
+              defaultViewRecord(record)
+            end
+          end
+        end
+      end
+    end
+  end
+  return detached, envelope
+end
+
+-- Indexes backward cost links carried by the fresh batch: an owning
+-- event sequence pointing at its actual cost-health event sequence.
+-- Links must stay inside one launch and one action and name the same
+-- subject activation; a missing, duplicate, cross-action,
+-- cross-activation, or future-guess link is a presentation error.
+-- No producer carries cost facts yet, so live batches index empty.
+---@param launch string owning launch identity behind the batch
+---@param fresh table<integer, table<string, unknown>> fresh events in sequence order
+---@return table<integer, integer> costLinks owning event sequence to cost event sequence
+local function indexCostLinks(launch, fresh)
+  local bySequence = {} ---@type table<integer, table<string, unknown>>
+  for _, event in ipairs(fresh) do
+    if type(event.sequence) == "number" then
+      bySequence[
+        event.sequence --[[@as integer]]
+      ] = event
+    end
+  end
+  local costLinks = {} ---@type table<integer, integer>
+  for _, event in ipairs(fresh) do
+    local presentation = type(event.presentation) == "table" and event.presentation or nil
+    local links = {} ---@type table<integer, unknown>
+    if type(presentation) == "table" then
+      local execution = presentation.execution --[[@as table<string, unknown>?]]
+      if type(execution) == "table" and type(execution.costEventSequence) == "number" then
+        links[
+          event.sequence --[[@as integer]]
+        ] = execution.costEventSequence
+      end
+      local operation = presentation.operation --[[@as table<string, unknown>?]]
+      if
+        type(operation) == "table"
+        and operation.kind == "health-cost"
+        and type(operation.ownerEventSequence) == "number"
+      then
+        links[
+          operation.ownerEventSequence --[[@as integer]]
+        ] = event.sequence
+      end
+      if
+        type(operation) == "table"
+        and operation.kind == "substitute-created"
+        and type(operation.costEventSequence) == "number"
+      then
+        links[
+          event.sequence --[[@as integer]]
+        ] = operation.costEventSequence
+      end
+    end
+    for ownerSequence, costSequence in pairs(links) do
+      local cost = costSequence --[[@as integer]]
+      local owner = bySequence[
+        ownerSequence --[[@as integer]]
+      ]
+      local costEvent = bySequence[cost]
+      if owner == nil or costEvent == nil then
+        error("cost link " .. tostring(ownerSequence) .. " for launch " .. launch .. " names a missing event", 0)
+      end
+      if cost >= ownerSequence then
+        error("cost link " .. tostring(ownerSequence) .. " for launch " .. launch .. " guesses a future cost event", 0)
+      end
+      if owner.actionId ~= costEvent.actionId then
+        error("cost link " .. tostring(ownerSequence) .. " for launch " .. launch .. " crosses actions", 0)
+      end
+      if
+        costLinks[
+          ownerSequence --[[@as integer]]
+        ] ~= nil
+      then
+        error("cost link " .. tostring(ownerSequence) .. " for launch " .. launch .. " has a duplicate cost", 0)
+      end
+      costLinks[
+        ownerSequence --[[@as integer]]
+      ] = cost
+    end
+  end
+  return costLinks
+end
+
+-- Refreshes the known source-slot facts from the batch views in event
+-- order and snapshots them for one selector call. Retired bindings
+-- persist until the same declared position pictures a replacement;
+-- redelivered facts never advance the map because only fresh batches
+-- refresh it.
+---@param self BattleTimeline
+---@param packet table<string, unknown> delivery carrying event-time views
+---@return table<integer, table<string, unknown>> detached source-slot snapshot in declared slot order
+local function snapshotSourceBindings(self, packet)
+  local function refresh(view)
+    if type(view) ~= "table" then
+      return
+    end
+    for _, group in ipairs({ "own", "foes" }) do
+      local records = view[group] --[[@as table<integer, table<string, unknown>>?]]
+      if type(records) == "table" then
+        for _, record in ipairs(records) do
+          if type(record) == "table" and type(record.side) == "number" and type(record.position) == "number" then
+            local key = tostring(record.side) .. "\0" .. tostring(record.position)
+            self._sourceBindings[key] = {
+              side = record.side,
+              position = record.position,
+              combatant = record.combatant,
+              activation = record.activation,
+              appearance = copyValue(record.species ~= nil and {
+                species = record.species,
+                form = record.form,
+                gender = record.gender,
+                shiny = record.shiny,
+                personality = record.personality,
+              } or nil),
+            }
+          end
+        end
+      end
+    end
+  end
+  refresh(packet.before)
+  refresh(packet.after)
+  local snapshot = {} ---@type table<integer, table<string, unknown>>
+  for _, binding in pairs(self._sourceBindings) do
+    snapshot[#snapshot + 1] = copyValue(binding)
+  end
+  table.sort(snapshot, function(left, right)
+    local leftSide = left.side --[[@as integer]]
+    local rightSide = right.side --[[@as integer]]
+    if leftSide ~= rightSide then
+      return leftSide < rightSide
+    end
+    local leftPosition = left.position --[[@as integer]]
+    local rightPosition = right.position --[[@as integer]]
+    return leftPosition < rightPosition
+  end)
+  return snapshot
+end
+
+-- Selects the frozen requests for every fresh event exactly once and
+-- records each in the per-launch ledger, including omissions. The
+-- selector runs once per event; redelivery replays identical content
+-- and queues nothing new.
+---@param self BattleTimeline
+---@param packet table<string, unknown> delivery carrying launch identity and event-time views
+---@param fresh table<integer, table<string, unknown>> fresh events in sequence order
+---@return table<string, table<integer, table<string, unknown>>> frozen requests by event sequence and kind
+local function prepassRequests(self, packet, fresh)
+  local launch = packet.launchId --[[@as string]]
+  local slots = self._slotGeometry
+  if slots == nil then
+    error("native requests for launch " .. launch .. " need their published slot geometry", 0)
+  end
+  local costLinks = indexCostLinks(launch, fresh)
+  local perEvent = {} ---@type table<string, table<integer, table<string, unknown>>>
+  for _, event in ipairs(fresh) do
+    local detached, envelope = selectionInput(event, packet)
+    local bindings = snapshotSourceBindings(self, packet)
+    local ok, selected = pcall(BattlePresentationFlow.animationPlayback, envelope, detached, slots, {
+      battleScene = self._battleScene,
+      sourceBindings = bindings,
+      costLinks = costLinks,
+    })
+    if not ok then
+      error(
+        "native requests for launch "
+          .. launch
+          .. " event "
+          .. tostring(event.sequence)
+          .. " kind "
+          .. tostring(event.kind)
+          .. " fail selection: "
+          .. tostring(selected),
+        0
+      )
+    end
+    local requests = selected --[[@as table<integer, table<string, unknown>>]]
+    for _, request in ipairs(requests) do
+      ledgerRecord(self, request, event.kind --[[@as string]])
+    end
+    if type(event.sequence) == "number" and type(event.kind) == "string" then
+      perEvent[
+        tostring(event.sequence) .. "\0" .. event.kind --[[@as string]]
+      ] = requests
+    end
+  end
+  return perEvent
+end
+
+-- Demands the exact selected effect behind one ledgered request cue.
+-- The cue itself stays ordered behind the event narration and ahead
+-- of its hit and health work, and still holds every later cue until
+-- the player occurrence actually completes. Each admitted request
+-- queues exactly one cue; redeliveries replay identical ledger
+-- content and queue nothing new. Generic impact and effectiveness
+-- voices stay silent on this path because the selected program owns
+-- audio timing.
 ---@param self BattleTimeline
 ---@param cue table<string, unknown> native-effect cue under admission
 local function beginNativeEffect(self, cue)
@@ -1056,7 +1516,13 @@ local function beginNativeEffect(self, cue)
     return
   end
   cue.startAttempted = true
-  if self._effects == nil then
+  -- Without a usable animation collaborator the routed cue fails
+  -- loudly with provenance: a declined (false) or missing
+  -- collaborator never holds forever or settles as a silent
+  -- generic success. A never-provided collaborator never reaches
+  -- this boundary because enqueue skips native cues entirely.
+  local collaborator = self._effects
+  if type(collaborator) ~= "table" then
     error(
       "native effect "
         .. tostring(cue.effectKey)
@@ -1066,7 +1532,7 @@ local function beginNativeEffect(self, cue)
       0
     )
   end
-  local starter = self._effects.start --[[@as fun(cue: table<string, unknown>): table<string, unknown>?]]
+  local starter = collaborator.start --[[@as fun(cue: table<string, unknown>): table<string, unknown>?]]
   if type(starter) ~= "function" then
     error(
       "native effect "
@@ -1093,107 +1559,112 @@ local function beginNativeEffect(self, cue)
   end
 end
 
--- Source scene gate behind BtlCmd_PlayMoveAnimation: only the optional
--- move-animation roots obey the frozen launch choice, keyed on the
--- executed move rather than the selected command so indirect calls
--- follow the move actually performed. Transform always plays, and
--- non-move cues (status, entry, capture, arrival, decisions) always play.
--- The gated set mirrors the kernel move routes that select a visual
--- program; the disabled route contributes no synthetic wait because the
--- source subscript_0291_WaitMoveAnimation is End alone.
-local SCENE_GATED_ORIGINS = {
-  ["move-used"] = true,
-  struck = true,
-  missed = true,
-  protected = true,
-  charged = true,
-  delayed = true,
-  mimicked = true,
-  immune = true,
-  ["multi-hit"] = true,
-  strike = true,
-}
-
----@param event table<string, unknown> sanitized kernel event carrying its accepted playback facts
----@return string? executed move identity, nil when no move was executed
-local function executedMoveOf(event)
-  local move = event.move --[[@as table<string, unknown>?]]
-  if type(move) == "table" and type(move.executed) == "string" and move.executed ~= "" then
-    return move.executed --[[@as string]]
-  end
-  return nil
-end
-
----@param self BattleTimeline
----@param event table<string, unknown> sanitized kernel event carrying its accepted playback facts
----@return boolean admitted true unless Scene Off omits this optional root
-local function sceneAdmitsEffect(self, event)
-  if self._battleScene ~= false then
-    return true
-  end
-  if SCENE_GATED_ORIGINS[event.kind] ~= true then
-    return true
-  end
-  local executed = executedMoveOf(event)
-  if executed == nil or executed == "TRANSFORM" then
-    return true
-  end
-  return false
-end
-
--- Queues one native-effect cue for an effect-keyed source event behind
--- its attack announcement and ahead of the event's hit and health work.
--- A malformed source action identity fails loudly instead of assigning
--- another user's visual or skipping silently. A Scene Off omission still
--- claims the occurrence so redeliveries and later hits queue nothing new.
----@param self BattleTimeline
----@param event table<string, unknown> sanitized kernel event carrying its accepted playback facts
----@param packet table<string, unknown> delivery carrying launch identity and event-time views
-local function enqueueNativeEffect(self, event, packet)
-  local launch = launchOf(packet)
-  local identity = occurrenceIdentityOf(launch, event, packet)
-  if identity == nil then
-    error(
-      "native effect "
-        .. tostring(event.effectKey)
-        .. " for launch "
-        .. tostring(packet.launchId)
-        .. " names no usable action identity",
-      0
-    )
-  end
-  if self._nativeSeen[identity] == true then
-    return
-  end
-  self._nativeSeen[identity] = true
-  if not sceneAdmitsEffect(self, event) then
-    return
-  end
-  local hitOrdinal = event.hitIndex
-  if type(hitOrdinal) ~= "number" then
-    local payload = event.payload --[[@as table<string, unknown>?]]
-    if type(payload) == "table" and type(payload.hitIndex) == "number" then
-      hitOrdinal = payload.hitIndex
+-- Whether the use announcement owns its action's visual: an attack
+-- announcement alone never proves a source animation call, so a use
+-- event sharing its action with a hit event in the same batch only
+-- narrates while the hit drains the visual. A use with no hit in the
+-- batch is a no-strike execution and drains its own selected call.
+-- Uses whose hit lands in a later batch can still double-play; that
+-- needs producer execution moments to close.
+---@param fresh table<integer, table<string, unknown>> fresh events in sequence order
+---@return table<string, boolean> actions owning at least one hit event in this batch
+local function batchHitActions(fresh)
+  local hits = {} ---@type table<string, boolean>
+  for _, event in ipairs(fresh) do
+    if event.kind == "struck" then
+      local action = event.actionId
+      if type(action) ~= "number" and type(action) ~= "string" then
+        action = event.sequence
+      end
+      hits[tostring(action)] = true
     end
   end
-  local seed = event.visualSeed
-  if type(seed) ~= "number" then
-    seed = visualSeedFor(event.sequence)
+  return hits
+end
+
+-- Queues one native-effect cue per admitted frozen request of the
+-- event, behind its narration and ahead of its hit and health work.
+-- Omitted requests occupy their ledger identities but enqueue no cue
+-- and no invented wait. A use event with a hit sibling only
+-- narrates; the hit owns the action's visual. Every admitted request
+-- selected by the sole Flow selector drains exactly one cue from the
+-- per-batch ledger: omitted requests occupy their identities but
+-- enqueue nothing, and narration/health-only emissions translate
+-- without a cue. A draining cue without a collaborator fails loudly
+-- at its first tick instead of holding silently.
+---@param self BattleTimeline
+---@param event table<string, unknown> sanitized kernel event under translation
+---@param packet table<string, unknown> delivery carrying launch identity and event-time views
+---@param fresh table<integer, table<string, unknown>>? fresh batch behind the use/hit rule, nil outside batch translation
+local function enqueueNativeEffect(self, event, packet, fresh)
+  -- Without an animation collaborator the screen presents the
+  -- established generic cue vocabulary: narration and health
+  -- translate, and no native cue is ever queued behind a
+  -- collaborator that will never arrive.
+  if self._effects == nil then
+    return
   end
-  local cue = {
-    kind = "native-effect",
-    launchId = packet.launchId,
-    packetId = packet.packetId,
-    eventSequence = event.sequence,
-    actionId = event.actionId,
-    hitOrdinal = hitOrdinal,
-    effectKey = event.effectKey,
-    event = event,
-    visualSeed = seed,
-    before = packet.before,
-    after = packet.after,
-  }
-  enqueue(self, cue)
+  local requests = self._batchRequests ~= nil
+      and type(event.sequence) == "number"
+      and type(event.kind) == "string"
+      and self._batchRequests[
+        tostring(event.sequence) .. "\0" .. event.kind --[[@as string]]
+      ]
+    or nil
+  local hits = fresh ~= nil and batchHitActions(fresh) or nil
+  if requests == nil then
+    return
+  end
+  for _, request in ipairs(requests) do
+    if request.disposition == "admit" then
+      local drains = true
+      if event.kind == "move-used" and hits ~= nil then
+        local action = event.actionId
+        if type(action) ~= "number" and type(action) ~= "string" then
+          action = event.sequence
+        end
+        drains = hits[tostring(action)] ~= true
+      end
+      -- One source call drains one cue: admitted siblings sharing
+      -- the action, kind, selected-call ordinal, and catalog key are
+      -- spread continuations of the same call, never new calls.
+      -- Repeated hits carry distinct ordinals and still replay.
+      if drains and self._batchDrained ~= nil then
+        local identity = request.identity --[[@as table<string, unknown>]]
+        local action = event.actionId
+        if type(action) ~= "number" and type(action) ~= "string" then
+          action = event.sequence
+        end
+        local callKey = tostring(action)
+          .. "\0"
+          .. tostring(event.kind)
+          .. "\0"
+          .. tostring(identity.ordinal)
+          .. "\0"
+          .. tostring(request.effectKey)
+        if self._batchDrained[callKey] == true then
+          drains = false
+        else
+          self._batchDrained[callKey] = true
+        end
+      end
+      if drains then
+        -- Animation cues carry no occurrence-derived seed: visual
+        -- variation flows only from the screen-owned battle visual
+        -- stream and the boot SPL stream.
+        enqueue(self, {
+          kind = "native-effect",
+          launchId = packet.launchId,
+          packetId = packet.packetId,
+          eventSequence = event.sequence,
+          actionId = event.actionId,
+          effectKey = request.effectKey,
+          request = copyValue(request),
+          event = event,
+        })
+      end
+    end
+  end
 end
 
 ---@param text string narration wording under presentation
@@ -1344,7 +1815,7 @@ local function queueOpening(self, view)
   local trainerSlides, trainerTracks = openingTrainerSlides(self, view, wild)
   local terrainSlides, terrainTracks = openingTerrainSlides()
   self._openingPresentation = {
-    playerTrainerVisible = true,
+    playerTrainerVisible = not wild,
     foeTrainerVisible = not wild,
     playerGaugeVisible = false,
     enemyGaugeVisible = false,
@@ -1563,7 +2034,8 @@ end
 ---@param event table<string, unknown> sanitized kernel event under translation
 ---@param packet table<string, unknown> delivery carrying launch identity and event-time views
 ---@param narrated table<string, boolean>? attack keys already narrated in this delivery
-local function translateStruck(self, event, packet, narrated)
+---@param fresh table<integer, table<string, unknown>>? fresh batch behind request draining
+local function translateStruck(self, event, packet, narrated, fresh)
   local payload = event.payload --[[@as table<string, unknown>]]
   -- Explicit playback facts name the true attacker and recipient;
   -- only legacy emissions without them fall back to display order.
@@ -1587,38 +2059,20 @@ local function translateStruck(self, event, packet, narrated)
   end
   local moveKey = explicitMove(event)
   local wording = moveUseText(self, attacker, moveKey)
-  -- One attack occurrence narrates once across its hits: the first
-  -- strike voices the attack while later hits keep their impact,
-  -- sound, and checkpoint motion in native order. The announcement
-  -- runs before the visual, and the visual runs once per action and
-  -- phase behind that announcement. Strikes without an effect key
-  -- keep generic voices; their action identity still scopes narration.
-  local nativeKey = nativeEffectKeyOf(event)
-  local occurrence = nil
-  if nativeKey ~= nil or event.actionId ~= nil then
-    occurrence = occurrenceIdentityOf(launchOf(packet), event, packet)
-  end
-  if occurrence ~= nil then
-    if self._announced[occurrence] ~= true then
-      self._announced[occurrence] = true
-      enqueueMessage(self, wording, false, 0)
-    end
-    if nativeKey ~= nil then
-      enqueueNativeEffect(self, event, packet)
-    end
-  else
-    local narrationKey = BattlePresentationFlow.attackKey(attacker, moveKey)
-    local already = narrated ~= nil and narrated[narrationKey] == true
-    if not already then
-      enqueueMessage(self, wording, false, 0)
-      if narrated ~= nil then
-        narrated[narrationKey] = true
-      end
-    end
-    if nativeKey ~= nil then
-      enqueueNativeEffect(self, event, packet)
+  -- One attack narrates once across its hits: the first strike
+  -- voices the attack while later hits keep their impact, sound,
+  -- and checkpoint motion in native order. The announcement runs
+  -- before the visuals, and every admitted hit drains its own
+  -- ledgered request behind that announcement.
+  local narrationKey = BattlePresentationFlow.attackKey(attacker, moveKey)
+  local already = narrated ~= nil and narrated[narrationKey] == true
+  if not already then
+    enqueueMessage(self, wording, false, 0)
+    if narrated ~= nil then
+      narrated[narrationKey] = true
     end
   end
+  enqueueNativeEffect(self, event, packet, fresh)
   -- subscript_0002_UpdateHp: every landed hit plays one impact voice
   -- chosen by effectiveness and panned toward the struck side
   -- (OpponentData_PlayMoveSE), whether or not the move has a program.
@@ -2409,18 +2863,17 @@ function enqueueSendOut(self, incoming, event, switching)
   if switching == true then
     enqueuePartyGauge(self, ownSide, BattleTimeline.PARTY_GAUGE_HIDE_TICKS, false)
   end
-  local throwTicks = enqueueBallThrow(self, incoming, ownSide and "player" or "foe")
+  local throwTicks, ownsBallOpen = enqueueBallThrow(self, incoming, ownSide and "player" or "foe")
   -- The follower slides in with no ball at all: Task_FollowMonSendOut
   -- runs no seal, no ball sound, and no palette fade behind its cry,
-  -- voicing the switch sound as its slide starts instead.
+  -- voicing the switch sound as its slide starts instead. A queued ball
+  -- cue owns its own open sound and seal (see tickBallThrowCue); the
+  -- trainer-exit foe path keeps them on the script beat.
   local follower = isFollowSendOut(self, incoming)
   if follower then
     enqueueFollowerSlideSound(self, incoming)
-  else
+  elseif ownsBallOpen ~= true then
     enqueueBallSound(self, incoming)
-  end
-  -- Task_PokemonSendOut starts the ball's seal particles with its ball sound.
-  if not follower then
     local sendOutBall = ballKeyOf(self, incoming)
     if sendOutBall ~= nil then
       enqueue(self, {
@@ -2536,14 +2989,16 @@ local function enqueueOpeningSendOutBatch(self, combatants, settleTicks, role, w
   end
   local visualTicks = 0
   for _, incoming in ipairs(combatants) do
-    visualTicks = visualTicks + enqueueBallThrow(self, incoming, ownSide and "player" or "foe")
+    local incomingTicks, ownsBallOpen = enqueueBallThrow(self, incoming, ownSide and "player" or "foe")
+    visualTicks = visualTicks + incomingTicks
     -- The follower slides in with no ball at all: Task_FollowMonSlideIn
     -- runs no seal and no ball sound behind its cry, voicing the switch
-    -- sound as its slide starts instead.
+    -- sound as its slide starts instead. A queued ball cue owns its own
+    -- open sound and seal; the trainer-exit foe path keeps them here.
     local follower = isFollowSendOut(self, incoming)
     if follower then
       enqueueFollowerSlideSound(self, incoming)
-    else
+    elseif ownsBallOpen ~= true then
       enqueueBallSound(self, incoming)
       local sendOutBall = ballKeyOf(self, incoming)
       if sendOutBall ~= nil then
@@ -2850,13 +3305,16 @@ local function moveOutcome(messageKey, targetField, moveField)
 end
 
 ---@param self BattleTimeline
----@param event table<string, unknown>
+---@param event table<string, unknown> sanitized kernel event under translation
 ---@param packet table<string, unknown> delivery carrying launch identity and event-time views
-local function translateTransformed(self, event, packet)
-  -- The transform narration runs before its selected native program
-  -- while the essential appearance below still applies synchronously:
-  -- the visual update is never silenced, even on paths where optional
-  -- artwork is suppressed.
+---@param fresh table<integer, table<string, unknown>>? fresh batch behind request draining
+local function translateTransformed(self, event, packet, fresh)
+  -- The selected program runs before its transformed line, and the
+  -- visual task owns the picture change at its authored moment: the
+  -- cue player never swaps the displayed appearance synchronously
+  -- here. The frozen request carries the donor appearance for the
+  -- player and later calls.
+  enqueueNativeEffect(self, event, packet, fresh)
   local payload = event.payload --[[@as table<string, unknown>]]
   local target = payload.target
   assert(type(target) == "number", "transform target is named")
@@ -2870,32 +3328,6 @@ local function translateTransformed(self, event, packet)
     assert(type(speciesName) == "string" and speciesName ~= "", "transform source tags resolve the species name")
     -- subscript_0092_Transform prints the line with WaitButtonABTime 30.
     enqueueMessage(self, messageText(self, "battle/narration/transformed", { who, speciesName }), false, 30, true)
-  end
-  if nativeEffectKeyOf(event) ~= nil then
-    enqueueNativeEffect(self, event, packet)
-  end
-  -- The displayed appearance tracks the copied battler even when
-  -- effects are suppressed: the disabled animation path still applies
-  -- the essential visual update behind its native wait.
-  local donorId = BattlePresentationFlow.transformDonor(event)
-  if donorId ~= nil then
-    local donor = self:_shown(donorId --[[@as integer]])
-    local shown = self:_shown(target --[[@as integer]])
-    if donor ~= nil and shown ~= nil and type(donor.species) == "string" then
-      shown.species = donor.species
-      if type(donor.form) == "number" then
-        shown.form = donor.form
-      end
-      -- The transformed battler draws the donor's picture, never the
-      -- stale pre-transform selector: the exact canonical selector
-      -- switches to the donor's alongside the species and form.
-      if type(donor.portraitSelector) == "string" and donor.portraitSelector ~= "" then
-        shown.portraitSelector = donor.portraitSelector
-      end
-      if donor.gender == "male" or donor.gender == "female" or donor.gender == "genderless" then
-        shown.gender = donor.gender
-      end
-    end
   end
 end
 
@@ -3173,6 +3605,47 @@ local function translateSketched(self, event)
   )
 end
 local translateMimicked = translateSilent
+---@param self BattleTimeline
+---@param event table<string, unknown> identification event under narration
+local function translateIdentified(self, event)
+  local payload = event.payload --[[@as table<string, unknown>]]
+  local user = payload.user
+  local target = payload.target
+  assert(type(user) == "number", "identification narration names its attacker")
+  assert(type(target) == "number", "identification narration names its defender")
+  -- subscript_0100_Foresight and subscript_0158_MiracleEye print the
+  -- line with WaitButtonABTime 30.
+  enqueueMessage(
+    self,
+    messageText(self, "battle/narration/identified", {
+      combatName(self, user --[[@as integer]]),
+      combatName(self, target --[[@as integer]]),
+    }),
+    false,
+    30,
+    true
+  )
+end
+---@param self BattleTimeline
+---@param event table<string, unknown> aim event under narration
+local function translateAimed(self, event)
+  local payload = event.payload --[[@as table<string, unknown>]]
+  local user = payload.user
+  local target = payload.target
+  assert(type(user) == "number", "aim narration names its attacker")
+  assert(type(target) == "number", "aim narration names its defender")
+  -- subscript_0079_LockOn prints the line with WaitButtonABTime 30.
+  enqueueMessage(
+    self,
+    messageText(self, "battle/narration/aimed", {
+      combatName(self, user --[[@as integer]]),
+      combatName(self, target --[[@as integer]]),
+    }),
+    false,
+    30,
+    true
+  )
+end
 local function translateCharged(self, event)
   local targetValue = (event.payload --[[@as table<string, unknown>]]).target
   assert(type(targetValue) == "number", "charged event names its battler")
@@ -3561,11 +4034,14 @@ local function translateBrokeFree(self, event)
         selector = "ball:" .. resting.ballKey,
         trainerless = true,
         openOnly = true,
+        combatant = target,
+        openPan = BattleAudio.SIDE_PAN.foe,
+        throwAnimated = false,
         fromX = spot.x,
         fromY = spot.y,
         targetX = spot.x,
         targetY = spot.y,
-        nominalTicks = BattleTimeline.THROW_OPEN_TICKS,
+        nominalTicks = BattleTimeline.BALL_IN_PLACE_ARC_TICKS + BattleTimeline.THROW_OPEN_TICKS,
       })
     end
     self._captureBall = nil
@@ -3651,6 +4127,8 @@ local OTHER_TRANSLATORS = {
   transformed = translateTransformed,
   sketched = translateSketched,
   mimicked = translateMimicked,
+  identified = translateIdentified,
+  aimed = translateAimed,
   switch = translateSwitch,
   ["status-gate"] = translateStatusGate,
   ["item-intent"] = translateIntent,
@@ -3668,48 +4146,48 @@ local OTHER_TRANSLATORS = {
 ---@param self BattleTimeline
 ---@param event table<string, unknown> sanitized kernel event under translation
 ---@param packet table<string, unknown> delivery carrying launch identity and event-time views
-local function translateOther(self, event, packet)
+---@param fresh table<integer, table<string, unknown>>? fresh batch behind request draining
+---@param narrated table<string, boolean>? attack keys already narrated in this delivery
+local function translateOther(self, event, packet, fresh, narrated)
   local kind = event.kind --[[@as string]]
   if kind == "move-used" then
-    -- A successful no-strike execution admits its visual behind its own
-    -- use announcement. A striking action owns the same occurrence
-    -- through its strike, so whichever event claims it first wins and
-    -- the other stays silent: one action still plays one visual.
+    -- The use event voices its attack announcement, which the batch
+    -- grouping moves ahead of its action's execution moments.
     -- subscript_0076_AttackMessageAndAnimation prints the line, waits
     -- only for the link barrier, and starts the move animation, so the
-    -- announcement carries no hold of its own.
-    local nativeKey = nativeEffectKeyOf(event)
-    local occurrence = (nativeKey ~= nil or event.actionId ~= nil)
-        and occurrenceIdentityOf(launchOf(packet), event, packet)
-      or nil
-    if occurrence == nil or self._announced[occurrence] ~= true then
-      translateMoveUsed(self, event, 0)
-      if occurrence ~= nil then
-        self._announced[occurrence] = true
+    -- announcement carries no hold of its own. The visual drains from
+    -- the ledgered request behind the same boundary: a hit sibling
+    -- owns the action's visual, while a use without hits drains its
+    -- own selected call. The announcement marks the batch narration
+    -- set so the owning hit never voices it twice.
+    translateMoveUsed(self, event, 0)
+    if narrated ~= nil then
+      local usePayload = event.payload --[[@as table<string, unknown>?]]
+      local user = explicitActor(event)
+      if user == nil and type(usePayload) == "table" and type(usePayload.user) == "number" then
+        user = usePayload.user --[[@as integer]]
       end
+      if user == nil then
+        user = moveOwner(self, explicitMove(event))
+      end
+      narrated[BattlePresentationFlow.attackKey(user, explicitMove(event))] = true
     end
-    if nativeKey ~= nil then
-      enqueueNativeEffect(self, event, packet)
-    end
+    enqueueNativeEffect(self, event, packet, fresh)
     return
   end
   if kind == "transformed" then
-    translateTransformed(self, event, packet)
+    translateTransformed(self, event, packet, fresh)
     return
   end
-  -- Any effect-keyed source event narrates before its selected native
-  -- program, except misses and failed moves: HGSS subscript_0007
-  -- announces and waits but does not start a move animation. Other
-  -- source-attributed kinds keep their selected programs instead of
-  -- collapsing onto a generic hit.
+  -- Every remaining event narrates before its selected native
+  -- program: misses and failed moves omit through their ledgered
+  -- disposition instead of a kind check here.
   local translate = OTHER_TRANSLATORS[kind]
   if translate == nil then
     error("unrepresentable effect: " .. kind, 0)
   end
   translate(self, event, packet)
-  if kind ~= "missed" and kind ~= "move-failed" and nativeEffectKeyOf(event) ~= nil then
-    enqueueNativeEffect(self, event, packet)
-  end
+  enqueueNativeEffect(self, event, packet, fresh)
 end
 
 -- Accepts one delivery packet in order: unseen identities translate
@@ -3727,6 +4205,17 @@ function BattleTimeline:present(packet, sourceMessages)
     return false
   end
   local launch = type(packet.launchId) == "string" and packet.launchId or ""
+  -- The ledger is per launch: a delivery naming a new launch without
+  -- an opening reset still starts a new ledger instead of merging
+  -- decisions across launches.
+  if self._launchId == nil then
+    self._launchId = launch
+  elseif self._launchId ~= launch then
+    self._launchId = launch
+    self._ledger = {}
+    self._seen = {}
+    self._sourceBindings = {}
+  end
   local events = {} ---@type table<integer, table<string, unknown>>
   if type(packet.events) == "table" then
     for _, event in
@@ -3793,12 +4282,25 @@ function BattleTimeline:present(packet, sourceMessages)
     self._latest = packet.after
   end
   indexFacts(self, packet.after)
-  -- The use event of a no-strike execution closes its action: within
-  -- each action group it translates first, so its announcement and
-  -- visual lead the action's cue block and stage or status siblings
-  -- of the same action never play ahead of the visual they belong to.
-  -- Grouping never crosses actions and never rewrites kernel event
-  -- identities; only cue scheduling changes.
+  -- The request prepass selects every fresh event's frozen requests
+  -- once and ledgers them, including omissions, before any cue
+  -- enqueues. Only sequenced events carry a ledger identity;
+  -- unsequenced emissions translate narration-only.
+  local sequenced = {} ---@type table<integer, table<string, unknown>>
+  for _, event in ipairs(fresh) do
+    if type(event.sequence) == "number" and event.sequence % 1 == 0 and event.sequence >= 1 then
+      sequenced[#sequenced + 1] = event
+    end
+  end
+  self._batchRequests = prepassRequests(self, packet, sequenced)
+  self._batchDrained = {}
+  -- Announcement-ahead grouping: within each action group the use
+  -- event translates first, so its announcement leads the action's
+  -- cue block. Grouping moves only the announcement; the visual
+  -- drains from the ledgered request at its own event boundary, so
+  -- an early use never steals its hit's occurrence. Grouping never
+  -- crosses actions and never rewrites kernel event identities; only
+  -- cue scheduling changes.
   local groups = {} ---@type table<integer, table<integer, table<string, unknown>>>
   local groupIndex = {} ---@type table<string, integer>
   for _, event in ipairs(fresh) do
@@ -3833,14 +4335,14 @@ function BattleTimeline:present(packet, sourceMessages)
       end
     end
   end
-  -- One attack occurrence narrates once per delivery: the set lives
+  -- One attack narrates once per delivery: the set lives
   -- only for this packet so later packets narrate their own attacks.
   local narrated = {} ---@type table<string, boolean>
   for _, event in ipairs(fresh) do
     if type(event.kind) == "string" then
       local kind = event.kind --[[@as string]]
       if kind == "struck" then
-        translateStruck(self, event, packet, narrated)
+        translateStruck(self, event, packet, narrated, fresh)
       elseif kind == "faint" then
         translateFaint(self, event)
       elseif kind == "exp" then
@@ -3848,10 +4350,12 @@ function BattleTimeline:present(packet, sourceMessages)
       elseif kind == "stats" then
         translateStats(self, event)
       else
-        translateOther(self, event, packet)
+        translateOther(self, event, packet, fresh, narrated)
       end
     end
   end
+  self._batchRequests = nil
+  self._batchDrained = nil
   -- Headless opening and terminal sequencing behind the same packet
   -- boundary: the screen already queued its introduction through its
   -- explicit entry, so a delivery that arrives after that entry never
@@ -3914,7 +4418,7 @@ function BattleTimeline:intro(view, wild)
   local trainerSlides, trainerTracks = openingTrainerSlides(self, view, wild)
   local terrainSlides, terrainTracks = openingTerrainSlides()
   self._openingPresentation = {
-    playerTrainerVisible = true,
+    playerTrainerVisible = not wild,
     foeTrainerVisible = not wild,
     playerGaugeVisible = false,
     enemyGaugeVisible = false,
@@ -4592,7 +5096,41 @@ local function startCue(self, cue)
     local state = assert(self._openingPresentation, "opening ball throws follow an installed opening")
     local trainerTracks = self._trainerSlideTracks
     local slides = state.trainerSlides --[[@as table<integer, table<string, unknown>>]]
+    -- BallThrow runs Task_PokemonSendOut/ThrowPokeball's own ball in mode
+    -- 0 (RunThrowArc with the apex hold and the in-arc open) while the
+    -- trainer's own windup throw runs the capture state machine (mode 3),
+    -- whose kind-15 ball reports opened as the arc completes. The source
+    -- kind behind a trainerless throw selects whether the palette blends
+    -- during flight or where the opening animation reaches its open cell.
+    local modeZero = cue.trainerless == true or cue.arcOnly == true
+    cue.modeZero = modeZero
+    local function resolveBall()
+      local ballKey = assert(cue.selector:match("^ball:([%w_]+)$"), "thrown balls name their staged ball key")
+      cue.ballKey = ballKey
+      cue.opening = self._ballOpening ~= nil and self._ballOpening(ballKey) or nil
+      cue.throwFrames = self._ballThrow ~= nil and self._ballThrow(ballKey) or nil
+      local ballKind = modeZero and ballKindOf(self, cue.combatant --[[@as integer]]) or nil
+      cue.ballKind = ballKind
+      cue.flashing = modeZero and ballFlashes(ballKind) or false
+      if modeZero then
+        if cue.flashing then
+          cue.openEventTick = BattleTimeline.BALL_FLASHING_OPEN_TICKS
+          cue.openEndTick = BattleTimeline.BALL_FLASHING_OPEN_TICKS
+          cue.openingStyle = nil
+        else
+          cue.openEventTick = BattleTimeline.BALL_OPEN_SETUP_TICKS + BattleTimeline.BALL_OPEN_FLASH_TICKS
+          cue.openEndTick = BattleTimeline.THROW_OPEN_TICKS
+          cue.openingStyle = "forced"
+        end
+      else
+        cue.openEventTick = 1
+        cue.openEndTick = BattleTimeline.THROW_OPEN_TICKS
+        cue.openingStyle = "durations"
+      end
+      return ballKey
+    end
     if cue.trainerless == true then
+      local ballKey = resolveBall()
       -- Mid-battle send-out: no trainer on screen, so the ball starts at
       -- its staged spot and arcs (player) or opens in place (foe).
       cue.phase = "arc"
@@ -4605,16 +5143,21 @@ local function startCue(self, cue)
         selector = cue.selector,
         x = cue.startX,
         y = cue.startY,
-        frame = 0,
+        drawableKey = ballCellKey(ballKey, 0),
         rotation = 0,
         visible = true,
       }
       if cue.openOnly == true then
-        cue.phase = "open"
-        cue.openElapsed = 0
-        local ballKey = cue.selector:match("^ball:([%w_]+)$")
-        assert(type(ballKey) == "string", "thrown balls name their staged ball key")
-        startBallBurst(self, ballKey, cue.targetX, cue.targetY)
+        -- The foe ball opens where it already sits: its twelve arc frames
+        -- hold the sprite still with no spin before the open steps run.
+        cue.motionTicks = BattleTimeline.BALL_IN_PLACE_ARC_TICKS
+        cue.arcTicks = BattleTimeline.BALL_IN_PLACE_ARC_TICKS
+        cue.arcHeight = 0
+        cue.spin = false
+      elseif cue.flashing then
+        -- The flashing kinds start their blend four frames before the
+        -- held arc lands, while the ball is still in flight.
+        cue.flashStartArcTick = (cue.arcTicks or BattleTimeline.THROW_ARC_TICKS) - BattleTimeline.BALL_FLASH_LEAD_TICKS
       end
       return
     end
@@ -4657,6 +5200,12 @@ local function startCue(self, cue)
       -- the trainer off, publishing no ball sprite.
       return
     end
+    local ballKey = resolveBall()
+    if cue.flashing then
+      -- The doubles partner's own ball runs the same in-arc blend from
+      -- its stashed release point.
+      cue.flashStartArcTick = (cue.arcTicks or BattleTimeline.THROW_ARC_TICKS) - BattleTimeline.BALL_FLASH_LEAD_TICKS
+    end
     -- Arc targets ride the cue from enqueue (per side type); the cue
     -- start never re-derives them.
     assert(
@@ -4667,7 +5216,7 @@ local function startCue(self, cue)
       selector = cue.selector,
       x = 0,
       y = 0,
-      frame = 0,
+      drawableKey = ballCellKey(ballKey, 0),
       rotation = 0,
       trainerSelector = cue.trainerSelector,
       throwOffsets = cue.throwOffsets,
@@ -4685,14 +5234,26 @@ local function startCue(self, cue)
         slide.phase = "exit-slide"
       end
     end
+    local ballKey = assert(cue.selector:match("^ball:([%w_]+)$"), "thrown balls name their staged ball key")
+    cue.ballKey = ballKey
+    cue.opening = self._ballOpening ~= nil and self._ballOpening(ballKey) or nil
+    cue.modeZero = true
+    cue.flashing = false
+    cue.openingStyle = "forced"
+    cue.openEventTick = BattleTimeline.BALL_OPEN_SETUP_TICKS + BattleTimeline.BALL_OPEN_FLASH_TICKS
+    cue.openEndTick = BattleTimeline.BALL_IN_PLACE_ARC_TICKS + BattleTimeline.THROW_OPEN_TICKS
   elseif cue.kind == "ball-flight" then
     local state = self._openingPresentation
     if state ~= nil then
+      local ballKey = assert(cue.selector:match("^ball:([%w_]+)$"), "thrown balls name their staged ball key")
+      cue.ballKey = ballKey
+      cue.throwFrames = self._ballThrow ~= nil and self._ballThrow(ballKey) or nil
+      cue.throwAnimated = true
       state.ballThrow = {
         selector = cue.selector,
         x = cue.startX,
         y = cue.startY,
-        frame = 0,
+        drawableKey = ballCellKey(ballKey, 0),
         rotation = 0,
         visible = true,
       }
@@ -5027,15 +5588,14 @@ function tickBallPoof(self, cue, shown, entering)
   end
 end
 
--- Starts the ball-burst flash where a thrown ball opens, mirroring the
--- ball-particles cue: the thrown ball bursts while the send-out poof grows
--- the mon behind it, so the open never reads as a frozen ball. The burst
--- animates on its own timeline once started; the cue timing is unchanged.
+-- Starts the capture-style ball burst where a trainer-thrown ball opens.
+-- The burst animates on its own timeline once started; the cue timing is
+-- unchanged.
 ---@param self BattleTimeline
 ---@param ballKey string staged ball behind the burst particles
 ---@param x number burst origin x in source pixels
 ---@param y number burst origin y in source pixels
-function startBallBurst(self, ballKey, x, y)
+local function startBallBurst(self, ballKey, x, y)
   self._ballParticleStarts[#self._ballParticleStarts + 1] = {
     effect = "burst",
     ballKey = ballKey,
@@ -5079,14 +5639,47 @@ local function tickStatsWindowCue(_, cue)
   return cue.acknowledged == true
 end
 
+-- Advances a non-flashing in-place open on one ball sprite: the opening
+-- animation's closed cell, the forced opened-halves cell, the white blend
+-- and the seal/open sound at the source open tick. Returns true once the
+-- ball task's open finished.
+---@param self BattleTimeline
+---@param cue table<string, unknown> cue carrying the source open fields
+---@param ball table<string, unknown> published ball sprite
+---@param openElapsed integer open tick since the arc landed
+---@return boolean finished
+local function tickInPlaceOpen(self, cue, ball, openElapsed)
+  cue.openElapsed = openElapsed
+  local eventTick = cue.openEventTick --[[@as integer]]
+  ball.visible = true
+  ball.rotation = 0
+  ball.paletteFlash = openElapsed >= eventTick and ballFlashCoefficient(openElapsed, eventTick) or nil
+  if openElapsed == eventTick then
+    -- Task_PokemonSendOut/Task_PokemonSlideIn report the ball opened
+    -- here: the BOWA2 and the BallSealEffect sparkle start on this tick.
+    emitSound(self, effectCue(BattleAudio.SINK_SOUNDS.ballOpen, { pan = cue.openPan }))
+    self._ballParticleStarts[#self._ballParticleStarts + 1] = {
+      effect = "seal",
+      ballKey = cue.ballKey,
+      battlerType = battlerTypeOf(self, cue.combatant --[[@as integer]]),
+      duration = 0,
+    }
+  end
+  local frameKey = openBallFrameKey(cue)
+  if frameKey ~= nil then
+    ball.drawableKey = frameKey
+  end
+  return openElapsed >= (cue.openEndTick or BattleTimeline.THROW_OPEN_TICKS)
+end
+
 local function tickTrainerExitCue(self, cue)
   local found = false
-  local finished = true
+  local slideHidden = false
   for index, slide in ipairs(self._openingPresentation and self._openingPresentation.trainerSlides or {}) do
     local track = assert(self._trainerSlideTracks[index], "trainer exits retain their source slide tracks")
     if slide.role == cue.role and track.participant == cue.participant then
       found = true
-      finished = finished and slide.visible ~= true
+      slideHidden = slide.visible ~= true
       local x = assert(type(slide.x) == "number" and slide.x, "foe trainer exits carry their native x")
       if x >= 160 then
         local ball = self._openingPresentation.ballThrow
@@ -5095,30 +5688,35 @@ local function tickTrainerExitCue(self, cue)
             selector = cue.selector,
             x = cue.ballX,
             y = cue.ballY,
-            frame = 0,
+            drawableKey = ballCellKey(assert(cue.selector:match("^ball:([%w_]+)$")), 0),
             rotation = 0,
             trainerParticipant = cue.participant,
             visible = true,
           }
           self._openingPresentation.ballThrow = ball
-          cue.ballElapsed = 0
+          cue.ballElapsed = 1
         else
           cue.ballElapsed = (cue.ballElapsed or 0) + 1
         end
-        if cue.ballElapsed >= 12 and ball.visible ~= false then
-          -- The in-place open finishes here (BallThrow_OpenInPlace):
-          -- burst the ball so its hide reads as an opening, matching
-          -- the player arc's burst at its own open.
-          ball.visible = false
-          local ballKey = cue.selector:match("^ball:([%w_]+)$")
-          assert(type(ballKey) == "string", "thrown balls name their staged ball key")
-          startBallBurst(self, ballKey, ball.x, ball.y)
+        local elapsed = assert(cue.ballElapsed) --[[@as integer]]
+        if elapsed <= BattleTimeline.BALL_IN_PLACE_ARC_TICKS then
+          -- RunThrowArc holds the static foe ball in place before the
+          -- opening animation starts.
+          ball.drawableKey = ballCellKey(cue.ballKey, 0)
+          ball.paletteFlash = nil
+        else
+          local openElapsed = elapsed - BattleTimeline.BALL_IN_PLACE_ARC_TICKS
+          if tickInPlaceOpen(self, cue, ball, openElapsed) then
+            ball.visible = false
+          end
         end
       end
     end
   end
   assert(found, "trainer exit resolves to its source participant slide")
-  return finished
+  -- The trainer walks off over its own twenty-one frames while the
+  -- BallThrow task keeps opening the ball; the cue owns both.
+  return slideHidden and (cue.ballElapsed or 0) >= (cue.openEndTick or BattleTimeline.THROW_OPEN_TICKS)
 end
 
 local function tickBallThrowCue(self, cue)
@@ -5171,18 +5769,45 @@ local function tickBallThrowCue(self, cue)
   ball = assert(ball, "active throws publish a ball sprite")
   if cue.phase == "arc" then
     -- Ball in flight from the release point to the mon spot, spinning
-    -- as it travels, then opening over the target.
+    -- as it travels, then opening over the target. RunThrowArc's player
+    -- send-out hold freezes the sprite (and its motion updates) for four
+    -- frames past the arc midpoint instead of moving every tick.
     cue.arcElapsed = (cue.arcElapsed or 0) + 1
-    local n = math.min(BattleTimeline.THROW_ARC_MOTION_TICKS, cue.arcElapsed - 1)
+    local motionTicks = cue.motionTicks --[[@as integer]]
+    local elapsed = cue.arcElapsed --[[@as integer]]
+    local hold = cue.apexHoldTicks --[[@as integer?]]
+    local n
+    if hold == nil or hold == 0 then
+      n = math.min(motionTicks, elapsed - 1)
+    else
+      local midpoint = math.floor(motionTicks / 2)
+      if elapsed - 1 <= midpoint then
+        n = math.max(0, elapsed - 1)
+      elseif elapsed - 1 <= midpoint + hold then
+        n = midpoint
+      else
+        n = math.min(motionTicks, elapsed - 1 - hold)
+      end
+    end
     ball.x, ball.y = ballArcPoint(cue --[[@as table<string, unknown>]], n)
     ball.visible = true
-    ball.rotation = (n * 0x2000) % 0x10000
-    if cue.arcElapsed >= BattleTimeline.THROW_ARC_TICKS then
+    ball.rotation = cue.spin == false and 0 or (n * 0x2000) % 0x10000
+    if cue.throwAnimated == true then
+      local frameKey = throwFrameKey(cue, elapsed - 1)
+      if frameKey ~= nil then
+        ball.drawableKey = frameKey
+      end
+    end
+    if cue.flashing == true then
+      -- RunThrowArc starts the ball's palette blend at arcDuration / 2 +
+      -- 10, four frames before the held arc lands.
+      local flashStart = cue.flashStartArcTick --[[@as integer]]
+      ball.paletteFlash = elapsed >= flashStart and ballFlashCoefficient(elapsed, flashStart) or nil
+    end
+    if cue.arcElapsed >= (cue.arcTicks or BattleTimeline.THROW_ARC_TICKS) then
       cue.phase = "open"
       cue.openElapsed = 0
-      local ballKey = cue.selector:match("^ball:([%w_]+)$")
-      assert(type(ballKey) == "string", "thrown balls name their staged ball key")
-      startBallBurst(self, ballKey, cue.targetX, cue.targetY)
+      ball.rotation = 0
     end
     return false
   end
@@ -5192,7 +5817,52 @@ local function tickBallThrowCue(self, cue)
     ball.y = cue.targetY
     ball.visible = true
     ball.rotation = 0
-    if cue.openElapsed >= BattleTimeline.THROW_OPEN_TICKS then
+    local eventTick = cue.openEventTick or 1
+    if cue.flashing == true then
+      -- The flashing kinds keep the throw animation running behind the
+      -- in-arc blend and start no opening sequence.
+      local arcTicks = cue.arcTicks or BattleTimeline.THROW_ARC_TICKS
+      ball.paletteFlash = ballFlashCoefficient(arcTicks + cue.openElapsed, cue.flashStartArcTick --[[@as integer]])
+      if cue.throwAnimated == true then
+        local frameKey = throwFrameKey(cue, arcTicks + cue.openElapsed - 1)
+        if frameKey ~= nil then
+          ball.drawableKey = frameKey
+        end
+      end
+      if cue.openElapsed == eventTick then
+        emitSound(self, effectCue(BattleAudio.SINK_SOUNDS.ballOpen, { pan = cue.openPan }))
+        self._ballParticleStarts[#self._ballParticleStarts + 1] = {
+          effect = "seal",
+          ballKey = cue.ballKey,
+          battlerType = battlerTypeOf(self, cue.combatant --[[@as integer]]),
+          duration = 0,
+        }
+      end
+    elseif cue.modeZero == true then
+      if tickInPlaceOpen(self, cue, ball, cue.openElapsed) then
+        ball.visible = false
+        return true
+      end
+      return false
+    else
+      -- The trainer's own kind-15 throw opens with BallBurstEffect and
+      -- follows the staged opening cell durations.
+      if cue.openElapsed == eventTick then
+        emitSound(self, effectCue(BattleAudio.SINK_SOUNDS.ballOpen, { pan = cue.openPan }))
+        self._ballParticleStarts[#self._ballParticleStarts + 1] = {
+          effect = "seal",
+          ballKey = cue.ballKey,
+          battlerType = battlerTypeOf(self, cue.combatant --[[@as integer]]),
+          duration = 0,
+        }
+        startBallBurst(self, cue.ballKey, cue.targetX, cue.targetY)
+      end
+      local frameKey = openBallFrameKey(cue)
+      if frameKey ~= nil then
+        ball.drawableKey = frameKey
+      end
+    end
+    if cue.openElapsed >= (cue.openEndTick or BattleTimeline.THROW_OPEN_TICKS) then
       ball.visible = false
       return true
     end
@@ -5261,6 +5931,12 @@ local function tickBallFlightCue(self, cue)
   local ball = self._openingPresentation and self._openingPresentation.ballThrow or nil
   if ball ~= nil then
     ball.x, ball.y = ballArcPoint(cue, n)
+    if cue.throwAnimated == true then
+      local frameKey = throwFrameKey(cue, elapsed - 1)
+      if frameKey ~= nil then
+        ball.drawableKey = frameKey
+      end
+    end
     if cue.spin == false then
       -- The capture fall drops straight down with no spin: the arc
       -- reset the rotation when its flight finished.

@@ -40,6 +40,16 @@
 -- Stair warps use the profile-owned locked source step and never use door
 -- animation or coordinate compensation.
 --
+-- Dynamic-warp anchors (the source's 0x100) take their destination from the
+-- saved dynamic-warp record the script set: the supplier is read once when the
+-- transition starts, so destination demand, resolution, and the arrival facing
+-- all describe one record. A resolved destination facing wins over the
+-- trigger-derived facing because the source creates the arrival player with
+-- the saved direction. Resolution also carries the trigger-time source facing
+-- snapshot (the source records PlayerAvatar_GetFacingDirection when the warp
+-- triggers), because the choreography turns the live player before the swap;
+-- downstream entrance publication reads that snapshot, never the player.
+--
 -- Panel warps run the teleport spin around the same lifecycle when the bound
 -- player offers facing + height pose control: TELE2 at each spin start, a
 -- 20-tick departure rising on the height arc while turning through each
@@ -76,6 +86,7 @@ local SurfaceResolver = require("libs.hgss.src.world.SurfaceResolver")
 ---@field commit fun(resolution: table<string, unknown>, facing: FieldDirection, prepared: table<string, unknown>)
 ---@field disposePrepared fun(resolution: table<string, unknown>?, prepared: table<string, unknown>?)? -- releases resources owned before commit
 ---@field resolveDestination function
+---@field dynamicWarpSource fun(): table<string, unknown>|nil -- late-read supplier of the saved dynamic-warp destination
 ---@field doorAt fun(runtimeMap: table<string, unknown>, fieldX: integer, fieldZ: integer): table<string, unknown>|nil -- nil = no door choreography
 ---@field playSound fun(soundId: string)?
 ---@field stopSound fun(soundId: string)?
@@ -85,7 +96,7 @@ local SurfaceResolver = require("libs.hgss.src.world.SurfaceResolver")
 ---@field escalatorAt fun(runtimeMap: table<string, unknown>, fieldX: integer, fieldZ: integer): table<string, unknown>?
 ---@field onPanel fun(...: unknown)?
 ---@field player table<string, unknown>|nil -- FieldPlayer, bound by the owner across the swap
----@field phase "idle"|"await_source_visual"|"fade_out"|"load_destination"|"swap_map"|"fade_in"|"choreo_hold"|"preview"
+---@field phase "idle"|"await_destination_environment"|"await_source_visual"|"fade_out"|"load_destination"|"swap_map"|"fade_in"|"choreo_hold"|"preview"
 ---@field fadeAlpha number
 ---@field fade FieldTransitionFade|nil
 ---@field fadeStarted boolean
@@ -110,7 +121,9 @@ local SurfaceResolver = require("libs.hgss.src.world.SurfaceResolver")
 ---@field prepared table<string, unknown>?
 ---@field sourceMap RuntimeFieldMap?
 ---@field sourceWarp table<string, unknown>?
+---@field trigger table<string, unknown>? -- the trigger record that started the transition; retained across the metadata wait
 ---@field coveredSwap boolean -- true while a covered scripted swap owns the lifecycle: destination resolution/commit run, but no FieldTransitionFade is created or advanced because an external screen cover already owns visibility
+---@field dynamicWarp table<string, unknown>|nil -- the saved dynamic-warp destination, resolved once when the transition starts and handed to destination demand and resolution
 ---@field selectPreview fun(sourceMap: RuntimeFieldMap, destinationMap: RuntimeFieldMap, profileId: integer|nil): { imageKey: string, timeSlot: integer, profileId: integer|nil }? -- post-commit source-selected area-preview selector
 ---@field follower { isPresent: fun(): boolean, recall: fun(), rejoin: fun(reason: string) }? -- optional presence-gated follower collaborator: panel departure recall, panel/preview arrival rejoin
 ---@field preview FieldAreaPreview? the active time-aware area preview, nil outside the preview substate
@@ -128,6 +141,7 @@ FieldTransition.__index = FieldTransition
 
 FieldTransition.PHASES = {
   idle = "idle",
+  await_destination_environment = "await_destination_environment",
   await_source_visual = "await_source_visual",
   fade_out = "fade_out",
   fade_in = "fade_in",
@@ -148,6 +162,7 @@ function FieldTransition.new(options)
   return setmetatable({
     loader = options.loader,
     resolveDestination = options.resolveDestination or WarpSystem.resolveDestination,
+    dynamicWarpSource = options.dynamicWarp,
     prepare = options.prepare,
     commit = options.commit,
     disposePrepared = options.disposePrepared,
@@ -181,6 +196,7 @@ function FieldTransition.new(options)
     ownsPlayerAnimationPause = false,
     escalator = nil,
     coveredSwap = false,
+    dynamicWarp = nil,
     preview = nil,
     previewArrival = nil,
     _panelSpin = nil,
@@ -569,6 +585,8 @@ local function resetTransient(self)
   self.escalator = nil
   self.progressTicks = 0
   self.coveredSwap = false
+  self.dynamicWarp = nil
+  self.trigger = nil
   self.preview = nil
   self.previewArrival = nil
   self._panelSpin = nil
@@ -616,7 +634,20 @@ local function adjustVerticalDestination(self, resolution)
   resolution.worldY = resolution.worldY + offset
 end
 
-local function selectProfile(self, sourceMap, trigger)
+-- The destination map profile selection asks about. A dynamic anchor's 0x100
+-- warp names the 0xFFF sentinel map header, which names no map: the saved
+-- destination record is the only destination identity it has.
+---@param self FieldTransition
+---@return integer|string
+local function effectiveDestinationMapId(self)
+  local warp = assert(self.sourceWarp, "profile selection requires the source warp")
+  if warp.destinationWarpId == WarpSystem.DYNAMIC_WARP_SENTINEL then
+    return WarpSystem.dynamicWarpRecord(self.sourceMap, warp, self.dynamicWarp).map
+  end
+  return warp.destinationMapId
+end
+
+local function selectProfile(trigger)
   local descriptor = trigger.transition
   if not descriptor then
     -- Scripted/plain callers have no source classification. They use the
@@ -643,20 +674,68 @@ local function selectProfile(self, sourceMap, trigger)
     )
     return descriptor.profile, descriptor.mode
   end
-  if descriptor.mode == FieldTransitionProfile.MODE_PANEL then
-    return nil, descriptor.mode
+  assert(descriptor.mode == FieldTransitionProfile.MODE_PANEL, "environment mode is resolved by its metadata demand")
+  return nil, descriptor.mode
+end
+
+-- Environment-mode selection needs the destination's generated environment
+-- metadata. That record can still be compiling when a script selected the
+-- destination, so the read is the loader's non-blocking demand: it enrolls the
+-- destination logical closure and reports readiness instead of reading a
+-- not-yet-published record. Only this demand is caught -- the source record and
+-- the profile pair keep their synchronous contract failures.
+---@param self FieldTransition
+---@return boolean ready
+---@return integer|string|nil destinationMapId
+---@return string|nil destinationEnvironment
+---@return string|nil failure
+local function demandDestinationEnvironment(self)
+  local destinationMapId = effectiveDestinationMapId(self)
+  local ready, destinationEnvironment, failure = self.loader:requestTransitionEnvironment(destinationMapId)
+  return ready, destinationMapId, destinationEnvironment, failure
+end
+
+-- Resolve the transition profile before any ownership change. Environment mode
+-- is the only mode that reads destination state; every other mode is decided
+-- from the trigger alone. A destination that is still compiling keeps the field
+-- locked on await_destination_environment and the caller retries until its
+-- metadata demand publishes; missing or failing destination state aborts
+-- through the ordinary pre-commit boundary.
+---@param self FieldTransition
+---@return boolean profile selected
+local function beginProfile(self)
+  local sourceMap = assert(self.sourceMap, "profile selection requires its source map")
+  local trigger = assert(self.trigger, "profile selection requires its trigger")
+  local descriptor = trigger.transition
+  if descriptor == nil or descriptor.mode ~= FieldTransitionProfile.MODE_ENVIRONMENT then
+    self.profileId, self.transitionMode = selectProfile(trigger)
+    return true
   end
   local sourceEnvironment = sourceMap.fieldData and sourceMap.fieldData.transitionEnvironment
   assert(sourceEnvironment, "source transition environment required")
-  assert(type(self.loader.transitionEnvironment) == "function", "field map transition metadata required")
-  local destinationEnvironment = self.loader:transitionEnvironment(self.sourceWarp.destinationMapId)
-  return FieldTransitionProfile.selectEnvironment(sourceEnvironment, destinationEnvironment, {
+  assert(type(self.loader.requestTransitionEnvironment) == "function", "field map transition metadata demand required")
+  local ok, ready, destinationMapId, destinationEnvironment, failure = pcall(demandDestinationEnvironment, self)
+  if not ok then
+    self:_abort(ready)
+    return false
+  end
+  if failure ~= nil then
+    self:_abort(failure)
+    return false
+  end
+  if not ready then
+    self.phase = FieldTransition.PHASES.await_destination_environment
+    self.locked = true
+    return false
+  end
+  self.profileId = FieldTransitionProfile.selectEnvironment(sourceEnvironment, assert(destinationEnvironment), {
     sourceMapId = sourceMap.mapId,
-    destinationMapId = self.sourceWarp.destinationMapId,
+    destinationMapId = destinationMapId,
     sourceEnvironment = sourceEnvironment,
     destinationEnvironment = destinationEnvironment,
-  }),
-    descriptor.mode
+  })
+  self.transitionMode = descriptor.mode
+  return true
 end
 
 -- Begin the source choreography: resolve the source door at the warp tile and
@@ -976,9 +1055,14 @@ local function beginTransition(self, sourceMap, trigger, facing)
   resetTransient(self)
   self.sourceMap = sourceMap
   self.sourceWarp = trigger.warp
+  self.trigger = trigger
   self.sourceKind = trigger.kind
   self.transitionMode = nil
   self.destinationFacing = trigger.destinationFacing or facing
+  self.dynamicWarp = nil
+  if self.dynamicWarpSource ~= nil then
+    self.dynamicWarp = self.dynamicWarpSource()
+  end
   self.facing = facing
   self.resolution = nil
   self.suppression = nil
@@ -1056,19 +1140,30 @@ local function beginFadeOut(self)
   runChoreo(self, beginSourceChoreography)
 end
 
-function FieldTransition:start(sourceMap, trigger, facing)
-  beginTransition(self, sourceMap, trigger, facing)
-  self.profileId, self.transitionMode = selectProfile(self, sourceMap, trigger)
-  if not runOnStart(self, sourceMap, trigger, facing) then
+-- Continue a started transition once its profile is selected. The onStart
+-- callback, the door source-visual wait, and the source fade-out begin here
+-- exactly once, whether the profile was selected synchronously or had to wait
+-- for destination metadata.
+local function beginProfileChoreography(self)
+  local sourceMap = assert(self.sourceMap, "profile choreography requires its source map")
+  local trigger = assert(self.trigger, "profile choreography requires its trigger")
+  if not runOnStart(self, sourceMap, trigger, self.facing) then
     return
   end
-
   if self.sourceKind == "door" and not realizeSourceVisual(self) then
     self.phase = FieldTransition.PHASES.await_source_visual
     self.locked = true
     return
   end
   beginFadeOut(self)
+end
+
+function FieldTransition:start(sourceMap, trigger, facing)
+  beginTransition(self, sourceMap, trigger, facing)
+  if not beginProfile(self) then
+    return
+  end
+  beginProfileChoreography(self)
 end
 
 -- Begin a covered scripted map swap: the caller (ScriptMapsService) has
@@ -1197,6 +1292,15 @@ function FieldTransition:updateFixed(inputSnapshot)
     end
     return false
   end
+  if self.phase == FieldTransition.PHASES.await_destination_environment then
+    -- Profile metadata wait: the destination logical closure compiles while the
+    -- field stays locked. Readiness selects the profile and begins the start
+    -- choreography exactly once; failures abort through the same boundary.
+    if beginProfile(self) then
+      beginProfileChoreography(self)
+    end
+    return false
+  end
   if self.phase == FieldTransition.PHASES.await_source_visual then
     -- Door-kind wait: the source visual compiles in the background while
     -- the field stays locked. Realization swaps the full source map in,
@@ -1238,7 +1342,7 @@ function FieldTransition:updateFixed(inputSnapshot)
     -- session keeps pumping; only readiness runs resolution and preparation
     -- once, and failures use the existing abort path.
     local ok, requestReady, requestError = pcall(function()
-      return self.loader:requestWarp(self.sourceMap, self.sourceWarp)
+      return self.loader:requestWarp(self.sourceMap, self.sourceWarp, self.dynamicWarp)
     end)
     if not ok then
       return self:_abort(requestReady)
@@ -1250,8 +1354,21 @@ function FieldTransition:updateFixed(inputSnapshot)
       return false
     end
     local resolveOk, err = pcall(function()
-      local result = self.resolveDestination(self.loader, self.sourceMap, self.sourceWarp)
+      local result = self.resolveDestination(self.loader, self.sourceMap, self.sourceWarp, self.dynamicWarp)
       self.resolution = result
+      -- The source entrance facing is the trigger-time snapshot: the
+      -- choreography turns the live player before the swap, so the direction
+      -- the source records when the warp triggers (FieldSystem_MapConnection
+      -- stores PlayerAvatar_GetFacingDirection) travels with the resolution.
+      result.sourceFacing = self.facing
+      if result.facing ~= nil then
+        -- A saved dynamic destination direction is the facing the source
+        -- creates the arrival player with: it becomes the transition's
+        -- authoritative destination facing for prepare, commit and the
+        -- profile hooks. The destination geometry adjustments below keep
+        -- their own authority over the arrival facing.
+        self.destinationFacing = result.facing
+      end
       if self.profileId == FieldTransitionProfile.HORIZONTAL_STAIRS then
         adjustHorizontalStairDestination(self, result)
       elseif

@@ -16,8 +16,7 @@
 local ApplicationLayout = require("libs.ui.src.ApplicationLayout")
 local BattleBagPockets = require("game.hgss.src.battle.BattleBagPockets")
 local BattleChildText = require("game.hgss.src.battle.BattleChildText")
-local BattleMenuPresenter = require("game.hgss.src.battle.BattleMenuPresenter")
-local BattleMenuRegions = require("game.hgss.src.battle.BattleMenuRegions")
+local BattlePartyPages = require("game.hgss.src.battle.BattlePartyPages")
 local BattleScene = require("libs.hgss.src.presentation.BattleScene")
 local BattleViewRoster = require("game.hgss.src.battle.BattleViewRoster")
 local FieldDialogueTheme = require("libs.hgss.src.ui.FieldDialogueTheme")
@@ -44,6 +43,14 @@ local TARGET_OUTER = { x = 0, y = 120, width = 256, height = 72 }
 local NARRATION_OUTER = { x = 0, y = 136, width = 256, height = 56 }
 local PROMPT_ORIGIN = { x = 12, y = 146 }
 local PROMPT_MAX_WIDTH = 88
+-- Adapted two-option dock: one framed window holds the staged question
+-- over the two source answers, mirroring the paired lower screen's source
+-- Yes/No cells while keeping the long replacement wording whole. It rises
+-- above the narration dock like the move and target docks do, because a
+-- two-line question and two answer rows do not fit the command strip.
+local TWO_OPTION_OUTER = { x = 0, y = 100, width = 256, height = 92 }
+local TWO_OPTION_QUESTION_LINES = 2
+local TWO_OPTION_ROW_HEIGHT = 20
 local COMMAND_IDS = { "fight", "bag", "pokemon", "run" }
 local COMMAND_LABELS = { fight = "FIGHT", bag = "BAG", pokemon = "POKEMON", run = "RUN" }
 local COMMAND_CELL_WIDTH = 64
@@ -89,10 +96,6 @@ local DOUBLES_HUD_CELLS = {
   enemy = { { x = 4, y = 0 }, { x = 132, y = 0 } },
   player = { { x = 4, y = 80 }, { x = 132, y = 80 } },
 }
-local DOUBLES_PICTURE_CELLS = {
-  enemy = { { x = 24, y = 40 }, { x = 152, y = 40 } },
-  player = { { x = 72, y = 40 }, { x = 200, y = 40 } },
-}
 local DOUBLES_HUD_WIDTH = 120
 local DOUBLES_HUD_HEIGHT = 40
 local DOUBLES_BAR_X = 4
@@ -102,8 +105,6 @@ local DOUBLES_NAME_WIDTH = 76
 local DOUBLES_LEVEL_WIDTH = 32
 local DOUBLES_CONDITION_WIDTH = 44
 local DOUBLES_HEALTH_WIDTH = 59
-local PLAYER_CENTER = { x = 60, y = 96 }
-local ENEMY_CENTER = { x = 196, y = 44 }
 
 ---@param outer table<string, unknown> half-open outer allocation
 ---@return table<string, unknown> framed content box derived through the real theme insets
@@ -184,9 +185,10 @@ local function scopeFor(mode, view)
     if child.kind == "learn" and type(child.confirmation) == "table" then
       return "two-option"
     end
-  elseif mode == "shift" then
-    -- The held Shift offer answers through the source Yes/No planes
-    -- behind the staged question instead of the command menu.
+  elseif mode == "shift" or mode == "use-next" then
+    -- The held Shift offer and the wild replacement offer answer through
+    -- the source two-option identities instead of the command menu, with
+    -- the compact dock adapting those cells to one surface.
     return "two-option"
   end
   return "command"
@@ -496,13 +498,36 @@ local function childContent(child)
   if child.kind == "learn" then
     backRect = { x = 8, y = 172, width = 240, height = 20 }
   end
+  -- Wrapper pages carry their transcribed hitbox regions for taps;
+  -- the roster paints through the native renderer alone.
+  local partyPage = type(child.partyPage) == "string" and child.partyPage or nil
+  local pageRegions = nil
+  if type(child.pageRegions) == "table" then
+    pageRegions = child.pageRegions
+  end
+  -- Party and target titles stay blank without staged wording: the
+  -- native roster and the retail wrapper pages carry their own chrome
+  -- instead of an invented modal title.
+  local title = BattleChildText.title(child)
+  if child.kind == "party" or child.kind == "target" then
+    if type(child.sourceTitle) ~= "string" then
+      title = ""
+    end
+  end
   return {
     kind = child.kind,
     focusId = child.focusId,
-    title = BattleChildText.title(child),
+    title = title,
     rows = rows,
+    partyPage = partyPage,
+    pageRegions = pageRegions,
     bagPage = type(child.bagPage) == "string" and child.bagPage or nil,
-    hasBack = not twoOption and (child.cancellable == true or child.kind == "learn"),
+    -- The native roster and the transcribed wrapper regions own their
+    -- cancel paths; the generic modal Back stays with bag/learn/move.
+    hasBack = not twoOption
+      and child.kind ~= "party"
+      and child.kind ~= "target"
+      and (child.cancellable == true or child.kind == "learn"),
     twoOption = twoOption,
     hasPocketNav = false,
     back = backRect,
@@ -578,39 +603,18 @@ local function doublesHud(view, players, enemies)
   end)
   return { boxes = boxes }
 end
-
----@param view table<string, unknown> internal semantic snapshot under resolution
----@param players table<integer, table<string, unknown>> live allies in slot order under resolution
----@param enemies table<integer, table<string, unknown>> live foes in slot order under resolution
----@return table<integer, table<string, unknown>> compact sprite anchors keyed by native position
-local function doublesSpriteCenters(view, players, enemies)
-  -- Anchors follow the canonical claimed order so a surviving slot
-  -- never slides onto a hidden neighbor's anchor mid-transition.
-  -- Records without a native position keep their live-order anchor.
-  local spots = {} ---@type table<integer, table<string, unknown>>
-  local function add(list, order, cells)
-    for index, battler in ipairs(list) do
-      local cell = cells[BattleViewRoster.claimedIndex(order, battler, index)]
-      assert(cell ~= nil, "the compact doubles anchors cover every live battler")
-      spots[#spots + 1] = {
-        position = battler.position,
-        x = cell.x,
-        y = cell.y,
-        width = 40,
-        height = 40,
-        scale = 0.5,
-      }
-    end
-  end
-  add(enemies, BattleViewRoster.claimedPositions(view, false), DOUBLES_PICTURE_CELLS.enemy)
-  add(players, BattleViewRoster.claimedPositions(view, true), DOUBLES_PICTURE_CELLS.player)
-  table.sort(spots, function(a, b)
-    local pa = a.position
-    local pb = b.position
-    assert(type(pa) == "number" and type(pb) == "number", "doubles sprite anchors key on native positions")
-    return pa < pb
-  end)
-  return spots
+-- One shared battlefield transform behind every world picture,
+-- particle, background and managed sprite: the native lattice fits
+-- uniformly inside the scene rectangle, centered on both axes.
+---@param scene table<string, unknown> fixed half-open scene rectangle
+---@return table<string, unknown> shared world fit behind the compact present
+local function worldTransformFor(scene)
+  local scale = math.min(scene.width / 256, scene.height / 192)
+  return {
+    scale = scale,
+    offsetX = scene.x + (scene.width - 256 * scale) / 2,
+    offsetY = scene.y + (scene.height - 192 * scale) / 2,
+  }
 end
 
 ---@param rect table<string, unknown> fixed half-open rect
@@ -671,6 +675,26 @@ function BattleCompactInterface.contentFor(view)
   if mode == "child" and type(view.childView) == "table" then
     childPlan = childContent(view.childView --[[@as table<string, unknown>]])
   end
+  local twoOptionDock = nil
+  if mode == "shift" or mode == "use-next" then
+    local content = contentOf(TWO_OPTION_OUTER)
+    local questionHeight = TWO_OPTION_QUESTION_LINES * 16
+    local rows = {}
+    for index, id in ipairs({ "confirm", "back" }) do
+      rows[index] = {
+        id = id,
+        x = TWO_OPTION_OUTER.x,
+        y = content.y + questionHeight + (index - 1) * TWO_OPTION_ROW_HEIGHT,
+        width = TWO_OPTION_OUTER.width,
+        height = TWO_OPTION_ROW_HEIGHT,
+      }
+    end
+    twoOptionDock = {
+      outer = copyRect(TWO_OPTION_OUTER),
+      content = content,
+      rows = rows,
+    }
+  end
   -- Doubles take the position-keyed layout whenever some side claims
   -- doubles slots, even while a neighbor hides mid-transition; hidden
   -- slots keep their cells with no live owner. Every other occupancy
@@ -694,6 +718,7 @@ function BattleCompactInterface.contentFor(view)
       cells = cells,
       cursors = cursors,
     },
+    twoOption = twoOptionDock,
     movePanels = { left = contentOf(MOVE_LEFT_OUTER), right = contentOf(MOVE_RIGHT_OUTER) },
     moveGrid = { x = MOVE_GRID_X, columnWidth = MOVE_COLUMN_WIDTH, rowHeight = MOVE_ROW_HEIGHT },
     moveBack = {
@@ -711,9 +736,7 @@ function BattleCompactInterface.contentFor(view)
       width = NARRATION_WIDTH,
     },
     hud = doubles and doublesHud(view, players, enemies) or singlesHud(view),
-    playerCenter = { x = PLAYER_CENTER.x, y = PLAYER_CENTER.y },
-    enemyCenter = { x = ENEMY_CENTER.x, y = ENEMY_CENTER.y },
-    spriteCenters = doubles and doublesSpriteCenters(view, players, enemies) or nil,
+    worldTransform = worldTransformFor(SCENE),
   }
 end
 
@@ -761,6 +784,32 @@ local function childRegions(child)
       { id = "back", x = 8, y = 112, width = 240, height = 56, scope = "child" },
     }
   end
+  -- Wrapper pages resolve through their transcribed hitbox regions
+  -- with the shared cancel rect; the roster paints through the native
+  -- renderer alone, so without it taps name nothing.
+  local page = type(child.partyPage) == "string" and child.partyPage or nil
+  if page == "mon_menu" or page == "summary" or page == "moves" or page == "move_detail" then
+    local regions = {}
+    if type(child.pageRegions) == "table" then
+      for _, region in ipairs(child.pageRegions) do
+        if type(region) == "table" and type(region.id) == "string" then
+          regions[#regions + 1] = {
+            id = region.id,
+            x = region.x,
+            y = region.y,
+            width = region.w,
+            height = region.h,
+            scope = "child",
+          }
+        end
+      end
+      return regions
+    end
+    return nil
+  end
+  if child.kind == "party" or child.kind == "target" then
+    return nil
+  end
   local regions = {}
   local function add(id, rect)
     regions[#regions + 1] =
@@ -795,17 +844,21 @@ local function regionsFor(content, mode)
   if mode == "narration" or mode == "outcome" then
     return { { id = "dialogue", x = 0, y = 0, width = 256, height = 192, scope = mode } }
   end
-  if mode == "shift" then
-    -- Pointer taps arm the Yes/No cells directly: confirm answers Yes
-    -- and back answers No through the same semantic edges as keypad.
+  if mode == "shift" or mode == "use-next" then
+    -- Pointer taps arm the two adapted answer rows directly: confirm
+    -- answers the source top option and back the bottom one through the
+    -- same semantic edges as the keypad.
+    local dock = assert(content.twoOption, "the held offers carry their two-option dock")
     local regions = {}
-    for _, region in ipairs(BattleMenuRegions.forLayout("two-option") or {}) do
+    for _, row in
+      ipairs(dock.rows --[[@as table<integer, table<string, unknown>> ]])
+    do
       regions[#regions + 1] = {
-        id = region.id,
-        x = region.x,
-        y = region.y,
-        width = region.w,
-        height = region.h,
+        id = row.id,
+        x = row.x,
+        y = row.y,
+        width = row.width,
+        height = row.height,
         scope = mode,
       }
     end
@@ -881,7 +934,13 @@ function BattleCompactInterface.mapInput(event, view, plan)
     local child = content.child
     local childView = view.childView
     local native = type(childView) == "table" and childView.native or nil
+    local page = type(childView) == "table" and childView.partyPage or nil
+    local isWrapper = page == "mon_menu" or page == "summary" or page == "moves" or page == "move_detail"
+    -- The native roster resolves through the full-surface native tap;
+    -- wrapper pages own their transcribed hitbox regions instead, since
+    -- the child answers wrapper taps by stable identity, not coordinates.
     local nativeChild = type(child) == "table"
+      and not isWrapper
       and (child.kind == "bag" or child.kind == "party" or child.kind == "target")
       and type(native) == "table"
       and type(native.layout) == "table"
@@ -1120,6 +1179,44 @@ local function drawCommandDock(resources, view, content)
   end
   windows.drawApplicationFrame(content.prompt.content, frame)
   windows.drawApplicationFrame(content.commands.content, frame)
+end
+
+-- Draws the adapted two-option dock: the staged question over the two
+-- source answers, with the text cursor on the selected row.
+---@param resources table<string, unknown> borrowed application collaborators
+---@param view table<string, unknown> internal semantic snapshot under drawing
+---@param content table<string, unknown> canonical compact plan content under drawing
+local function drawTwoOptionDock(resources, view, content)
+  local text = assert(resources.text, "the compact render borrows its text services")
+  local windows = assert(resources.windows, "the compact render borrows its window services")
+  local background = backgroundOf(resources)
+  local frame = resources.frameKey
+  local dock = assert(content.twoOption, "the held offers carry their two-option dock") --[[@as table<string, unknown>]]
+  local inner = assert(dock.content, "the two-option dock carries its framed content") --[[@as table<string, number>]]
+  fillBox(resources.graphics, background, dock.outer --[[@as table<string, unknown>]])
+  local lines = wrapPrompt(text, view.message or "", inner.width, TWO_OPTION_QUESTION_LINES)
+  for index, line in ipairs(lines) do
+    drawLabel(text, line, inner.x, inner.y + (index - 1) * 16)
+  end
+  local labels = view.twoOption --[[@as table<string, unknown>?]]
+  if type(labels) == "table" then
+    local right = inner.x + inner.width
+    for _, row in
+      ipairs(dock.rows --[[@as table<integer, table<string, unknown>> ]])
+    do
+      local wording = row.id == "confirm" and labels.top or labels.bottom
+      if type(wording) == "string" then
+        local selected = (row.id == "confirm" and view.selection == "yes")
+          or (row.id == "back" and view.selection == "no")
+        local textX = inner.x + 16
+        if selected then
+          drawLabel(text, CURSOR, inner.x, row.y --[[@as integer]] + 2)
+        end
+        drawLabel(text, fitText(text, wording --[[@as string]], right - textX), textX, row.y --[[@as integer]] + 2)
+      end
+    end
+  end
+  windows.drawApplicationFrame(dock.content, frame)
 end
 
 ---@param resources table<string, unknown> borrowed application collaborators
@@ -1644,25 +1741,26 @@ end
 ---@param childView table<string, unknown>? detached child view carrying the staged labels
 local function drawTwoOptionModal(resources, view, childView)
   local text = resources.text --[[@as table<string, unknown>]]
-  local graphics = assert(resources.graphics, "the compact render borrows its host graphics")
-  local assets = assert(resources.assets, "the compact render borrows its asset holder")
-  local pressed = BattleMenuPresenter.drawChildTwoOption(graphics, assets, view)
+  local BattleRenderer = require("game.hgss.src.battle.BattleRenderer")
   local sourceLabels = assert(childView, "the child snapshot carries source text") --[[@as table<string, unknown>]]
   local labels = assert(sourceLabels.twoOption, "learning confirmation carries staged source labels") --[[@as table<string, unknown>]]
   local drawText = text.drawTextForRole --[[@as fun(role: string, content: string, x: number, y: number, colors: table<string, integer>?)?]]
   local measureText = text.measureForRole --[[@as fun(role: string, content: string): table<string, number>?]]
-  local function drawOption(value, anchorY, colors, optionId)
-    local label = assert(value, "the two-option source label is staged") --[[@as string]]
-    local width = measureText ~= nil and measureText("menu", label).width or text.measure(label).width
-    local y = pressed == optionId and anchorY - 2 or anchorY
-    if drawText ~= nil then
-      drawText("menu", label, 128 - math.floor(width / 2), y, colors)
-    else
-      text.drawText(label, 128 - math.floor(width / 2), y)
+  local function overlay(pressed)
+    local function drawOption(value, anchorY, colors, optionId)
+      local label = assert(value, "the two-option source label is staged") --[[@as string]]
+      local width = measureText ~= nil and measureText("menu", label).width or text.measure(label).width
+      local y = pressed == optionId and anchorY - 2 or anchorY
+      if drawText ~= nil then
+        drawText("menu", label, 128 - math.floor(width / 2), y, colors)
+      else
+        text.drawText(label, 128 - math.floor(width / 2), y)
+      end
     end
+    drawOption(labels.top, 67, { foreground = 1, shadow = 2, background = 3 }, "yes")
+    drawOption(labels.bottom, 139, { foreground = 10, shadow = 11, background = 12 }, "cancel")
   end
-  drawOption(labels.top, 67, { foreground = 1, shadow = 2, background = 3 }, "yes")
-  drawOption(labels.bottom, 139, { foreground = 10, shadow = 11, background = 12 }, "cancel")
+  BattleRenderer.drawTwoOptionPane(resources, view, overlay)
 end
 
 -- Tabular row columns relative to the row origin: the entry name width,
@@ -1741,6 +1839,12 @@ end
 ---@param childPlan table<string, unknown> canonical child plan content
 ---@param childView table<string, unknown>? detached child view under drawing
 local function drawChildFooter(text, childPlan, childView)
+  -- Party and target children own no modal footer: the native roster
+  -- and the retail wrapper pages carry their own chrome.
+  local kind = type(childPlan) == "table" and childPlan.kind or nil
+  if kind == "party" or kind == "target" then
+    return
+  end
   local view = type(childView) == "table" and childView or nil
   if view ~= nil and view.kind == "learn" and type(view.confirmation) == "table" then
     drawLabel(text, fitText(text, learnConfirmation(view), 232), 12, 136)
@@ -1765,6 +1869,463 @@ local function drawChildFooter(text, childPlan, childView)
   drawLabel(text, fitText(text, notice, 232), 12, 172)
 end
 
+-- Measures one compact label through the text service, falling back
+-- to the raw width when the service carries no measure.
+---@param text table<string, unknown> borrowed text services
+---@param content string text under measuring
+---@return number measured width
+local function compactMeasure(text, content)
+  if type(text.measure) == "function" then
+    local ok, measured = pcall(text.measure, content)
+    if ok and type(measured) == "table" and type(measured.width) == "number" then
+      return measured.width
+    end
+  end
+  return #tostring(content) * 8
+end
+
+---@param childView table<string, unknown> detached wrapper child view under lookup
+---@param index integer code window index under lookup
+---@return table<string, number>? pixel origin, extent, and palette bank, nil without a staged template
+local function compactWindowBox(childView, index)
+  local boxes = childView.windowBoxes --[[@as table<integer, table<string, number>>?]]
+  local box = type(boxes) == "table" and boxes[index + 1] or nil
+  if type(box) ~= "table" then
+    return nil
+  end
+  return {
+    x = box.left * 8,
+    y = box.top * 8,
+    w = box.width * 8,
+    h = box.height * 8,
+    bank = box.palette,
+  }
+end
+
+-- Fills one wrapper HP bar through the staged party palette like the
+-- paired painter: the retail color pair over the staged track, with
+-- byte channels normalized to the host color range.
+---@param graphics table<string, unknown> borrowed host graphics under drawing
+---@param view table<string, unknown> internal semantic snapshot carrying the staged text palettes
+---@param entry table<string, unknown> projected HP bar window under drawing
+---@param box table<string, number> window pixel origin, extent, and palette bank under drawing
+local function drawCompactBar(graphics, view, entry, box)
+  local current = tonumber(entry.current) or 0
+  local max = tonumber(entry.max) or 0
+  if current <= 0 or max <= 0 then
+    return
+  end
+  local pixels = BattleScene.hpPixels(current, max)
+  local colorIdx = BattleScene.hpColorIdx(pixels)
+  if pixels <= 0 or colorIdx == 0 then
+    return
+  end
+  local dark, light = 1, 2
+  if colorIdx == 2 then
+    dark, light = 3, 4
+  elseif colorIdx == 1 then
+    dark, light = 5, 6
+  end
+  -- The bar window fills through its own template palette bank like
+  -- every wrapper text role; a box without its bank paints nothing.
+  local bank = box.bank
+  if type(bank) ~= "number" then
+    return
+  end
+  local palettes = assert(view.textPalettes, "the compact wrapper borrows its staged text palettes")
+  local colors = assert(palettes.party, "the compact wrapper borrows the staged party palette").colors --[[@as table[] ]]
+  local function ink(slot)
+    local color = assert(colors[bank * 16 + slot + 1], "party bar slots fall inside their palette bank")
+    return { color.r / 255, color.g / 255, color.b / 255 }
+  end
+  local darkInk, lightInk = ink(dark), ink(light)
+  graphics.setColor(lightInk[1], lightInk[2], lightInk[3], 1)
+  graphics.rectangle("fill", box.x, box.y + 1, pixels, 1)
+  graphics.setColor(darkInk[1], darkInk[2], darkInk[3], 1)
+  graphics.rectangle("fill", box.x, box.y + 2, pixels, 2)
+  graphics.setColor(lightInk[1], lightInk[2], lightInk[3], 1)
+  graphics.rectangle("fill", box.x, box.y + 4, pixels, 1)
+  graphics.setColor(1, 1, 1, 1)
+end
+
+-- Repaints one summary experience-bar track like DrawExpBar: the staged
+-- per-level tile behind the filled pixels, over the 8-tile track.
+-- Missing staged tiles draw nothing, leaving the empty track the page
+-- raster carries.
+---@param assets table<string, unknown> borrowed asset holder under drawing
+---@param graphics table<string, unknown> borrowed host graphics under drawing
+---@param entry table<string, unknown> projected experience-bar window under drawing
+local function drawCompactExpTiles(assets, graphics, entry)
+  local current = tonumber(entry.current) or 0
+  local max = tonumber(entry.max) or 0
+  local pixels = 0
+  if max > 0 and current > 0 then
+    pixels = math.floor(current * 64 / max)
+    if pixels < 0 then
+      pixels = 0
+    elseif pixels > 64 then
+      pixels = 64
+    end
+    if pixels == 0 then
+      pixels = 1
+    end
+  end
+  for column = 0, 7 do
+    local level = pixels - column * 8
+    if level < 0 then
+      level = 0
+    elseif level > 8 then
+      level = 8
+    end
+    local art = assets:drawable("party:exp:" .. tostring(level))
+    if art ~= nil then
+      if type(art.draw) == "function" then
+        art:draw(graphics, 80 + column * 8, 64)
+      else
+        graphics.draw(art, 80 + column * 8, 64)
+      end
+    end
+  end
+end
+
+-- Draws one compact wrapper text role through its transcribed window:
+-- single text at its origin, centered, or right-aligned; the HP/PP
+-- splits print their positioned parts; embedded line breaks
+-- (ability/move descriptions carry the ROM 0xE000 breaks as "\n")
+-- flow to the next 16-pixel row like the retail printer. Missing
+-- windows or text draw nothing.
+---@param text table<string, unknown> borrowed text services
+---@param view table<string, unknown> internal semantic snapshot carrying the staged text palettes
+---@param entry table<string, unknown> projected window content under drawing
+---@param box table<string, number> window pixel origin, extent, and palette bank under drawing
+---@param spec table<string, unknown> transcribed text layout behind the role
+---@param graphics table<string, unknown> borrowed host graphics behind bar fills
+local function drawCompactRole(text, view, entry, box, spec, graphics)
+  if spec.bar == true then
+    drawCompactBar(graphics, view, entry, box)
+    return
+  end
+  if spec.parts == "hp" then
+    local slash = tostring(entry.slash or "/")
+    local slashWidth = compactMeasure(text, slash)
+    local middle = math.floor((box.w - slashWidth) / 2)
+    local current = tostring(entry.current or "")
+    if current ~= "" then
+      drawLabel(text, current, box.x + middle - compactMeasure(text, current), box.y)
+    end
+    drawLabel(text, slash, box.x + middle, box.y)
+    local max = tostring(entry.max or "")
+    if max ~= "" then
+      drawLabel(text, max, box.x + middle + slashWidth, box.y)
+    end
+    return
+  end
+  if spec.parts == "move-pp" then
+    local label = tostring(entry.label or "")
+    if label ~= "" then
+      drawLabel(text, label, box.x + 40, box.y + 24)
+    end
+    local slash = tostring(entry.slash or "/")
+    local slashWidth = compactMeasure(text, slash)
+    local current = tostring(entry.current or "")
+    if current ~= "" then
+      drawLabel(text, current, box.x + 80 - compactMeasure(text, current), box.y + 24)
+    end
+    drawLabel(text, slash, box.x + 80, box.y + 24)
+    local max = tostring(entry.max or "")
+    if max ~= "" then
+      drawLabel(text, max, box.x + 80 + slashWidth, box.y + 24)
+    end
+    return
+  end
+  if spec.parts == "pp" then
+    local slash = tostring(entry.slash or "/")
+    local slashWidth = compactMeasure(text, slash)
+    local middle = math.floor((box.w - slashWidth) / 2)
+    local current = tostring(entry.current or "")
+    if current ~= "" then
+      drawLabel(text, current, box.x + middle - compactMeasure(text, current), box.y)
+    end
+    drawLabel(text, slash, box.x + middle, box.y)
+    local max = tostring(entry.max or "")
+    if max ~= "" then
+      drawLabel(text, max, box.x + middle + slashWidth, box.y)
+    end
+    return
+  end
+  local content = tostring(entry.text or "")
+  if content == "" then
+    return
+  end
+  local baseY = box.y + (tonumber(spec.y) or 0)
+  local row = 0
+  for line in (content .. "\n"):gmatch("(.-)\n") do
+    if line ~= "" then
+      local x = box.x + (tonumber(spec.x) or 0)
+      if spec.align == "center" then
+        x = box.x + math.floor((box.w - compactMeasure(text, line)) / 2)
+      elseif spec.align == "right" then
+        x = box.x + box.w - compactMeasure(text, line)
+      end
+      drawLabel(text, line, x, baseY + row * 16)
+    end
+    row = row + 1
+  end
+end
+
+-- Draws one battle summary, move-list, or move-detail wrapper page in
+-- the compact modal: the staged ROM page background composites first,
+-- pressed/disabled faces repaint over it, every window prints through
+-- its transcribed template with the compact ink, and sprites and the
+-- d-pad cursor ride their retail anchors. Missing staged art keeps
+-- the fill under the existing pending path, never substitutes.
+---@param resources table<string, unknown> borrowed application collaborators
+---@param view table<string, unknown> internal semantic snapshot carrying the staged text palettes
+---@param childView table<string, unknown> detached wrapper child view under drawing
+local function drawCompactWrapperPage(resources, view, childView)
+  local graphics = assert(resources.graphics, "the compact render borrows its host graphics")
+  local assets = assert(resources.assets, "the compact wrapper borrows its asset holder")
+  local text = assert(resources.text, "the compact render borrows its text services")
+  local page = childView.partyPage --[[@as string]]
+  local artKey = BattlePartyPages.pageArtKey(page) or ("party:page/" .. page)
+  local pageArt = assets:drawable(artKey)
+  if pageArt ~= nil then
+    if type(pageArt.draw) == "function" then
+      pageArt:draw(graphics, 0, 0)
+    else
+      graphics.draw(pageArt, 0, 0)
+    end
+  end
+  -- Disabled faces (single-mon prev/next, empty move slots) and the
+  -- staged press dip repaint over the rest page raster.
+  local function face(button, frame)
+    local rects = childView.pageButtonRects --[[@as table<integer, table<string, number>>?]]
+    local rect = type(rects) == "table" and rects[button] or nil
+    if rect == nil then
+      return
+    end
+    local art = assets:drawable("party:button:" .. tostring(button) .. ":" .. tostring(frame))
+    if art == nil then
+      return
+    end
+    if type(art.draw) == "function" then
+      art:draw(graphics, rect.x * 8, rect.y * 8)
+    else
+      graphics.draw(art, rect.x * 8, rect.y * 8)
+    end
+  end
+  if page == "mon_menu" then
+    if childView.pageIsEgg == true then
+      face(8, 3)
+      face(10, 3)
+    end
+  elseif page == "summary" then
+    if childView.pageMultiMon ~= true then
+      face(12, 3)
+      face(13, 3)
+    end
+  elseif page == "moves" then
+    if childView.pageMultiMon ~= true then
+      face(12, 3)
+      face(13, 3)
+    end
+    local windows = childView.pageWindows --[[@as table<integer, table<string, unknown>>?]]
+    local known = {}
+    if type(windows) == "table" then
+      for _, window in ipairs(windows) do
+        local slot = type(window) == "table"
+          and type(window.role) == "string"
+          and tonumber(window.role:match("^move%-name:(%d+)$") or "")
+        if slot ~= nil and tostring(window.text or "") ~= "" then
+          known[slot] = true
+        end
+      end
+    end
+    for moveSlot = 0, 3 do
+      if known[moveSlot] ~= true then
+        face(14 + moveSlot, 3)
+      end
+    end
+  elseif page == "move_detail" then
+    local selected = tonumber(childView.pageMove) or 0
+    face(30 + selected, 2)
+  end
+  local press = childView.pagePress --[[@as table<string, unknown>?]]
+  if type(press) == "table" then
+    local button = nil
+    if page == "mon_menu" then
+      button = ({ [0] = 7, [1] = 8, [2] = 10, [3] = 6 })[tonumber(press.button) or -1]
+    elseif page == "summary" then
+      button = ({ [0] = 12, [1] = 13, [2] = 11, [3] = 6 })[tonumber(press.button) or -1]
+    elseif page == "moves" then
+      button = ({ [0] = 14, [1] = 15, [2] = 16, [3] = 17, [4] = 12, [5] = 13, [6] = 9, [7] = 6 })[tonumber(press.button) or -1]
+    elseif page == "move_detail" and tonumber(press.button) == 4 then
+      button = 6
+    end
+    local frame = ({ [1] = 1, [2] = 2, [3] = 0 })[tonumber(press.phase) or 0]
+    if button ~= nil and frame ~= nil then
+      face(button, frame)
+    end
+  end
+  -- Window text through the transcribed text layout with the compact
+  -- ink; the sprite and cursor layers below keep their retail anchors.
+  local layout = BattlePartyPages.textLayout(page)
+  local windows = childView.pageWindows --[[@as table<integer, table<string, unknown>>?]]
+  local byRole = {} ---@type table<string, table<string, unknown>>
+  if type(windows) == "table" then
+    for _, window in ipairs(windows) do
+      if type(window) == "table" and type(window.role) == "string" then
+        byRole[window.role] = window
+      end
+    end
+  end
+  -- The mon-menu name centers with its gender symbol like
+  -- PrintMonNameCentered instead of pinning the symbol to the window
+  -- edge.
+  if page == "mon_menu" then
+    local nameEntry = byRole["mon-name"]
+    if nameEntry ~= nil then
+      local box = compactWindowBox(childView, 0)
+      if box ~= nil then
+        local name = tostring(nameEntry.text or "")
+        local genderEntry = byRole["mon-gender"]
+        local symbol = type(genderEntry) == "table" and tostring(genderEntry.text or "") or ""
+        local gap = symbol ~= "" and 8 or 0
+        local nameWidth = compactMeasure(text, name)
+        local symbolWidth = symbol ~= "" and compactMeasure(text, symbol) or 0
+        local x = box.x + math.floor((box.w - nameWidth - symbolWidth - gap) / 2)
+        drawLabel(text, name, x, box.y + 7)
+        if symbol ~= "" then
+          drawLabel(text, symbol, x + nameWidth + gap, box.y + 8)
+        end
+      end
+    end
+  end
+  for role, spec in pairs(layout) do
+    local entry = byRole[role]
+    -- The mon-menu name block paints above as one centered unit, so
+    -- the generic loop skips both halves of it.
+    if entry ~= nil and not (page == "mon_menu" and (role == "mon-name" or role == "mon-gender")) then
+      local box = compactWindowBox(childView, spec.window --[[@as integer]])
+      if box ~= nil then
+        if role == "mon-gender" then
+          local symbol = tostring(entry.text or "")
+          if symbol ~= "" then
+            local x = box.x + box.w - compactMeasure(text, symbol)
+            drawLabel(text, symbol, x, box.y)
+          end
+        else
+          drawCompactRole(text, view, entry, box, spec, graphics)
+        end
+      end
+    end
+  end
+  -- The experience bar repaints its staged tiles like DrawExpBar, and
+  -- the refusal message prints over the mon menu through the message
+  -- window.
+  local expEntry = byRole["exp-bar"]
+  if expEntry ~= nil then
+    drawCompactExpTiles(assets, graphics, expEntry)
+  end
+  local messageEntry = byRole["message"]
+  if messageEntry ~= nil then
+    local message = tostring(messageEntry.text or "")
+    if message ~= "" then
+      local row = 0
+      for line in message:gmatch("[^\n]+") do
+        drawLabel(text, line, 16, 152 + row * 16)
+        row = row + 1
+      end
+    end
+  end
+  -- Sprites ride their retail anchors through the established
+  -- providers; corners frame the focused box while the cursor is
+  -- active. Missing drawables draw nothing.
+  local function drawAt(key, x, y)
+    local art = assets:drawable(key)
+    if art == nil then
+      return
+    end
+    local width, height = 16, 16
+    if type(art.getDimensions) == "function" then
+      width, height = art:getDimensions()
+    end
+    local drawX = x - math.floor(width / 2)
+    local drawY = y - math.floor(height / 2)
+    if type(art.draw) == "function" then
+      art:draw(graphics, drawX, drawY)
+    else
+      graphics.draw(art, drawX, drawY)
+    end
+  end
+  for _, sprite in ipairs(childView.pageSprites or {}) do
+    if type(sprite) == "table" and type(sprite.kind) == "string" then
+      local key = nil
+      local skey = sprite.key --[[@as string?]]
+      if sprite.kind == "icon" then
+        key = "battle:icon:" .. tostring(sprite.key) .. ":frame:1"
+      elseif sprite.kind == "mon-type" or sprite.kind == "move-type" then
+        key = "battle:move-type-icon:" .. tostring(skey or ""):lower()
+      elseif sprite.kind == "category" then
+        key = "battle:move-category-icon:" .. tostring(skey or ""):lower()
+      elseif sprite.kind == "status" then
+        key = "battle:status-icon:" .. tostring(skey or ""):lower()
+      elseif sprite.kind == "held-item" then
+        key = "battle:item-icon:" .. tostring(skey)
+      end
+      if key ~= nil then
+        drawAt(key, tonumber(sprite.x) or 0, tonumber(sprite.y) or 0)
+      end
+    end
+  end
+  if childView.cursorActive == true then
+    local boxes = childView.pageCursorBoxes --[[@as table<integer, table<string, unknown>>?]]
+    local cursor = tonumber(childView.pageCursor) or 0
+    local box = type(boxes) == "table" and boxes[cursor + 1] or nil
+    if type(box) == "table" then
+      local cornerFrames = view.wrapperCursorFrames --[[@as table<string, table<string, unknown>>?]]
+      if type(cornerFrames) ~= "table" then
+        cornerFrames = view.bagCursorFrames --[[@as table<string, table<string, unknown>>?]]
+      end
+      local cornerTick = tonumber(view.wrapperCursorTick) or 0
+      local function cornerOffset(corner)
+        local staged = type(cornerFrames) == "table" and cornerFrames[corner] or nil
+        local list = type(staged) == "table" and staged.frames or nil
+        if type(list) ~= "table" then
+          return 0, 0
+        end
+        local total = 0
+        for _, frame in ipairs(list) do
+          total = total + (tonumber(frame.duration) or 0)
+        end
+        if total <= 0 then
+          return 0, 0
+        end
+        local at = cornerTick % total
+        local elapsed = 0
+        for _, frame in ipairs(list) do
+          local duration = tonumber(frame.duration) or 0
+          if duration > 0 and at < elapsed + duration then
+            return tonumber(frame.x) or 0, tonumber(frame.y) or 0
+          end
+          elapsed = elapsed + duration
+        end
+        return 0, 0
+      end
+      local spots = {
+        { key = "battle:cursor-tl", corner = "tl", x = box.left, y = box.top },
+        { key = "battle:cursor-tr", corner = "tr", x = box.right, y = box.top },
+        { key = "battle:cursor-bl", corner = "bl", x = box.left, y = box.bottom },
+        { key = "battle:cursor-br", corner = "br", x = box.right, y = box.bottom },
+      }
+      for _, spot in ipairs(spots) do
+        local dx, dy = cornerOffset(spot.corner)
+        drawAt(spot.key, spot.x + dx, spot.y + dy)
+      end
+    end
+  end
+end
+
 -- Draws the open child as a fullscreen 256x192 modal: the title,
 -- every projected row with its focus and disabled marks, the staged
 -- learning confirmation, and the permitted Back and pocket controls.
@@ -1782,6 +2343,16 @@ local function drawChildModal(resources, view, content, placement)
   if type(childView) == "table" then
     local BattleRenderer = require("game.hgss.src.battle.BattleRenderer")
     if BattleRenderer.drawNativeChild(resources, childView, placement) then
+      return
+    end
+    -- Wrapper pages paint through their retail page painter; the
+    -- native roster stays hidden behind them.
+    if childView.kind == "party" or childView.kind == "target" then
+      local page = childView.partyPage --[[@as string?]]
+      if page == "mon_menu" or page == "summary" or page == "moves" or page == "move_detail" then
+        drawCompactWrapperPage(resources, view, childView)
+        return
+      end
       return
     end
   end
@@ -1849,13 +2420,34 @@ local function drawChildModal(resources, view, content, placement)
         end
       end
     end
+    -- D-pad cursor corners frame the focused box while the cursor is
+    -- active (BattleDpadCursor_SetRect over the page cursor boxes; set
+    -- by keys, cleared by touch), exactly like the paired modal.
+    -- Sprites center on the corners like the item spots. A missing
+    -- staged corner draws nothing under the existing pending path,
+    -- never a substitute or a text marker.
+    local bagTick = view.bagCursorTick --[[@as integer?]] or 0
+    for _, corner in
+      ipairs(BattleBagPockets.cursorDraws(childView.native, bagPage, childView.focusId, bagTick, view.bagCursorFrames))
+    do
+      local cornerArt = assets:drawable(corner.key)
+      if cornerArt ~= nil then
+        local width, height = 32, 32
+        if type(cornerArt.getDimensions) == "function" then
+          width, height = cornerArt:getDimensions()
+        end
+        local cornerX = corner.x - math.floor(width / 2)
+        local cornerY = corner.y - math.floor(height / 2)
+        if type(cornerArt.draw) == "function" then
+          cornerArt:draw(resources.graphics, cornerX, cornerY)
+        else
+          resources.graphics.draw(cornerArt, cornerX, cornerY)
+        end
+      end
+    end
   end
   drawLabel(text, fitText(text, tostring(childPlan.title or ""), 200), 12, 10)
   if type(childView) == "table" then
-    local occupancy = BattleChildText.occupancy(childView)
-    if occupancy ~= nil then
-      drawLabel(text, occupancy, 216, 10)
-    end
     if childView.kind == "bag" and type(childView.stock) == "number" then
       drawLabel(text, "Stock: " .. tostring(childView.stock), 176, 10)
     end
@@ -1892,20 +2484,68 @@ function BattleCompactInterface.render(resources, view, plan)
   local BattleRenderer = require("game.hgss.src.battle.BattleRenderer")
   LogicalSurface.draw(graphics, placement, function()
     if view.mode == "child" and type(content.child) == "table" and type(view.childView) == "table" then
-      drawChildModal(resources, view, content, placement)
+      -- Child modals compose through the sub engine fullscreen: the
+      -- modal content owns every role it paints, never a post-composed
+      -- overlay.
+      local function drawChildModalDock()
+        drawChildModal(resources, view, content, placement)
+      end
+      BattleRenderer.drawCompactDock(resources, view, {
+        draw = drawChildModalDock,
+        rect = { x = 0, y = 0, width = 256, height = 192 },
+      })
       return
     end
-    BattleRenderer.drawPane(resources, view, BattleCompactInterface.NATIVE.id, content, placement)
-    drawCompactHud(resources, view, content)
+    -- HUD, narration and docks enter the composition as content
+    -- callbacks at their planned target coordinates; nothing draws
+    -- past the pass. Interactive docks compose through the sub engine
+    -- inside their dock rectangle; narration rides the main window.
     local mode = view.mode
+    local function drawCompactHudContent()
+      drawCompactHud(resources, view, content)
+    end
+    local compactUI = {
+      hud = drawCompactHudContent,
+    }
+    local subDock = nil
     if mode == "command" then
-      drawCommandDock(resources, view, content)
+      local function drawCommandSubDock()
+        drawCommandDock(resources, view, content)
+      end
+      subDock = {
+        draw = drawCommandSubDock,
+        rect = { x = 0, y = 136, width = 256, height = 56 },
+      }
     elseif mode == "moves" then
-      drawMoveDock(resources, view, content)
+      local function drawMoveSubDock()
+        drawMoveDock(resources, view, content)
+      end
+      subDock = {
+        draw = drawMoveSubDock,
+        rect = { x = 0, y = 120, width = 256, height = 72 },
+      }
     elseif mode == "target" then
-      drawTargetDock(resources, view, content)
+      local function drawTargetSubDock()
+        drawTargetDock(resources, view, content)
+      end
+      subDock = {
+        draw = drawTargetSubDock,
+        rect = { x = 0, y = 120, width = 256, height = 72 },
+      }
+    elseif mode == "shift" or mode == "use-next" then
+      local function drawTwoOptionSubDock()
+        drawTwoOptionDock(resources, view, content)
+      end
+      subDock = { draw = drawTwoOptionSubDock, rect = content.twoOption.outer }
     else
-      drawNarrationDock(resources, view, content)
+      local function drawNarrationWindow()
+        drawNarrationDock(resources, view, content)
+      end
+      compactUI.window = drawNarrationWindow
+    end
+    BattleRenderer.drawPane(resources, view, BattleCompactInterface.NATIVE.id, content, placement, compactUI)
+    if subDock ~= nil then
+      BattleRenderer.drawCompactDock(resources, view, subDock)
     end
   end)
 end

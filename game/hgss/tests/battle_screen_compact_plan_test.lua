@@ -7,11 +7,24 @@
 
 local Assert = require("tests.support.Assert")
 local ApplicationPresentation = require("libs.ui.src.ApplicationPresentation")
+local CompositionFrameDrain = require("tests.support.CompositionFrameDrain")
 local BattleScreenInterface = require("game.hgss.src.battle.BattleScreenInterface")
 local FakeGraphics = require("tests.support.FakeGraphics")
 local BattlePresentationManifestFixture = require("tests.support.BattlePresentationManifestFixture")
 local FieldDialogueTheme = require("libs.hgss.src.ui.FieldDialogueTheme")
 local ScreenTopology = require("libs.ui.src.ScreenTopology")
+
+
+-- Drains one typed composition frame through the recording boundary so
+-- compact content assertions observe production draws without GPU.
+---@param graphics table recording graphics boundary under drawing
+---@return function renderPictures stub behind the test asset holder
+local function drainPictures(graphics)
+  return function(_, drawGraphics, frame)
+    CompositionFrameDrain.drain(drawGraphics, frame)
+    return { handle = "picture-composite" }
+  end
+end
 
 local T = {}
 
@@ -417,9 +430,7 @@ function T.disabled_focusable_absent_blank()
       drawable = function(_, key)
         return fakeImage(key)
       end,
-      renderPictures = function()
-        return { handle = "picture-composite" }
-      end,
+      renderPictures = drainPictures(graphics),
     },
     frameKey = "compact-plan-test-frame",
     sceneImageKey = "scene:test",
@@ -491,6 +502,7 @@ function T.label_clip_regions_bound_drawn_text()
       drawable = function(_, key)
         return fakeImage(key)
       end,
+      renderPictures = drainPictures(graphics),
     },
     frameKey = "compact-plan-test-frame",
     sceneImageKey = "scene:test",
@@ -517,6 +529,7 @@ function T.label_clip_regions_bound_drawn_text()
       drawable = function(_, key)
         return fakeImage(key)
       end,
+      renderPictures = drainPictures(promptGraphics),
     },
     frameKey = "compact-plan-test-frame",
     sceneImageKey = "scene:test",
@@ -567,10 +580,8 @@ function T.hud_anchors_and_native_defaults_unaffected()
   Assert.equal(content.hud.enemy.y, 4, "the enemy bounds keep their top anchor")
   Assert.equal(content.hud.player.rightEdge, 252, "the player bounds keep their right edge")
   Assert.equal(content.hud.player.y, 4, "the player bounds keep the upper-right anchor")
-  Assert.equal(content.playerCenter.x, 60, "the player image keeps its interim center column")
-  Assert.equal(content.playerCenter.y, 96, "the player image keeps its interim center row")
-  Assert.equal(content.enemyCenter.x, 196, "the enemy image keeps its interim center column")
-  Assert.equal(content.enemyCenter.y, 44, "the enemy image keeps its interim center row")
+  Assert.isNil(content.playerCenter, "no interim portrait center survives beside the shared transform")
+  Assert.isNil(content.enemyCenter, "no interim enemy center survives beside the shared transform")
   Assert.equal(BattleRenderer.PLAYER_CENTER.x, 64, "the native player image center is unchanged")
   Assert.equal(BattleRenderer.ENEMY_CENTER.x, 192, "the native enemy image center is unchanged")
   Assert.equal(BattleRenderer.PLAYER_HUD.x, 192, "the native player HUD anchor is unchanged")
@@ -727,29 +738,13 @@ function T.doubles_panels_and_portraits_fit_the_locked_compact_band()
       assertRect(boxes[index], expected, mode .. " panel " .. index)
       Assert.isTrue(boxes[index].y + boxes[index].height <= 120, mode .. " panel stays above the earliest dock")
     end
-    Assert.equal(#content.spriteCenters, 4, mode .. " retains all canonical portrait slots")
-    for index, expected in ipairs(pictureRects) do
-      local actual = content.spriteCenters[index]
-      for _, key in ipairs({ "position", "x", "y", "width", "height", "scale" }) do
-        Assert.equal(actual[key], expected[key], mode .. " portrait " .. index .. " " .. key)
-      end
-      Assert.isTrue(actual.x + actual.width <= 256, mode .. " portrait stays within the right edge")
-      Assert.isTrue(actual.y + actual.height <= 120, mode .. " portrait stays above the earliest dock")
-    end
-    for _, picture in ipairs(content.spriteCenters) do
-      for _, panel in ipairs(boxes) do
-        local disjoint = picture.x + picture.width <= panel.x
-          or panel.x + panel.width <= picture.x
-          or picture.y + picture.height <= panel.y
-          or panel.y + panel.height <= picture.y
-        Assert.isTrue(disjoint, mode .. " portrait never overlaps a panel")
-      end
-    end
   end
 end
 
--- Compact fallback cases share logical portrait geometry across host
--- aspect ratios; paired native panes do not consume the adapted plan.
+-- Compact fallback cases share one logical battlefield transform across
+-- host aspect ratios; paired native panes do not consume the adapted
+-- plan. The transform fits the native lattice uniformly inside the
+-- scene rectangle, so host fitting never moves world art on its own.
 function T.doubles_compact_geometry_survives_fitted_host_topologies()
   require(COMPACT_MODULE)
   local view = snapshot("moves", {
@@ -760,15 +755,23 @@ function T.doubles_compact_geometry_survives_fitted_host_topologies()
       { combatant = 4, side = 2, position = 4, visible = true },
     },
   })
-  local expected = { { 72, 40 }, { 200, 40 }, { 24, 40 }, { 152, 40 } }
+  local first = nil
   for _, dimensions in ipairs({ { 320, 240 }, { 400, 240 }, { 240, 400 }, { 320, 320 } }) do
     local plan =
       resolve(singleMeasurement(dimensions[1], dimensions[2], "compact-doubles-fitted:" .. dimensions[1]), view)
     local content = assert(plan.content)
-    for index, point in ipairs(expected) do
-      local spot = content.spriteCenters[index]
-      Assert.deepEqual({ spot.x, spot.y }, point, "fitted host keeps authored logical picture slot " .. index)
+    local transform = assert(content.worldTransform, "the fitted plan carries one battlefield transform")
+    if first == nil then
+      first = transform
+    else
+      Assert.deepEqual(transform, first, "fitted hosts share the logical world fit")
     end
+    local scene = assert(content.scene, "the fitted plan carries its scene rectangle")
+    Assert.equal(
+      transform.scale,
+      math.min(scene.width / 256, scene.height / 192),
+      "the shared fit stays uniform inside the scene"
+    )
   end
 end
 
@@ -809,6 +812,7 @@ function T.dock_draw_uses_shared_background_and_shared_frame()
       drawable = function(_, key)
         return fakeImage(key)
       end,
+      renderPictures = drainPictures(graphics),
     },
     frameKey = "compact-plan-test-frame",
     sceneImageKey = "scene:test",
@@ -856,10 +860,10 @@ local function footerRosterRows(count, occupied)
   return rows
 end
 
----@param plan table resolved plan under test driving
----@param view table internal semantic snapshot under test driving
----@return table<string, integer> drawn text census keyed by content
-local function childDrawCensus(plan, view)
+---@param plan table resolved plan under test drawing
+---@param view table internal semantic snapshot under test drawing
+---@return table[] drawn text entries for one plan draw
+local function planDrawText(plan, view)
   local graphics = FakeGraphics.new({})
   local order = {}
   local text = recordingText(order)
@@ -871,19 +875,30 @@ local function childDrawCensus(plan, view)
       drawable = function(_, key)
         return fakeImage(key)
       end,
-      renderPictures = function()
-        return { handle = "picture-composite" }
-      end,
+      renderPictures = drainPictures(graphics),
     },
     frameKey = "compact-plan-test-frame",
     sceneImageKey = "scene:test",
   }, view, plan)
+  return text.draws
+end
+
+---@param draws table[] drawn text entries under census
+---@return table<string, integer> drawn text census keyed by content
+local function censusOf(draws)
   local census = {}
-  for _, entry in ipairs(text.draws) do
+  for _, entry in ipairs(draws) do
     local content = tostring(entry.content)
     census[content] = (census[content] or 0) + 1
   end
   return census
+end
+
+---@param plan table resolved plan under test drawing
+---@param view table internal semantic snapshot under test drawing
+---@return table<string, integer> drawn text census keyed by content
+local function childDrawCensus(plan, view)
+  return censusOf(planDrawText(plan, view))
 end
 
 ---@param view table internal semantic snapshot under test driving
@@ -926,23 +941,25 @@ function T.child_footer_wording_matches_across_compact_and_paired_draws()
     {
       name = "target",
       child = { kind = "target", stagedItem = "POTION", focusId = "slot:1", rows = footerRosterRows(3, 2) },
-      caption = "Select the target.",
-      occupancy = "2/3",
-      title = "Use POTION on whom?",
+      -- Target children paint through the native renderer alone: no
+      -- invented title, guidance, or occupancy rides either modal.
+      caption = nil,
+      occupancy = nil,
+      title = nil,
     },
     {
       name = "forced-party",
       child = { kind = "party", focusId = "slot:1", rows = footerRosterRows(3, 2) },
-      caption = "Select its replacement.",
-      occupancy = "2/3",
-      title = "Choose a replacement!",
+      caption = nil,
+      occupancy = nil,
+      title = nil,
     },
     {
       name = "voluntary-party",
       child = { kind = "party", cancellable = true, focusId = "slot:1", rows = footerRosterRows(3, 2) },
-      caption = "Select a reserve.",
-      occupancy = "2/3",
-      title = "Choose a Pokemon!",
+      caption = nil,
+      occupancy = nil,
+      title = nil,
     },
     {
       name = "learn",
@@ -980,18 +997,15 @@ function T.child_footer_wording_matches_across_compact_and_paired_draws()
     {
       name = "missing-rows-party",
       child = { kind = "party" },
-      caption = "Select its replacement.",
+      caption = nil,
       occupancy = nil,
-      title = "Choose a replacement!",
+      title = nil,
     },
   }
   local captions = {
-    "Select the target.",
     "Select an item.",
     "Select a move to forget.",
     "Restore which move?",
-    "Select a reserve.",
-    "Select its replacement.",
   }
   for _, case in ipairs(cases) do
     local tag = " (" .. case.name .. ")"
@@ -1049,6 +1063,77 @@ function T.child_footer_wording_matches_across_compact_and_paired_draws()
   end
 end
 
+-- The held Shift and use-next offers adapt the source two-option menu to
+-- one compact dock: a two-line question over the two staged answers with
+-- the cursor on the selected row, and each row claims its tap under the
+-- offer's own scope.
+function T.two_option_dock_adapts_the_source_answers_to_one_surface()
+  require(COMPACT_MODULE)
+  for _, case in ipairs({
+    {
+      mode = "shift",
+      route = "menu/switch-or-keep",
+      question = "LEAD is about to switch out.",
+      top = "Switch Pokémon",
+      bottom = "Keep battling",
+    },
+    {
+      mode = "use-next",
+      route = "menu/switch-or-flee",
+      question = "Use next Pokémon?",
+      top = "Use next Pokémon",
+      bottom = "Flee",
+    },
+  }) do
+    local tag = " (" .. case.mode .. ")"
+    local view = snapshot(case.mode, {
+      message = case.question,
+      selection = "yes",
+      twoOption = { route = case.route, top = case.top, bottom = case.bottom },
+    })
+    local plan = resolve(singleMeasurement(256, 192, "compact-plan-test:two-option-" .. case.mode), view)
+    local content = assert(plan.content, "the compact plan carries its content" .. tag)
+    Assert.equal(content.layout, "two-option", "the offer draws the source two-option menu" .. tag)
+    local dock = assert(content.twoOption, "the held offer carries its two-option dock" .. tag)
+    Assert.equal(#dock.rows, 2, "the dock adapts both source answers" .. tag)
+    local top, bottom = dock.rows[1], dock.rows[2]
+    Assert.equal(top.id, "confirm", "the first row answers the top source option" .. tag)
+    Assert.equal(bottom.id, "back", "the second row answers the bottom source option" .. tag)
+    Assert.isTrue(bottom.y >= top.y + top.height, "the answers stack without overlapping" .. tag)
+    Assert.isTrue(
+      bottom.y + bottom.height <= dock.outer.y + dock.outer.height,
+      "both answer rows stay inside the dock" .. tag
+    )
+    Assert.isTrue(dock.content.y + 32 <= top.y, "the question keeps its two lines above the answers" .. tag)
+    for _, row in ipairs({ top, bottom }) do
+      local press = plan.mapInput(
+        { type = "pointer_down", pointerId = "tap:" .. row.id, x = row.x + 8, y = row.y + 8 },
+        view,
+        plan
+      )
+      Assert.notNil(press, "the " .. row.id .. " row claims its tap" .. tag)
+      Assert.equal(press.control.id, row.id, "the tap names its own answer cell" .. tag)
+      Assert.equal(press.control.scope, case.mode, "the tap answers under the offer's own scope" .. tag)
+    end
+    Assert.isNil(
+      plan.mapInput({ type = "pointer_down", pointerId = "tap:question", x = 128, y = top.y - 2 }, view, plan),
+      "the question above the answers claims nothing" .. tag
+    )
+    local draws = planDrawText(plan, view)
+    local ink = censusOf(draws)
+    Assert.equal(ink[case.question], 1, "the dock paints the staged question" .. tag)
+    Assert.equal(ink[case.top], 1, "the top answer paints its staged wording" .. tag)
+    Assert.equal(ink[case.bottom], 1, "the bottom answer paints its staged wording" .. tag)
+    local cursors = 0
+    for _, entry in ipairs(draws) do
+      if entry.x == dock.content.x and entry.y == top.y + 2 then
+        cursors = cursors + 1
+      end
+    end
+    Assert.equal(cursors, 1, "the cursor rests on the selected answer" .. tag)
+  end
+end
+
 -- Multi-actor decisions name the acting battler at each dock's acting
 -- origin so staged choices are never mistaken for the previous entry's;
 -- a single-actor decision names nobody there.
@@ -1073,6 +1158,7 @@ function T.multi_actor_docks_name_the_acting_battler()
           drawable = function(_, key)
             return fakeImage(key)
           end,
+          renderPictures = drainPictures(graphics),
         },
         frameKey = "compact-plan-test-frame",
         sceneImageKey = "scene:test",
@@ -1087,6 +1173,23 @@ function T.multi_actor_docks_name_the_acting_battler()
       Assert.equal(named, total > 1, "the dock names the acting battler only in multi-actor decisions" .. tag)
     end
   end
+end
+
+
+-- One battlefield transform fits the native lattice inside the scene
+-- rectangle: every world picture, particle, background and managed
+-- sprite shares it, so no per-battler anchor may move art on its own.
+function T.compact_plan_carries_one_battlefield_transform()
+  require(COMPACT_MODULE)
+  local plan = resolve(singleMeasurement(256, 192, "compact-plan-test:transform"), snapshot("command"))
+  local content = assert(plan.content, "the compact plan carries its content")
+  local scene = assert(content.scene, "the compact plan carries its scene rectangle")
+  local transform = assert(content.worldTransform, "the compact plan carries one battlefield transform")
+  local scale = math.min(scene.width / 256, scene.height / 192)
+  Assert.equal(transform.scale, scale, "the transform fits the native lattice uniformly")
+  Assert.equal(transform.offsetX, scene.x + (scene.width - 256 * scale) / 2, "the fitted lattice centers horizontally")
+  Assert.equal(transform.offsetY, scene.y + (scene.height - 192 * scale) / 2, "the fitted lattice centers vertically")
+  Assert.isNil(content.spriteCenters, "no per-battler anchor survives beside the shared transform")
 end
 
 return { tests = T }

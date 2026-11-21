@@ -22,6 +22,8 @@ local FieldDialogueRenderer = require("libs.hgss.src.ui.FieldDialogueRenderer")
 local FieldWindowRenderer = require("libs.hgss.src.ui.FieldWindowRenderer")
 local FieldYesNoRenderer = require("libs.hgss.src.ui.FieldYesNoRenderer")
 local LogicalSurface = require("libs.ui.src.LogicalSurface")
+local PixelScale = require("libs.ui.src.PixelScale")
+local NativeDisplay = require("libs.ui.src.NativeDisplay")
 local FieldMenuRenderer = require("libs.hgss.src.ui.FieldMenuRenderer")
 local FieldSignpostRenderer = require("libs.hgss.src.ui.FieldSignpostRenderer")
 local FieldTextRenderer = require("libs.hgss.src.ui.FieldTextRenderer")
@@ -31,6 +33,7 @@ local FieldTerrainEffectRenderer = require("libs.hgss.src.presentation.FieldTerr
 local GpuAssetPool = require("libs.hgss.src.presentation.GpuAssetPool")
 local FieldRenderer = require("libs.hgss.src.presentation.FieldRenderer")
 local StartMenuRenderer = require("libs.hgss.src.ui.StartMenuRenderer")
+local FieldCallNoticeRenderer = require("game.hgss.src.field.FieldCallNoticeRenderer")
 local Utf8Glyphs = require("libs.assets.src.Utf8Glyphs")
 local ApplicationPresentation = require("libs.ui.src.ApplicationPresentation")
 local TrainerCardRenderer = require("libs.hgss.src.ui.TrainerCardRenderer")
@@ -101,6 +104,7 @@ local FieldAreaPreviewRenderer = require("game.hgss.src.field.FieldAreaPreviewRe
 ---@field menuRenderer FieldMenuRenderer
 ---@field signpostRenderer FieldSignpostRenderer?
 ---@field startMenuRenderer StartMenuRenderer?
+---@field _callNoticeRenderer FieldCallNoticeRenderer? the lazily built incoming-call notice
 ---@field trainerCardRenderer TrainerCardRenderer?
 ---@field partyScreenRenderer PartyScreenRenderer?
 ---@field partyManifest table<string, unknown> validated native party-screen presentation geometry
@@ -432,6 +436,19 @@ local function buildPresenters(owner)
           })
         end)
       end
+    elseif inputKey == "mailbox" or inputKey == "mailbox-inactive" then
+      -- The Party menu's Mail read and confirmation leaves are the same
+      -- Mailbox surfaces the PC child draws: one fitted native pane.
+      ApplicationPresentation.draw(hostGraphics, {
+        graphics = hostGraphics,
+        mailViewGeometry = MailViewInterface.TEXT,
+        mailboxRenderer = assert(owner.mailboxRenderer, "Mailbox drawing borrows its owned renderer"),
+        monIconProvider = assert(owner.monIconProvider, "Mailbox drawing borrows the shared mon icon provider"),
+        itemIconProvider = assert(owner.itemIconProvider, "Mailbox drawing borrows the shared item icon provider"),
+        textRenderer = assert(owner.textRenderer, "Mailbox drawing borrows the field text renderer"),
+        windowRenderer = assert(owner.windowRenderer, "Mailbox drawing borrows the shared field-window renderer"),
+        applicationFrameIndex = assert(owner.applicationFrameIndex, "Mailbox drawing borrows the selected frame"),
+      }, status, plan)
     elseif inputKey == "easy-chat" or inputKey == "easy-chat-inactive" then
       owner:drawEasyChat(status)
     else
@@ -834,6 +851,13 @@ end
 ---@return boolean ready
 ---@return string? failure
 function FieldPresentationResources:prepareMonNamingSubject(subject)
+  -- Only the party-nickname subject owns a mon icon; the player and rival
+  -- subjects are generated naming animations the shared renderer draws
+  -- itself, so they need the renderer prepared and nothing else.
+  if subject.kind ~= "pokemon" then
+    ensureMonNamingRenderer(self)
+    return true, nil
+  end
   local iconKey = assert(subject.iconKey, "Pokemon naming subject requires its icon key")
   local icons = assert(self.monIconProvider, "field presentation owns the mon icon provider")
   local ready, failure = icons:prepareKeys({ iconKey })
@@ -867,6 +891,25 @@ end
 ---@return NamingScreenRenderer the renderer prepared by a successful naming preparation
 function FieldPresentationResources:monNamingRenderer()
   return assert(self.namingRenderer, "field presentation owns no Pokemon naming renderer")
+end
+
+-- The incoming-call notice over the live field, built on first use so a
+-- field boot that never rings acquires no caller art. It borrows the shared
+-- image owner and the field text renderer, and releases with the rest of the
+-- presentation.
+---@return FieldCallNoticeRenderer
+function FieldPresentationResources:callNoticeRenderer()
+  local renderer = self._callNoticeRenderer
+  if renderer ~= nil then
+    return renderer
+  end
+  renderer = FieldCallNoticeRenderer.new({
+    manifest = assert(self.uiManifest, "field UI manifest is unavailable"),
+    text = assert(self.textRenderer, "field presentation owns no text renderer"),
+    imagePool = assert(self._imagePool, "field presentation borrows its shared image owner"),
+  })
+  self._callNoticeRenderer = renderer
+  return renderer
 end
 
 -- Draws the current application through its registered presenter. The map is
@@ -1053,6 +1096,14 @@ function FieldPresentationResources:preparePcApplication(status, runtime)
       end
       return true
     end
+    -- While the parked give-target picker owns the screen, the list
+    -- beneath draws no mon icons: polling its empty demand here would
+    -- retire the picker's adopted icon pages every tick (the picker
+    -- prepares its own demand on its gated tick), so only the list
+    -- chrome stays hot for the return.
+    if status.phase == "picker" then
+      return assert(self.mailboxRenderer, "Mailbox borrows its owned renderer"):prepare(status)
+    end
     for _, icon in ipairs(assert(status.icons, "Mailbox status publishes message icon snapshots")) do
       iconKeys[#iconKeys + 1] = icon.iconKey
     end
@@ -1080,12 +1131,14 @@ function FieldPresentationResources:pcApplicationResources(runtime)
   end
   return {
     drawEasyChat = drawEasyChat,
+    graphics = assert(love and love.graphics, "PC applications draw through the host graphics namespace"),
     mailViewGeometry = MailViewInterface.TEXT,
     icons = assert(self.monIconProvider, "PC applications borrow the shared mon icon provider"),
     itemIcons = assert(self.itemIconProvider, "Storage borrows the shared item icon provider"),
     storageRenderer = assert(self.storageRenderer, "Storage borrows its owned renderer"),
     mailboxRenderer = assert(self.mailboxRenderer, "Mailbox borrows its owned renderer"),
     photoAlbumRenderer = assert(self.photoAlbumRenderer, "Photo Album borrows its owned renderer"),
+    partyScreenRenderer = assert(self.partyScreenRenderer, "Mailbox pickers borrow the shared party renderer"),
     monCatalog = assert(runtime.monCatalog, "Photo Album borrows the shared mon catalog"),
     monIconProvider = assert(self.monIconProvider, "Mailbox borrows the shared mon icon provider"),
     itemIconProvider = assert(self.itemIconProvider, "Mailbox borrows the shared item icon provider"),
@@ -1233,16 +1286,61 @@ function FieldPresentationResources:_bannerSkinFor(styleKey)
 end
 
 -- Draws the transient area-name banner above the world and warp fade and below
--- script/foreground covers, anchored to the canonical MAIN reference frame.
+-- script/foreground covers, fitted to the actual screen bounds.
 -- A hidden banner paints nothing.
 ---@param banner FieldMapNameBanner the runtime's banner controller
----@param referenceFrame LayoutGeometry.Rect canonical MAIN field screen
-function FieldPresentationResources:drawMapNameBanner(banner, referenceFrame)
+---@param bounds LayoutGeometry.Rect actual host screen bounds
+function FieldPresentationResources:drawMapNameBanner(banner, bounds)
   local status = banner:status()
   if status == nil then
     return
   end
-  assert(self.bannerRenderer, "field presentation owns no map-name banner renderer"):draw(status, referenceFrame)
+  assert(self.bannerRenderer, "field presentation owns no map-name banner renderer"):draw(status, bounds)
+end
+
+-- The one placement every source main-display window paints through: the
+-- canonical MAIN field reference frame at the resolved field pixel scale, so a
+-- source tile coordinate lands on the same host pixel for both the floor box
+-- and the money box whatever the viewport scale is.
+---@param referenceFrame LayoutGeometry.Rect canonical MAIN field screen
+---@param fieldScale integer the resolved field pixel scale
+---@return LayoutGeometry.Placement
+function FieldPresentationResources.mainDisplayPlacement(referenceFrame, fieldScale)
+  local scale = PixelScale.fitPreferred(referenceFrame, NativeDisplay.WIDTH, NativeDisplay.HEIGHT, fieldScale)
+  return PixelScale.cover(referenceFrame, scale).placement
+end
+
+-- Draws an open source floor box on the MAIN field surface at its source tile
+-- placement: a framed window four tiles high with the source title on the first
+-- row and the floor label indented by its own source offset on the second. The
+-- host owns the window's lifetime; this only paints the current snapshot.
+---@param window table<string, unknown> the floor window snapshot
+---@param referenceFrame LayoutGeometry.Rect the canonical MAIN field screen
+---@param fieldScale integer the resolved field pixel scale
+function FieldPresentationResources:drawFloorWindow(window, referenceFrame, fieldScale)
+  local graphics = assert(love and love.graphics, "floor window drawing requires its host graphics namespace")
+  local text = assert(self.textRenderer, "floor window drawing borrows the field text renderer")
+  local windowRenderer = assert(self.windowRenderer, "floor window drawing borrows the shared field-window renderer")
+  local title = assert(window.title, "the source floor window carries its title text")
+  local label = assert(window.label, "the source floor window carries its floor label text")
+  local placement = FieldPresentationResources.mainDisplayPlacement(referenceFrame, fieldScale)
+  local inset = assert(window.labelInset, "the source floor label carries its row offset")
+  local widthTiles = math.max(4, math.ceil((math.max(text:textWidth(title), inset + text:textWidth(label)) + 8) / 8))
+  local box = {
+    x = window.tileX * 8,
+    y = window.tileY * 8,
+    width = widthTiles * 8,
+    height = window.heightTiles * 8,
+  }
+  local frameIndex = assert(self.applicationFrameIndex, "field presentation owns no application frame index")
+  local palette = FieldTextRenderer.dialoguePalette(assert(text.fontDef, "floor window text requires the field font"))
+  graphics.push("all")
+  LogicalSurface.draw(graphics, placement, function()
+    windowRenderer:drawWindow(box, frameIndex, text:windowBackgroundColor())
+    text:drawTextWithPalette(title, box.x, box.y, palette)
+    text:drawTextWithPalette(label, box.x + inset, box.y + 16, palette)
+  end)
+  graphics.pop()
 end
 
 -- Leases the one selected area-preview image the status names. A replacement
@@ -1335,6 +1433,10 @@ function FieldPresentationResources:dispose()
   if self.startMenuRenderer then
     self.startMenuRenderer:release()
     self.startMenuRenderer = nil
+  end
+  if self._callNoticeRenderer then
+    self._callNoticeRenderer:release()
+    self._callNoticeRenderer = nil
   end
   if self.trainerCardRenderer then
     self.trainerCardRenderer:release()

@@ -2,6 +2,7 @@
 -- topologies without involving rendering or physical input.
 
 local Assert = require("tests.support.Assert")
+local ListSurface = require("libs.ui.src.ListSurface")
 local MenuLayout = require("libs.hgss.src.ui.MenuLayout")
 local ScreenTopology = require("libs.ui.src.ScreenTopology")
 
@@ -122,16 +123,75 @@ function T.large_menus_scroll_without_overflow_and_keep_the_selected_item_visibl
   end
 end
 
-function T.touch_menus_use_touch_sized_rows_and_a_cancel_target()
+-- The shared list presentation sizes rows from the field line height: three
+-- tile rows per entry, which leaves the focus ring clear of the glyph cell
+-- instead of slicing through it.
+function T.list_rows_keep_the_focus_ring_off_the_label_ink()
+  local layout = resolve({ topology = topology(256, 192), menu = menu(3) })
+
+  Assert.equal(#layout.rows, 3, "every option materializes its row")
+  Assert.equal(layout.itemRects[0].height, 24, "list entries keep the three-tile source row extent")
+  Assert.equal(layout.maxScrollOffset, 0, "three short options need no scrolling")
+  for _, row in ipairs(layout.rows) do
+    Assert.isTrue(row.marker.y > row.rect.y, "the focus ring insets its row")
+    Assert.isTrue(row.marker.y < row.labelRect.y, "the ring clears the label cell above")
+    Assert.isTrue(
+      row.marker.y + row.marker.height > row.labelRect.y + row.labelRect.height,
+      "the ring clears the label cell below"
+    )
+    Assert.isTrue(row.marker.x < row.labelRect.x, "the ring clears the label cell on the left")
+    Assert.isTrue(
+      row.marker.x + row.marker.width > row.labelRect.x + row.labelRect.width,
+      "the ring clears the label cell on the right"
+    )
+  end
+end
+
+-- The resolved surface is a padded ListSurface, so the row width the list
+-- measures must reserve that padding; otherwise the widest label overflows
+-- its row and the focus ring closes over the text.
+function T.a_menu_reserves_its_surface_padding_so_each_label_fits_its_row()
+  local widths = { BUY = 24, SELL = 32, ["SEE YA!"] = 56 }
+  local layout = resolve({
+    topology = topology(256, 192),
+    menu = {
+      items = { { text = "BUY" }, { text = "SELL" }, { text = "SEE YA!" } },
+    },
+    measureText = function(text)
+      return widths[text] or #text * 8
+    end,
+  })
+
+  for _, row in ipairs(layout.rows) do
+    local label = assert(layout.itemTexts[row.itemIndex], "the resolved row carries its label")
+    Assert.isTrue(row.labelRect.width >= widths[label], "row " .. row.itemIndex .. " fits its label")
+  end
+end
+
+function T.touch_menus_place_the_cancel_target_inside_the_same_frame()
   local layout = resolve({
     topology = topology(256, 192, { touch = true }),
-    menu = menu(2, { cancellable = true }),
+    menu = menu(3, { cancellable = true }),
   })
-  Assert.isTrue(layout.itemRects[0].height * layout.placement.scale >= MenuLayout.minimumTouchTarget)
+  local frame = layout.frameBox
   Assert.notNil(layout.cancelRect)
-  Assert.isTrue(layout.cancelRect.y >= layout.listSurface.surface.y + layout.listSurface.surface.height)
-  Assert.isTrue(layout.cancelRect.height * layout.placement.scale >= MenuLayout.minimumTouchTarget)
-  Assert.isNil(resolve({ topology = topology(256, 192), menu = menu(2, { cancellable = true }) }).cancelRect)
+  Assert.equal(layout.cancelRect.height, layout.itemRects[0].height, "the cancel target shares the list row extent")
+  Assert.isTrue(
+    layout.cancelRect.y >= layout.scrollViewport.y + layout.scrollViewport.height,
+    "the cancel target sits below the item viewport"
+  )
+  Assert.isTrue(
+    layout.cancelRect.y + layout.cancelRect.height <= frame.y + frame.height - ListSurface.PADDING,
+    "the cancel target stays inside the frame"
+  )
+  Assert.isTrue(frame.height > layout.listSurface.surface.height, "the frame carries the cancel row")
+  Assert.equal(layout.maxScrollOffset, 0, "three options and their cancel row fit without scrolling")
+  Assert.equal(frame.x, layout.listSurface.surface.x)
+  Assert.equal(frame.width, layout.listSurface.surface.width)
+  Assert.isNil(
+    resolve({ topology = topology(256, 192), menu = menu(3, { cancellable = true }) }).cancelRect,
+    "non-touch menus cancel through the input binding, not a row"
+  )
 end
 
 function T.dual_screen_menus_prefer_the_auxiliary_surface()
@@ -149,6 +209,131 @@ function T.dual_screen_menus_prefer_the_auxiliary_surface()
   local layout = resolve({ topology = dual, menu = menu(3) })
   Assert.equal(layout.surface.id, "secondary")
   Assert.isTrue(contains(layout.surface.safeRect, physical(layout, layout.listSurface.surface)))
+end
+
+-- One source window row pair per item: `choice` labels are measured in pixels
+-- like the retail title, and a shorter label yields a narrower window.
+local function multichoice(opts)
+  opts = opts or {}
+  local items = {}
+  for index = 1, opts.count or 3 do
+    items[index] = { text = opts.text or "Choice A" }
+  end
+  return {
+    kind = "multichoice",
+    tileX = opts.tileX or 12,
+    tileY = opts.tileY or 8,
+    anchorRight = opts.anchorRight == true,
+    items = items,
+    selectedIndex = 0,
+    cancellable = false,
+  }
+end
+
+-- A source multichoice window occupies the native tile position it was created
+-- with: ScriptMenu_ShowMultichoice adds its main-display window at the stored
+-- x/y with the measured width and `count * 2` tiles of height. The width is the
+-- widest measured label plus the source 12-pixel inset, rounded UP to tiles.
+function T.source_multichoice_windows_sit_at_their_native_foreground_position()
+  local layout = resolve({ topology = topology(256, 192), menu = multichoice({ tileX = 12, tileY = 8 }) })
+  Assert.equal(layout.surface.id, "main")
+  Assert.isFalse(layout.surface.touch)
+  local surface = layout.listSurface.surface
+  Assert.isTrue(
+    surface.x >= 12 * 8 and surface.x <= 13 * 8,
+    "the window starts at its source tile column: " .. surface.x
+  )
+  Assert.isTrue(surface.y >= 8 * 8 and surface.y <= 9 * 8, "the window starts at its source tile row: " .. surface.y)
+  -- "Choice A" measures 8 glyphs = 64 pixels, so the source asks for 76 and
+  -- draws whole tiles.
+  Assert.equal(surface.width, 10 * 8, "the measured label plus the source inset rounds up to whole tiles")
+  Assert.isTrue(surface.height >= 3 * 2 * 8 - 16 and surface.height <= 3 * 2 * 8, "height is two tiles per item")
+  Assert.equal(surface.width % 8, 0, "a source window stays on the tile grid")
+  Assert.equal(surface.height % 8, 0, "a source window stays on the tile grid")
+
+  local moved = resolve({ topology = topology(256, 192), menu = multichoice({ tileX = 20, tileY = 14 }) })
+  local movedSurface = moved.listSurface.surface
+  Assert.equal(movedSurface.x - surface.x, 8 * 8, "the window follows its source tile column")
+  Assert.equal(movedSurface.y - surface.y, 6 * 8, "the window follows its source tile row")
+end
+
+-- ScriptMenu_ShowMultichoice indents the label by one glyph cell and keeps the
+-- rest of its measured width, so the widest label never loses its last tile to
+-- the window clip.
+function T.multichoice_label_rows_fit_the_widest_measured_label()
+  for _, text in ipairs({ "Short", "Choice A", "A label that is 18", string.rep("W", 12) }) do
+    local layout = resolve({ topology = topology(256, 192), menu = multichoice({ tileX = 4, text = text }) })
+    local surface = layout.listSurface.surface
+    for _, row in ipairs(layout.rows) do
+      Assert.isTrue(
+        row.labelRect.width >= #text * 8,
+        string.format("the label row holds the %d-pixel label: %d", #text * 8, row.labelRect.width)
+      )
+      Assert.isTrue(
+        row.labelRect.x + row.labelRect.width <= surface.x + surface.width,
+        "the label row never extends past the source window"
+      )
+    end
+  end
+end
+
+-- The source window is never clamped to the display: a measured width that runs
+-- off the reference display fails the layout instead of being clipped.
+function T.overwide_multichoice_windows_fail_instead_of_clipping()
+  Assert.throws(function()
+    resolve({ topology = topology(256, 192), menu = multichoice({ tileX = 24, text = string.rep("W", 40) }) })
+  end)
+end
+
+-- ScriptMenu_SetAnchorRight makes the window's *left* edge move: the stored x
+-- loses exactly the measured window width, so the right edge stays on x.
+function T.right_anchored_multichoice_windows_subtract_their_measured_tile_width()
+  -- Column 20 keeps the ten-tile source window of an eight-glyph "Choice A"
+  -- label inside the 256-pixel reference display (20 * 8 + 10 * 8 = 240).
+  local plain = resolve({ topology = topology(256, 192), menu = multichoice({ tileX = 20 }) })
+  local anchored = resolve({ topology = topology(256, 192), menu = multichoice({ tileX = 16, anchorRight = true }) })
+  Assert.isTrue(
+    plain.listSurface.surface.x >= 20 * 8 and plain.listSurface.surface.x <= 21 * 8,
+    "an unanchored window starts at its source tile column: " .. plain.listSurface.surface.x
+  )
+  -- The window keeps its right edge on the source column, so its left edge is
+  -- that column minus the measured window width.
+  Assert.equal(
+    anchored.listSurface.surface.x,
+    16 * 8 - plain.listSurface.surface.width,
+    "the anchor subtracts the measured window width from the source x"
+  )
+
+  local wide = resolve({ topology = topology(256, 192), menu = multichoice({ tileX = 16, anchorRight = true }) })
+  local narrow = resolve({
+    topology = topology(256, 192),
+    menu = multichoice({ tileX = 16, anchorRight = true, text = "Short" }),
+  })
+  Assert.equal(
+    narrow.listSurface.surface.x - wide.listSurface.surface.x,
+    (8 - 5) * 8,
+    "narrower labels are rounded to fewer tiles and subtract less"
+  )
+end
+
+-- The source multichoice window belongs to the gameplay display; the existing
+-- touchscreen list menu keeps the auxiliary presentation it already has.
+function T.multichoice_windows_use_the_gameplay_display_while_list_menus_stay_auxiliary()
+  local dual = ScreenTopology.dualDisplay({
+    id = "main",
+    rect = rect(0, 0, 400, 240),
+    role = "world",
+    touch = false,
+  }, {
+    id = "secondary",
+    rect = rect(412, 0, 400, 240),
+    role = "auxiliary",
+    touch = true,
+  })
+  local foreground = resolve({ topology = dual, menu = multichoice({ tileX = 12, tileY = 8 }) })
+  Assert.equal(foreground.surface.id, "main")
+  Assert.isTrue(contains(foreground.surface.safeRect, physical(foreground, foreground.listSurface.surface)))
+  Assert.equal(resolve({ topology = dual, menu = menu(3) }).surface.id, "secondary")
 end
 
 function T.directional_adjacency_follows_item_geometry_and_has_no_wraparound()

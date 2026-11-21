@@ -58,7 +58,6 @@ local BattlePresentationCache = require("libs.assets.src.battle.BattlePresentati
 ---@field _effects table<string, BattlePresentationAssets.EffectState> per-effect demand/load/lease state by flat effect key
 ---@field _effectDrawables table<string, boolean> staged semantic texture keys admitted through effect leases
 ---@field _picturePass table<string, unknown>? per-screen Pokepic color/depth renderer
----@field _menuBlend BattleMenuPresenter.BlendTargets? per-screen native menu BG1 blend targets
 ---@field _released boolean release guard
 ---@field _headless boolean explicit data-only composition
 local BattlePresentationAssets = {}
@@ -133,7 +132,6 @@ function BattlePresentationAssets.new(opts)
     _effects = {},
     _effectDrawables = {},
     _picturePass = nil,
-    _menuBlend = nil,
     _released = false,
     _headless = opts.assets.headless == true,
   }, BattlePresentationAssets)
@@ -157,6 +155,19 @@ end
 local function flatEffectKey(key)
   return type(key) == "string" and key ~= "" and key:find("/", 1, true) == nil
 end
+
+-- Retail battle mon-menu/summary/check-moves/move-detail page
+-- backgrounds ride every launch demand (battle_party_menu.c
+-- LoadPageTilemaps): the four semantic page keys stage without
+-- invented substitutes. Page readiness gates on each drawable resolving
+-- in update below; a missing page draws nothing at paint time instead
+-- of failing the launch.
+local PARTY_PAGES = {
+  "party:page/check-moves",
+  "party:page/mon-menu",
+  "party:page/move-detail",
+  "party:page/summary",
+}
 
 ---@param self BattlePresentationAssets holder owning the per-effect state
 ---@param key string flat semantic effect key
@@ -231,10 +242,15 @@ function BattlePresentationAssets:_demand()
   for _, selector in ipairs(self._battleBalls) do
     battleBalls[#battleBalls + 1] = selector
   end
+  local partyPages = {}
+  for _, key in ipairs(PARTY_PAGES) do
+    partyPages[#partyPages + 1] = key
+  end
   return {
     launchId = self._launchId,
     scenes = { self._sceneKey },
     pages = selectors,
+    partyPages = partyPages,
     iconKeys = iconKeys,
     trainerPictures = trainerPictures,
     battleBalls = battleBalls,
@@ -413,6 +429,11 @@ function BattlePresentationAssets:update()
     end
     self._owned[key] = true
   end
+  -- Party pages stay out of the launch readiness gate on purpose: the
+  -- demand names them so staged pages resolve, but launches whose
+  -- pages never open (or whose worker has not staged them yet) still
+  -- reach ready. The page painter gates on each drawable instead and
+  -- draws nothing new while its background is missing.
   self._state = "ready"
 end
 
@@ -862,6 +883,25 @@ function BattlePresentationAssets:sceneLayer()
   return self._sceneLayer
 end
 
+---@param raster table<string, unknown> cached stripe raster from the panel task
+---@return table<string, unknown>? image handle, nil when this host has no mutable layer adapter
+---@return string? terminal image failure
+function BattlePresentationAssets:stripeBackground(raster)
+  if type(self._assets.background) ~= "function" then
+    return nil
+  end
+  local image, failure = self._assets.background(raster)
+  if failure ~= nil then
+    self._state = "failed"
+    self._error = "battle stripe image failed for launch " .. self._launchId .. ": " .. tostring(failure)
+    return nil, self._error
+  end
+  if image ~= nil then
+    self._owned["battle-stripes"] = true
+  end
+  return image
+end
+
 ---@param raster table<string, unknown> cached BG3 raster from BattleScene
 ---@return table<string, unknown>? image handle, nil when this host has no mutable layer adapter
 ---@return string? terminal image failure
@@ -920,29 +960,22 @@ function BattlePresentationAssets:releaseFadedIntro()
   end
 end
 
--- Renders one source Pokepic plane into this screen's isolated depth target.
+-- Delegates one complete typed composition frame to the screen's shared
+-- battle pass: native pictures and particle polygons share one exact 3D
+-- target, then the private six-plane resolve blends the 2D planes. The
+-- pass owns its targets; callers borrow the returned opaque canvas until
+-- the next render and never retain or release it.
 ---@param graphics table<string, unknown> borrowed graphics namespace
----@param pictures table<integer, table<string, unknown>> visible native picture submissions
----@return table<string, unknown> staged picture color layer
-function BattlePresentationAssets:renderPictures(graphics, pictures)
+---@param frame table<string, unknown> typed composition frame for one engine
+---@return table<string, unknown> borrowed opaque logical canvas
+function BattlePresentationAssets:renderPictures(graphics, frame)
   assert(not self._released, "released battle assets render no pictures")
+  assert(type(frame) == "table" and frame.engine ~= nil, "battle composition renders its typed frame")
   if self._picturePass == nil then
     local BattlePicturePass = require("libs.hgss.src.presentation.BattlePicturePass")
     self._picturePass = BattlePicturePass.new(graphics)
   end
-  return self._picturePass:render(graphics, pictures)
-end
-
--- Lends this screen's native menu BG1 blend targets, allocated on first use.
----@param graphics love.graphics borrowed graphics namespace
----@return BattleMenuPresenter.BlendTargets
-function BattlePresentationAssets:menuBlendTargets(graphics)
-  assert(not self._released, "released battle assets lend no menu blend targets")
-  if self._menuBlend == nil then
-    local BattleMenuPresenter = require("game.hgss.src.battle.BattleMenuPresenter")
-    self._menuBlend = BattleMenuPresenter.newBlendTargets(graphics)
-  end
-  return self._menuBlend
+  return self._picturePass:render(graphics, frame)
 end
 
 ---@param size integer native Pokepic shadow-size selector
@@ -987,10 +1020,6 @@ function BattlePresentationAssets:dispose()
   if self._picturePass ~= nil then
     self._picturePass:release()
     self._picturePass = nil
-  end
-  if self._menuBlend ~= nil then
-    self._menuBlend:release()
-    self._menuBlend = nil
   end
   for key in pairs(self._owned) do
     self._assets.release(key)

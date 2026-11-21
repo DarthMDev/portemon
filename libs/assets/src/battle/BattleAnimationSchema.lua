@@ -12,7 +12,9 @@ local Validate = require("libs.assets.src.Validate")
 ---@class BattleAnimationSchema
 local BattleAnimationSchema = {}
 
-BattleAnimationSchema.EFFECT_SCHEMA = "g4-battle-effect-v4"
+-- The effect schema follows the central contract revision: no second
+-- version literal lives beside the shared generation.
+BattleAnimationSchema.EFFECT_SCHEMA = require("libs.assets.src.DerivedAssetContract").battlePresentation.effectSchema
 
 local CODE_EFFECT = "BATTLE_EFFECT_INVALID"
 
@@ -47,6 +49,7 @@ local TASK_KINDS = {
   ["positioned-sound-motion"] = true,
   ["repeated-sound-playback"] = true,
   ["delayed-sound-playback"] = true,
+  ["sprite-fan-around-attacker"] = true,
   ["pokemon-picture-animation"] = true,
   ["pokemon-battler-sprite-slot"] = true,
   ["battle-background-blend-transition"] = true,
@@ -93,32 +96,34 @@ local TASK_KINDS = {
   ["managed-sprite-draw-loop"] = true,
   ["battle-particle-emitter-battler-path"] = true,
   ["battle-particle-emitter-curved-battler-path"] = true,
-  ["multi-sprite-position-tick"] = true,
-  ["sprite-affine-scale-draw-transition"] = true,
-  ["sprite-animation-position-transition"] = true,
-  ["pokemon-picture-multi-sprite-animation"] = true,
-  ["sprite-affine-rotation-motion"] = true,
-  ["pokemon-picture-sprite-position-transition"] = true,
-  ["pokemon-picture-affine-transition"] = true,
-  ["sprite-alpha-transition"] = true,
+  ["sprite-spread-copies"] = true,
+  ["sprite-blink-scale-fade"] = true,
+  ["sprite-orbit-trail"] = true,
+  ["sprite-crossing"] = true,
+  ["sprite-grow-rock-shrink"] = true,
+  ["sprite-stack-on-defender"] = true,
+  ["sprite-boomerang"] = true,
+  ["sprite-rise-stretch"] = true,
   ["pokemon-picture-palette-fade"] = true,
-  ["pokemon-picture-animation-palette-fade"] = true,
-  ["pokemon-picture-relative-sprite-path-transition"] = true,
-  ["sprite-brightness-transition"] = true,
-  ["pokemon-picture-animation-speed-transition"] = true,
+  ["pokemon-picture-zigzag-slash"] = true,
+  ["sprite-zigzag-flash"] = true,
+  ["sprite-pops"] = true,
+  ["sprite-pulse-brightness"] = true,
+  ["sprite-shrink-attacker-into"] = true,
   ["pokemon-picture-attacker-dash-afterimages"] = true,
-  ["sprite-affine-animation"] = true,
-  ["pokemon-picture-oam-animation-transition"] = true,
-  ["pokemon-picture-animation-position-transition"] = true,
-  ["sprite-affine-rotation-transition"] = true,
-  ["sprite-animation-completion"] = true,
-  ["sprite-animation-affine-scale-transition"] = true,
+  ["sprite-scale-over-defender"] = true,
+  ["sprite-orbit-attacker-bobbing"] = true,
+  ["sprite-floating-stream"] = true,
+  ["sprite-throw-arc"] = true,
+  ["sprite-fade-anim"] = true,
+  ["sprite-blink-center"] = true,
   ["battle-sprite-affine-appearance-transition"] = true,
   ["pokemon-picture-three-sprite-position-wave-transition"] = true,
   ["pokemon-picture-reciprocal-position-palette-transition"] = true,
-  ["sprite-flip-animation-transition"] = true,
-  ["sprite-randomized-affine-motion"] = true,
-  ["sprite-flip-and-offset-transition"] = true,
+  ["sprite-sliding-pairs"] = true,
+  ["sprite-pop-scatter"] = true,
+  ["sprite-quad"] = true,
+  ["sprite-flash-around-attacker"] = true,
   ["pokemon-picture-randomized-position-motion"] = true,
   ["pokemon-picture-entry-offset-transition"] = true,
   ["pokemon-picture-oscillating-axis-motion"] = true,
@@ -133,29 +138,29 @@ local TASK_KINDS = {
   ["pokemon-picture-table-driven-position-transition"] = true,
   ["pokemon-picture-position-path-transition"] = true,
   ["pokemon-picture-repeated-palette-fade"] = true,
-  ["pokemon-picture-battle-palette-fade-cycle"] = true,
   ["pokemon-picture-and-battle-palette-fade-cycle"] = true,
+  ["pokemon-picture-leap-offscreen-transition"] = true,
   ["pokemon-picture-and-battle-palette-fade"] = true,
+  ["pokemon-picture-blend-sprite-palette"] = true,
   ["pokemon-picture-four-sprite-wave-transition"] = true,
   ["pokemon-picture-z-rotation-transition"] = true,
   ["sprite-affine-scale-and-blend-transition"] = true,
   ["pokemon-picture-repeated-scale-position-transition"] = true,
   ["battle-background-picture-wipe-transition"] = true,
   ["battle-background-picture-scroll-oscillation"] = true,
-  ["battle-background-picture-coordinate-sweep"] = true,
   ["pokemon-picture-managed-sprite-affine-pair-transition"] = true,
   ["pokemon-picture-vanish-and-restore-transition"] = true,
   ["pokemon-picture-three-sprite-affine-transition"] = true,
   ["battle-background-picture-palette-scroll"] = true,
-  ["pokemon-picture-priority-motion"] = true,
-  ["sprite-position-offset"] = true,
-  ["sprite-affine-transform-motion"] = true,
-  ["sprite-animation-lifecycle"] = true,
-  ["sprite-affine-animation-lifecycle"] = true,
-  ["multi-sprite-battler-animation"] = true,
-  ["multi-sprite-position-transition"] = true,
-  ["sprite-animation-palette-offset"] = true,
-  ["multi-sprite-picture-animation"] = true,
+  ["sprite-trail-to-defender"] = true,
+  ["sprite-offset-animate"] = true,
+  ["sprite-orbit"] = true,
+  ["sprite-above-defender"] = true,
+  ["sprite-arc"] = true,
+  ["sprite-rising-shrink"] = true,
+  ["sprite-row-sequence"] = true,
+  ["sprite-palette-cycle"] = true,
+  ["sprite-orbit-attacker"] = true,
 }
 
 local TASK_CONTEXTS = {
@@ -177,61 +182,62 @@ local PICTURE_SETS = {
 }
 
 local CONFIGURED_SPRITE_TASK_CONTEXTS = {
-  ["multi-sprite-position-tick"] = "sprite-system",
-  ["sprite-affine-scale-draw-transition"] = "battle-sprite",
-  ["sprite-animation-position-transition"] = "battle-sprite",
-  ["pokemon-picture-multi-sprite-animation"] = "pokemon-picture",
-  ["sprite-affine-rotation-motion"] = "battle-sprite",
-  ["pokemon-picture-sprite-position-transition"] = "pokemon-picture",
-  ["pokemon-picture-affine-transition"] = "pokemon-picture",
-  ["sprite-alpha-transition"] = "pokemon-picture",
+  ["sprite-spread-copies"] = "sprite-system",
+  ["sprite-blink-scale-fade"] = "battle-sprite",
+  ["sprite-orbit-trail"] = "battle-sprite",
+  ["sprite-crossing"] = "pokemon-picture",
+  ["sprite-grow-rock-shrink"] = "battle-sprite",
+  ["sprite-stack-on-defender"] = "pokemon-picture",
+  ["sprite-boomerang"] = "pokemon-picture",
+  ["sprite-rise-stretch"] = "pokemon-picture",
   ["pokemon-picture-palette-fade"] = "pokemon-picture",
-  ["pokemon-picture-animation-palette-fade"] = "pokemon-picture",
-  ["pokemon-picture-relative-sprite-path-transition"] = "pokemon-picture",
-  ["sprite-brightness-transition"] = "battle-display",
-  ["pokemon-picture-animation"] = "pokemon-picture",
-  ["pokemon-picture-animation-speed-transition"] = "pokemon-picture",
-  ["sprite-affine-animation"] = "pokemon-picture",
-  ["pokemon-picture-oam-animation-transition"] = "pokemon-picture",
-  ["pokemon-picture-animation-position-transition"] = "pokemon-picture",
-  ["sprite-affine-rotation-transition"] = "battle-sprite",
-  ["sprite-animation-completion"] = "battle-sprite",
-  ["sprite-animation-affine-scale-transition"] = "battle-sprite",
-  ["sprite-flip-animation-transition"] = "battle-sprite",
-  ["sprite-randomized-affine-motion"] = "battle-sprite",
-  ["sprite-flip-and-offset-transition"] = "battle-sprite",
-  ["pokemon-picture-randomized-position-motion"] = "pokemon-picture",
-  ["pokemon-picture-priority-motion"] = "pokemon-picture",
-  ["sprite-position-offset"] = "battle-sprite",
-  ["sprite-affine-transform-motion"] = "battle-sprite",
-  ["sprite-animation-lifecycle"] = "battle-sprite",
-  ["sprite-affine-animation-lifecycle"] = "battle-sprite",
-  ["multi-sprite-battler-animation"] = "pokemon-picture",
-  ["multi-sprite-position-transition"] = "battle-sprite",
-  ["sprite-animation-palette-offset"] = "battle-palette",
-  ["multi-sprite-picture-animation"] = "pokemon-picture",
+  ["pokemon-picture-zigzag-slash"] = "pokemon-picture",
+  ["sprite-zigzag-flash"] = "pokemon-picture",
+  ["sprite-pops"] = "pokemon-picture",
+  ["sprite-pulse-brightness"] = "battle-display",
+  ["sprite-fan-around-attacker"] = "pokemon-picture",
+  ["sprite-shrink-attacker-into"] = "pokemon-picture",
+  ["sprite-scale-over-defender"] = "pokemon-picture",
+  ["sprite-orbit-attacker-bobbing"] = "pokemon-picture",
+  ["sprite-floating-stream"] = "pokemon-picture",
+  ["sprite-throw-arc"] = "battle-sprite",
+  ["sprite-fade-anim"] = "battle-sprite",
+  ["sprite-blink-center"] = "battle-sprite",
+  ["sprite-sliding-pairs"] = "battle-sprite",
+  ["sprite-pop-scatter"] = "battle-sprite",
+  ["sprite-quad"] = "battle-sprite",
+  ["sprite-flash-around-attacker"] = "pokemon-picture",
+  ["sprite-trail-to-defender"] = "pokemon-picture",
+  ["sprite-offset-animate"] = "battle-sprite",
+  ["sprite-orbit"] = "battle-sprite",
+  ["sprite-above-defender"] = "battle-sprite",
+  ["sprite-arc"] = "battle-sprite",
+  ["sprite-rising-shrink"] = "pokemon-picture",
+  ["sprite-row-sequence"] = "battle-sprite",
+  ["sprite-palette-cycle"] = "battle-palette",
+  ["sprite-orbit-attacker"] = "pokemon-picture",
 }
 
 local CONFIGURED_SPRITE_TASK_PARAMETERS = {
-  ["sprite-affine-scale-draw-transition"] = {
+  ["sprite-blink-scale-fade"] = {
     spriteCount = { min = -0x80000000, max = 0x7FFFFFFF },
   },
-  ["pokemon-picture-multi-sprite-animation"] = {
+  ["sprite-crossing"] = {
     spriteCount = { min = -0x80000000, max = 0x7FFFFFFF },
   },
-  ["sprite-affine-rotation-transition"] = {
-    spriteSpacingX = { min = -0x8000, max = 0x7FFF },
-    spriteSpacingY = { min = -0x8000, max = 0x7FFF },
-    positionTransitionTicks = { min = 0, max = 0xFFFF },
-    rotationAngle = { min = 0, max = 0xFFFFFFFF },
+  ["sprite-throw-arc"] = {
+    offsetX = { min = -0x8000, max = 0x7FFF },
+    offsetY = { min = -0x8000, max = 0x7FFF },
+    durationTicks = { min = 0, max = 0xFFFF },
+    arcHeight = { min = -0x80000000, max = 0x7FFFFFFF },
   },
-  ["sprite-animation-affine-scale-transition"] = {
+  ["sprite-blink-center"] = {
     spriteCount = { min = 0, max = 0xFF },
   },
-  ["sprite-flip-animation-transition"] = {
+  ["sprite-sliding-pairs"] = {
     spriteCount = { min = 0, max = 0xFF },
   },
-  ["sprite-position-offset"] = {
+  ["sprite-offset-animate"] = {
     offsetX = { min = -0x8000, max = 0x7FFF },
     offsetY = { min = -0x8000, max = 0x7FFF },
   },
@@ -255,6 +261,7 @@ local VISUAL_UPDATE_KINDS = {
 local RUNTIME_SELECTIONS = {
   ["battle-background-screen-selection"] = true,
   ["battle-background-three-way-screen-selection"] = true,
+  ["object-window-stripe-selection"] = true,
   ["battler-resource-selection"] = true,
   ["battler-pokemon-picture-resource"] = true,
   ["battler-particle-position-pair"] = true,
@@ -384,9 +391,18 @@ local SINUSOIDAL_POSITION_PARAMETERS = {
   durationTicks = { min = 0, max = 0xFFFFFFFF },
 }
 
+local PANEL_SLIDE_RESOURCE_SLOTS = {}
+for graphic = 0, 3 do
+  PANEL_SLIDE_RESOURCE_SLOTS[#PANEL_SLIDE_RESOURCE_SLOTS + 1] = "stripeGraphic" .. graphic .. "Char"
+  PANEL_SLIDE_RESOURCE_SLOTS[#PANEL_SLIDE_RESOURCE_SLOTS + 1] = "stripeGraphic" .. graphic .. "Palette"
+  PANEL_SLIDE_RESOURCE_SLOTS[#PANEL_SLIDE_RESOURCE_SLOTS + 1] = "stripeGraphic" .. graphic .. "Screen"
+end
+
 local PANEL_SLIDE_PROFILE = {
   taskKind = "battle-sprite-panel-slide",
   taskContext = "sprite-system",
+  runtimeSelection = "object-window-stripe-selection",
+  resourceSlots = PANEL_SLIDE_RESOURCE_SLOTS,
   parameters = {
     firstPanelOffsetX = { min = -0x8000, max = 0x7FFF },
     firstPanelOffsetY = { min = -0x8000, max = 0x7FFF },
@@ -799,14 +815,16 @@ local ANIMATION_CALLBACKS = {
       pauseTicks = { min = 0, max = 0xFFFFFFFF },
     },
   },
-  ["pokemon-picture-battle-palette-fade-cycle"] = {
-    taskKind = "pokemon-picture-battle-palette-fade-cycle",
-    taskContext = "battle-palette",
-    parameters = {},
-  },
   ["pokemon-picture-and-battle-palette-fade-cycle"] = {
     taskKind = "pokemon-picture-and-battle-palette-fade-cycle",
     taskContext = "battle-palette",
+    battlerTarget = "attacker",
+    parameters = {},
+  },
+  ["pokemon-picture-leap-offscreen-transition"] = {
+    taskKind = "pokemon-picture-leap-offscreen-transition",
+    taskContext = "pokemon-picture",
+    battlerTarget = "attacker",
     parameters = {},
   },
   ["pokemon-picture-and-battle-palette-fade"] = {
@@ -825,6 +843,27 @@ local ANIMATION_CALLBACKS = {
       startCoefficient = { min = 0, max = 0xFF },
       endCoefficient = { min = 0, max = 0xFF },
       nextColor = { min = 0, max = 0xFFFF },
+    },
+  },
+  ["pokemon-picture-blend-sprite-palette"] = {
+    taskKind = "pokemon-picture-blend-sprite-palette",
+    taskContext = "pokemon-picture",
+    parameters = {
+      pictureTarget = {
+        type = "enum",
+        values = {
+          attacker = true,
+          target = true,
+          ["attacker-related-position-when-paired"] = true,
+          ["target-related-position-when-paired"] = true,
+        },
+      },
+      wait = { min = -0x80, max = 0x7F },
+      startCoefficient = { min = 0, max = 0xFF },
+      endCoefficient = { min = 0, max = 0xFF },
+      nextColor = { min = 0, max = 0xFFFF },
+      blendStep = { min = -0x80, max = 0x7F },
+      durationTicks = { min = 1, max = 0xFFFFFFFF },
     },
   },
   ["pokemon-picture-four-sprite-wave-transition"] = {
@@ -875,18 +914,12 @@ local ANIMATION_CALLBACKS = {
     taskKind = "battle-background-picture-scroll-oscillation",
     taskContext = "battle-display",
     parameters = {
-      directionState = { min = 0, max = 0xFF },
-      phaseIndex = { min = 0, max = 0xFF },
-    },
-  },
-  ["battle-background-picture-coordinate-sweep"] = {
-    taskKind = "battle-background-picture-coordinate-sweep",
-    taskContext = "battle-display",
-    parameters = {
-      startX = { min = -0x8000, max = 0x7FFF },
-      startY = { min = -0x8000, max = 0x7FFF },
-      deltaX = { min = -0x8000, max = 0x7FFF },
-      deltaY = { min = -0x8000, max = 0x7FFF },
+      shake = { min = 0, max = 1 },
+      shakeAmpX = { min = -0x8000, max = 0x7FFF },
+      shakeAmpY = { min = -0x8000, max = 0x7FFF },
+      shakeInterval = { min = -0x8000, max = 0x7FFF },
+      shakeCount = { min = -0x8000, max = 0x7FFF },
+      shakeExtra = { min = -0x8000, max = 0x7FFF },
     },
   },
   ["pokemon-picture-managed-sprite-affine-pair-transition"] = {
@@ -1133,6 +1166,18 @@ local RESOURCE_KEY_SLOTS = {
   screenBattlerClassFour = true,
   screenContextFlag = true,
   template = true,
+  stripeGraphic0Char = true,
+  stripeGraphic0Palette = true,
+  stripeGraphic0Screen = true,
+  stripeGraphic1Char = true,
+  stripeGraphic1Palette = true,
+  stripeGraphic1Screen = true,
+  stripeGraphic2Char = true,
+  stripeGraphic2Palette = true,
+  stripeGraphic2Screen = true,
+  stripeGraphic3Char = true,
+  stripeGraphic3Palette = true,
+  stripeGraphic3Screen = true,
 }
 
 local SPRITE_EFFECT_MODES = {
@@ -1222,6 +1267,15 @@ local ENUM_FIELDS = {
 }
 
 local SIDE_MASK_BRANCH_FIELDS = { sideMask = true, otherwise = true, target = true }
+local WEATHER_BRANCH_FIELDS = { condition = true, target = true }
+local WEATHER_CONDITIONS = {
+  clear = true,
+  rain = true,
+  sand = true,
+  sun = true,
+  hail = true,
+  other = true,
+}
 local MOVE_POWER_PROFILE_FIELDS = { movePower = true, profile = true }
 local NO_PARAMETERS = {}
 
@@ -1382,6 +1436,15 @@ local function checkCallbackInvocation(instruction, context, code, field)
   elseif instruction.resourceKeys ~= nil then
     fail(code, field .. ".resourceKeys are not declared by this callback profile", context)
   end
+  if instruction.args ~= nil then
+    if not Validate.isArray(instruction.args) or #instruction.args > 10 then
+      fail(code, field .. ".args carries at most ten source animation arguments", context)
+    else
+      for index, value in ipairs(instruction.args) do
+        SchemaCheck.checkInteger(value, context, code, field .. ".args[" .. index .. "]")
+      end
+    end
+  end
   checkParameters(instruction.parameters, profile.parameters, context, code, field)
 end
 
@@ -1482,6 +1545,237 @@ end
 -- A parameterized emitter creation joins a loaded particle system with
 -- either one fixed emitter ordinal or a closed position-pair ordinal map
 -- selected at runtime.
+-- The twelve pair-transform profiles behind source callbacks 5..16 read
+-- seven script axis triples plus one position triple at creation; the
+-- from-script convergence/magnet profiles read one more target block.
+local PAIR_TRANSFORM_PROFILES = {
+  ["particle-emitter-position-pair-primary-primary"] = true,
+  ["particle-emitter-position-pair-primary-secondary"] = true,
+  ["particle-emitter-position-pair-primary-partner"] = true,
+  ["particle-emitter-position-pair-primary-opponent"] = true,
+  ["particle-emitter-position-pair-primary-opposing-partner"] = true,
+  ["particle-emitter-position-pair-primary-active"] = true,
+  ["particle-emitter-position-pair-secondary-primary"] = true,
+  ["particle-emitter-position-pair-secondary-secondary"] = true,
+  ["particle-emitter-position-pair-secondary-partner"] = true,
+  ["particle-emitter-position-pair-secondary-opponent"] = true,
+  ["particle-emitter-position-pair-secondary-opposing-partner"] = true,
+  ["particle-emitter-position-pair-secondary-active"] = true,
+}
+
+local PAIR_SCRIPT_TARGET_PROFILES = {
+  ["particle-emitter-position-pair-secondary-primary"] = true,
+  ["particle-emitter-position-pair-secondary-active"] = true,
+}
+
+---@param instruction table<string, unknown> decoded battle animation instruction
+---@param context table<string, unknown> validation context
+---@param code string schema error code
+---@param field string instruction path behind diagnostics
+local function checkPairScriptVectors(instruction, context, code, field)
+  local pair = PAIR_TRANSFORM_PROFILES[instruction.actionProfile] == true
+  local function checkTriple(value, what)
+    SchemaCheck.checkRecord(value, { x = true, y = true, z = true }, context, code, what)
+    for _, name in ipairs({ "x", "y", "z" }) do
+      SchemaCheck.checkInteger(value[name], context, code, what .. "." .. name, -0x80000000, 0x7FFFFFFF)
+    end
+  end
+  if instruction.scriptVectors ~= nil then
+    if not pair then
+      fail(code, field .. " carries script vectors only for its pair-transform profiles", context)
+      return
+    end
+    if not Validate.isArray(instruction.scriptVectors) or #instruction.scriptVectors ~= 7 then
+      fail(code, field .. ".scriptVectors carries all seven source axis triples", context)
+      return
+    end
+    for index, triple in ipairs(instruction.scriptVectors) do
+      checkTriple(triple, field .. ".scriptVectors[" .. index .. "]")
+    end
+  elseif pair then
+    fail(code, field .. " carries script vectors for pair-transform profiles", context)
+    return
+  end
+  if instruction.scriptPosition ~= nil then
+    if not pair then
+      fail(code, field .. " carries a script position only for its pair-transform profiles", context)
+      return
+    end
+    checkTriple(instruction.scriptPosition, field .. ".scriptPosition")
+  elseif pair then
+    fail(code, field .. " carries a script position for pair-transform profiles", context)
+    return
+  end
+  local needsTarget = PAIR_SCRIPT_TARGET_PROFILES[instruction.actionProfile] == true
+  if instruction.scriptTarget ~= nil then
+    if not needsTarget then
+      fail(code, field .. " carries a script target only for its from-script pair profiles", context)
+      return
+    end
+    SchemaCheck.checkRecord(
+      instruction.scriptTarget,
+      { x = true, y = true, z = true, scaleKind = true },
+      context,
+      code,
+      field .. ".scriptTarget"
+    )
+    for _, name in ipairs({ "x", "y", "z" }) do
+      SchemaCheck.checkInteger(
+        instruction.scriptTarget[name],
+        context,
+        code,
+        field .. ".scriptTarget." .. name,
+        -0x80000000,
+        0x7FFFFFFF
+      )
+    end
+    SchemaCheck.checkInteger(
+      instruction.scriptTarget.scaleKind,
+      context,
+      code,
+      field .. ".scriptTarget.scaleKind",
+      0,
+      0xFFFFFFFF
+    )
+  elseif needsTarget then
+    fail(code, field .. " carries a script target for from-script pair profiles", context)
+    return
+  end
+end
+
+-- Trailer blocks behind the configured profile: battler-type offsets for
+-- position modes 100/101, script camera angles for camera mode 2, and
+-- one field block per meaningful flag in ascending mask order.
+local CONFIGURED_FIELD_MASKS = { 2, 16, 32, 64, 128, 4096, 8192 }
+
+---@param instruction table<string, unknown> decoded battle animation instruction
+---@param context table<string, unknown> validation context
+---@param code string schema error code
+---@param field string instruction path behind diagnostics
+local function checkConfiguredTrailers(instruction, context, code, field)
+  local configuredProfile = "particle-emitter-battler-class-camera-position"
+  local function checkOffsetBlock(value, what)
+    SchemaCheck.checkRecord(value, { x = true, y = true, z = true, ignoreSide = true }, context, code, what)
+    for _, name in ipairs({ "x", "y", "z" }) do
+      SchemaCheck.checkInteger(value[name], context, code, what .. "." .. name, -0x80000000, 0x7FFFFFFF)
+    end
+    SchemaCheck.checkInteger(value.ignoreSide, context, code, what .. ".ignoreSide", 0, 1)
+  end
+  if instruction.typeOffsets ~= nil then
+    if instruction.actionProfile ~= configuredProfile then
+      fail(code, field .. " carries type offsets only for its configured profile", context)
+      return
+    end
+    local positionMode = type(instruction.emitterConfig) == "table" and instruction.emitterConfig.positionMode or nil
+    if positionMode ~= 100 and positionMode ~= 101 then
+      fail(code, field .. " carries type offsets only for battler-type position modes", context)
+      return
+    end
+    if not Validate.isArray(instruction.typeOffsets) or #instruction.typeOffsets ~= 6 then
+      fail(code, field .. ".typeOffsets carries one block per battler type", context)
+      return
+    end
+    for index, block in ipairs(instruction.typeOffsets) do
+      checkOffsetBlock(block, field .. ".typeOffsets[" .. index .. "]")
+    end
+  elseif
+    instruction.actionProfile == configuredProfile
+    and type(instruction.emitterConfig) == "table"
+    and (instruction.emitterConfig.positionMode == 100 or instruction.emitterConfig.positionMode == 101)
+  then
+    fail(code, field .. " carries type offsets for battler-type position modes", context)
+    return
+  end
+  if instruction.cameraAngles ~= nil then
+    if instruction.actionProfile ~= configuredProfile then
+      fail(code, field .. " carries camera angles only for its configured profile", context)
+      return
+    end
+    local cameraMode = type(instruction.emitterConfig) == "table" and instruction.emitterConfig.cameraMode or nil
+    if cameraMode ~= 2 then
+      fail(code, field .. " carries camera angles only for its script-driven camera mode", context)
+      return
+    end
+    SchemaCheck.checkRecord(
+      instruction.cameraAngles,
+      { x = true, y = true, z = true },
+      context,
+      code,
+      field .. ".cameraAngles"
+    )
+    for _, name in ipairs({ "x", "y", "z" }) do
+      SchemaCheck.checkInteger(
+        instruction.cameraAngles[name],
+        context,
+        code,
+        field .. ".cameraAngles." .. name,
+        0,
+        0xFFFFFFFF
+      )
+    end
+  elseif
+    instruction.actionProfile == configuredProfile
+    and type(instruction.emitterConfig) == "table"
+    and instruction.emitterConfig.cameraMode == 2
+  then
+    fail(code, field .. " carries camera angles for its script-driven camera mode", context)
+    return
+  end
+  if instruction.fieldScripts ~= nil then
+    if instruction.actionProfile ~= configuredProfile then
+      fail(code, field .. " carries field blocks only for its configured profile", context)
+      return
+    end
+    if not Validate.isArray(instruction.fieldScripts) then
+      fail(code, field .. ".fieldScripts carries one block per meaningful flag", context)
+      return
+    end
+    local config = instruction.emitterConfig
+    local expected = {}
+    if type(config) == "table" and type(config.flags) == "number" then
+      for _, mask in ipairs(CONFIGURED_FIELD_MASKS) do
+        if math.floor(config.flags / mask) % 2 == 1 then
+          expected[#expected + 1] = mask
+        end
+      end
+    end
+    if #instruction.fieldScripts ~= #expected then
+      fail(code, field .. ".fieldScripts carries one block per meaningful flag", context)
+      return
+    end
+    for index, block in ipairs(instruction.fieldScripts) do
+      local at = field .. ".fieldScripts[" .. index .. "]"
+      SchemaCheck.checkRecord(
+        block,
+        { mask = true, mode = true, ignoreSide = true, x = true, y = true, z = true },
+        context,
+        code,
+        at
+      )
+      if block.mask ~= expected[index] then
+        fail(code, at .. ".mask follows ascending source mask order", context)
+        return
+      end
+      SchemaCheck.checkInteger(block.mode, context, code, at .. ".mode", 0, 0xFFFFFFFF)
+      SchemaCheck.checkInteger(block.ignoreSide, context, code, at .. ".ignoreSide", 0, 1)
+      for _, name in ipairs({ "x", "y", "z" }) do
+        SchemaCheck.checkInteger(block[name], context, code, at .. "." .. name, -0x80000000, 0x7FFFFFFF)
+      end
+    end
+  elseif
+    instruction.actionProfile == configuredProfile
+    and type(instruction.emitterConfig) == "table"
+    and type(instruction.emitterConfig.flags) == "number"
+  then
+    for _, mask in ipairs(CONFIGURED_FIELD_MASKS) do
+      if math.floor(instruction.emitterConfig.flags / mask) % 2 == 1 then
+        fail(code, field .. ".fieldScripts carries one block per meaningful flag", context)
+        return
+      end
+    end
+  end
+end
+
 local function checkParameterizedBattlerEffect(instruction, context, code, field)
   local emitter = instruction.emitter
   local continuationSlot = instruction.continuationSlot
@@ -1584,6 +1878,8 @@ local function checkParameterizedBattlerEffect(instruction, context, code, field
     fail(code, field .. " carries an offset block for offset position modes", context)
     return
   end
+  checkConfiguredTrailers(instruction, context, code, field)
+  checkPairScriptVectors(instruction, context, code, field)
 end
 
 local function checkSideMaskBranches(instruction, context, code, field)
@@ -1607,6 +1903,27 @@ local function checkSideMaskBranches(instruction, context, code, field)
     end
     if branchCase.otherwise ~= nil and not hasOtherwise then
       fail(code, branchField .. ".otherwise must be true", context)
+    end
+    checkInt(branchCase.target, context, code, branchField .. ".target")
+  end
+end
+
+local function checkWeatherBranches(instruction, context, code, field)
+  local branchCases = instruction.branchCases
+  if branchCases == nil then
+    return
+  end
+  if not Validate.isArray(branchCases) then
+    fail(code, field .. ".branchCases must be an array", context)
+  end
+  if #branchCases ~= 6 then
+    fail(code, field .. ".branchCases must carry all six weather selections", context)
+  end
+  for index, branchCase in ipairs(branchCases) do
+    local branchField = field .. ".branchCases[" .. index .. "]"
+    SchemaCheck.checkRecord(branchCase, WEATHER_BRANCH_FIELDS, context, code, branchField)
+    if WEATHER_CONDITIONS[branchCase.condition] ~= true then
+      fail(code, branchField .. ".condition must name its weather selection", context)
     end
     checkInt(branchCase.target, context, code, branchField .. ".target")
   end
@@ -1647,6 +1964,7 @@ local OPERATIONS = {
       "parameters",
       "resourceKeys",
       "runtimeSelection",
+      "args",
     },
     check = checkCallbackInvocation,
   },
@@ -1709,6 +2027,12 @@ local OPERATIONS = {
       "emitterCases",
       "emitterConfig",
       "emitterOffset",
+      "typeOffsets",
+      "cameraAngles",
+      "fieldScripts",
+      "scriptVectors",
+      "scriptPosition",
+      "scriptTarget",
       "runtimeSelection",
       "systemIndex",
       "continuationSlot",
@@ -1737,6 +2061,7 @@ local OPERATIONS = {
   ["submit-presentation-layout"] = { values = true },
   ["submit-presentation-update"] = { values = true },
   ["branch-on-side-mask"] = { fields = { "branchCases" }, check = checkSideMaskBranches },
+  ["branch-on-weather-condition"] = { fields = { "branchCases" }, check = checkWeatherBranches },
   ["branch-on-side-predicate"] = { values = true, fields = { "branchTarget", "alternateTarget" } },
   ["branch-on-side-equality"] = { values = true, fields = { "branchTarget", "alternateTarget" } },
   ["load-sprite-character"] = { values = 1, resourceSlots = { "character" } },
@@ -1920,6 +2245,20 @@ local function checkResources(resources, context, code, field)
   end
 end
 
+local function checkDisplayPolicy(displayPolicy, context, code, field)
+  SchemaCheck.checkRecord(displayPolicy, {
+    suspendHealthbarUpdates = true,
+    updateBattlerG3 = true,
+  }, context, code, field)
+  if type(displayPolicy.suspendHealthbarUpdates) ~= "boolean" then
+    fail(code, field .. ".suspendHealthbarUpdates stays a boolean", context)
+  end
+  if type(displayPolicy.updateBattlerG3) ~= "boolean" then
+    fail(code, field .. ".updateBattlerG3 stays a boolean", context)
+  end
+  checkNoNativeKeys(displayPolicy, context, code, field)
+end
+
 local function checkRequiredContext(requiredContext, context, code, field)
   if type(requiredContext) ~= "table" then
     fail(code, field .. " must be a record", context)
@@ -2056,6 +2395,7 @@ function BattleAnimationSchema.assertEffect(effect)
     dependencies = true,
     resources = true,
     requiredContext = true,
+    displayPolicy = true,
   }, context, CODE_EFFECT, "effect")
   if effect.schema ~= BattleAnimationSchema.EFFECT_SCHEMA then
     fail(CODE_EFFECT, "effect schema must be " .. BattleAnimationSchema.EFFECT_SCHEMA, context)
@@ -2070,6 +2410,7 @@ function BattleAnimationSchema.assertEffect(effect)
   checkResources(effect.resources, context, CODE_EFFECT, "effect resources")
   checkProgramResourceClosure(effect.program, effect.dependencies, effect.resources, context, CODE_EFFECT)
   checkRequiredContext(effect.requiredContext, context, CODE_EFFECT, "effect requiredContext")
+  checkDisplayPolicy(effect.displayPolicy, context, CODE_EFFECT, "effect displayPolicy")
   if anyNested(effect.program, needsSpriteContextTable) and effect.requiredContext.spriteContextTable == nil then
     fail(CODE_EFFECT, "effect requiredContext omitted spriteContextTable", context)
   end

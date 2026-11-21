@@ -72,9 +72,10 @@ end
 ---@field private _gesturePose string?
 ---@field private _gestureTick integer?
 ---@field private _gestureOffsetY number
----@field private _scriptedMotion table<string, unknown>?
----@field private _scriptedPoseDelta integer? pose ticks the last scripted locomotion tick advanced; kept through its commit tick, cleared by the next ordinary update, scripted begin, or cancel
+---@field private _scriptedMotion { action: string, direction: string?, distance: string?, speed: string?, hop: boolean?, gestureName: string?, durationTicks: integer, progressTicks: integer, startGesturePose: string?, startGestureTick: integer?, startGestureOffsetY: number, advancement: "caller"|"tick" }?
+---@field private _scriptedPoseDelta integer? pose ticks the last scripted locomotion tick advanced; kept through its commit tick and the ordinary field update, cleared by the next ordinary step/turn, scripted begin, or cancel
 ---@field private _movementRevision integer committed tile commits observed by followers
+---@field private _committedTerrainSteps table[]? tile steps committed since the last terrain drain
 ---@field private _lastTraversalKind string traversal kind of the last committed tile
 ---@field private _movementStartRevision integer resolved translation starts observed by followers
 ---@field private _movementTransaction FieldPlayer.MovementTransaction? latest resolved translation start
@@ -234,6 +235,7 @@ function FieldPlayer.new(options)
     _gestureTick = nil,
     _gestureOffsetY = 0,
     _movementRevision = 0,
+    _committedTerrainSteps = nil,
     _lastTraversalKind = "idle",
     _movementStartRevision = 0,
     _movementTransaction = nil,
@@ -447,6 +449,7 @@ end
 -- action speed, and the published duration is that speed's calibration.
 function FieldPlayer:_beginStep(direction, destination, speed, traversalKind)
   assert(type(speed) == "string", "movement speed required")
+  self._scriptedPoseDelta = nil
   local MovementCalibration = require("libs.hgss.src.script.tasks.MovementCalibration")
   local durationTicks = assert(MovementCalibration.SPEED_TICKS[speed], "unknown movement speed " .. tostring(speed))
   self.facing = direction
@@ -499,6 +502,7 @@ function FieldPlayer:_publishMovementStart(direction, speed, traversalKind)
 end
 
 function FieldPlayer:_beginTurn(direction)
+  self._scriptedPoseDelta = nil
   self.facing = direction
   self.motion = "turning"
   self.progressTicks = 0
@@ -506,6 +510,7 @@ function FieldPlayer:_beginTurn(direction)
 end
 
 function FieldPlayer:_beginJump(direction, destination)
+  self._scriptedPoseDelta = nil
   self.facing = direction
   self.from = {
     fieldX = self.fieldX,
@@ -927,7 +932,16 @@ end
 ---@return boolean stepCompleted
 function FieldPlayer:updateFixed(input, run)
   input = input or {}
-  self._scriptedPoseDelta = nil
+  local scripted = self._scriptedMotion
+  if scripted ~= nil and scripted.advancement ~= "tick" then
+    -- A caller-advanced scripted action belongs to the owner that began it
+    -- (the script movement task or the field-move plan): that owner advances
+    -- its progress, interpolation pair, and pose cadence through
+    -- advanceScriptedAction. The ordinary field update must not advance the
+    -- same action a second time (which would halve its duration) or erase this
+    -- tick's pose delta before the presentation clock reads it.
+    return false
+  end
   self.previousWorldX, self.previousWorldY, self.previousWorldZ = self.worldX, self.worldY, self.worldZ
 
   if self.motion == "walking" then
@@ -1033,10 +1047,39 @@ function FieldPlayer:committedAnchor()
   }
 end
 
+-- Every committed tile publishes the facts of that step exactly once: the
+-- session turns them into the source terrain responses at the tile the player
+-- entered, whichever owner drove the step (ordinary input, a jump, planned
+-- traversal, or a scripted walk).
 ---@param kind string
 function FieldPlayer:_commitTile(kind)
   self._movementRevision = self._movementRevision + 1
   self._lastTraversalKind = kind
+  local steps = self._committedTerrainSteps
+  if steps == nil then
+    steps = {}
+    self._committedTerrainSteps = steps
+  end
+  steps[#steps + 1] = {
+    fieldX = self.fieldX,
+    fieldZ = self.fieldZ,
+    worldY = self.worldY,
+    facing = self.facing,
+    cellKey = self.committedSourceCellKey,
+    sourceSurfaceId = self.committedSourceSurfaceId,
+  }
+end
+
+-- Take every committed tile step since the previous drain; absent when no
+-- step committed. The session consumes these exactly once per fixed tick.
+---@return table[]?
+function FieldPlayer:takeCommittedTerrainSteps()
+  local steps = self._committedTerrainSteps
+  if steps == nil then
+    return nil
+  end
+  self._committedTerrainSteps = nil
+  return steps
 end
 
 ---@param out { x: number, y: number, z: number }
@@ -1108,7 +1151,17 @@ function FieldPlayer:clearGesturePresentation()
   self._gestureOffsetY = 0
 end
 
-function FieldPlayer:beginScriptedAction(action)
+---@param action table<string, unknown>
+---@param advancement "caller"|"tick"? who advances the action's progress: the caller
+--- through advanceScriptedAction (default), or the fixed field update (field-move
+--- traversal, whose plan only observes the session tick)
+function FieldPlayer:beginScriptedAction(action, advancement)
+  if advancement ~= nil then
+    assert(
+      advancement == "caller" or advancement == "tick",
+      "unknown scripted action advancement " .. tostring(advancement)
+    )
+  end
   local kind = action.action
   -- Face is an instantaneous direction change: it must succeed even when a
   -- scripted walk is mid-presentation (the MovementTask drives facing through
@@ -1218,6 +1271,7 @@ function FieldPlayer:beginScriptedAction(action)
   self.durationTicks = durationTicks
   self._scriptedMotion = {
     action = kind,
+    advancement = advancement or "caller",
     direction = action.direction,
     distance = action.distance,
     speed = action.speed,
@@ -1319,6 +1373,8 @@ function FieldPlayer:commitScriptedAction()
     self.worldX, self.worldY, self.worldZ = self.to.worldX, self.to.worldY, self.to.worldZ
     self.surfaceId = self.to.surfaceId
     if moved then
+      self.committedSourceCellKey = self.to.sourceCellKey
+      self.committedSourceSurfaceId = self.to.sourceSurfaceId
       self:_commitTile("scripted")
     end
   end
@@ -1338,6 +1394,12 @@ end
 
 function FieldPlayer:cancelScriptedMovement()
   local m = self._scriptedMotion
+  if m == nil then
+    -- Only the script movement owner that began an action may cancel it.
+    -- Cancelling an absent scripted action must never stop an ordinary field
+    -- step: that step owns its own duration and commit.
+    return
+  end
   self._scriptedPoseDelta = nil
   if m and self.from then
     self.worldX, self.worldY, self.worldZ = self.from.worldX, self.from.worldY, self.from.worldZ

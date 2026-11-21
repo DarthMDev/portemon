@@ -41,6 +41,38 @@ local function freshCalls()
   return { romFs = 0, index = 0, script = 0, audio = 0, catalog = 0, presentation = 0 }
 end
 
+local function snapshotCalls(calls)
+  return {
+    romFs = calls.romFs,
+    index = calls.index,
+    script = calls.script,
+    audio = calls.audio,
+    catalog = calls.catalog,
+    presentation = calls.presentation,
+  }
+end
+
+-- Aggregate compilation on the controller thread is the defect, so every
+-- recorded planner call is a violation whatever the phase observed it in.
+local function assertNoAggregateCompilation(counts, phase)
+  Assert.equal(counts.romFs, 0, phase .. " opens no source reader")
+  Assert.equal(counts.index, 0, phase .. " compiles no cell index")
+  Assert.equal(counts.script, 0, phase .. " plans no scripts")
+  Assert.equal(counts.audio, 0, phase .. " plans no audio")
+  Assert.equal(counts.catalog, 0, phase .. " compiles no mon catalog")
+  Assert.equal(counts.presentation, 0, phase .. " plans no mon presentation")
+end
+
+local function countOf(list, value)
+  local count = 0
+  for _, entry in ipairs(list) do
+    if entry == value then
+      count = count + 1
+    end
+  end
+  return count
+end
+
 local function cellDescriptor(matrixMemberId, index)
   return {
     matrixMemberId = matrixMemberId,
@@ -251,36 +283,43 @@ function T.construction_schedules_the_source_inventory_without_compiling_sources
   local result = withPatched(patches, function()
     local pool = recordingPool()
     local session = openSession("construction-generation", pool)
-    local snapshot = {
-      romFs = calls.romFs,
-      index = calls.index,
-      script = calls.script,
-      audio = calls.audio,
-      catalog = calls.catalog,
-      presentation = calls.presentation,
-    }
     local ready, failure = session:requestMilestone("new-game-intro", "required")
-    session:update()
+    -- Submission is paced by the shared per-update budget: a starved
+    -- wall-clock slice may spend the first pump on roster construction, so
+    -- poll boundedly for submission instead of assuming it lands on exactly
+    -- one update.
+    for _ = 1, 25 do
+      session:update()
+      if contains(pool.submitted, "source-plan:global") then
+        break
+      end
+    end
+    local scheduled = snapshotCalls(calls)
+    -- An unchanged re-request only observes the retained answer: the intro
+    -- still cannot certify before its inventory publishes.
+    local retainedReady, retainedFailure = session:requestMilestone("new-game-intro", "required")
     return {
-      snapshot = snapshot,
+      scheduled = scheduled,
       ready = ready,
       failure = failure,
+      retainedReady = retainedReady,
+      retainedFailure = retainedFailure,
       submitted = copyList(pool.submitted),
       enumerationComplete = session:status().enumerationComplete,
     }
   end)
-  Assert.equal(result.snapshot.romFs, 0, "selecting a generation opens no source reader")
-  Assert.equal(result.snapshot.index, 0, "selecting a generation compiles no cell index")
-  Assert.equal(result.snapshot.script, 0, "selecting a generation plans no scripts")
-  Assert.equal(result.snapshot.audio, 0, "selecting a generation plans no audio")
-  Assert.equal(result.snapshot.catalog, 0, "selecting a generation compiles no mon catalog")
-  Assert.equal(result.snapshot.presentation, 0, "selecting a generation plans no mon presentation")
+  -- The planner call counts only accumulate, so the post-scheduling snapshot
+  -- covers construction as well.
+  assertNoAggregateCompilation(result.scheduled, "selection through scheduling")
   Assert.isFalse(result.ready, "the intro stays pending until the inventory publishes")
   Assert.isNil(result.failure, "the intro reports no failure while the inventory is pending")
-  Assert.isTrue(
-    contains(result.submitted, "source-plan:global"),
-    "intro demand schedules the persisted source inventory job"
+  Assert.equal(
+    countOf(result.submitted, "source-plan:global"),
+    1,
+    "intro demand schedules exactly one persisted source inventory job"
   )
+  Assert.isFalse(result.retainedReady, "the intro never certifies while its inventory is pending")
+  Assert.isNil(result.retainedFailure, "the pending inventory is not reported as a failure")
   Assert.isTrue(result.enumerationComplete == false, "enumeration is not complete before the inventory publishes")
 end
 
@@ -869,22 +908,39 @@ local function inventoryPlan(generation, scriptIds)
 end
 
 local function layoutManifest(schema, imagePath, width, height, cell)
+  local MonCache = require("libs.assets.src.MonCache")
+  local portrait = schema == MonCache.PORTRAIT_MANIFEST_SCHEMA
+  local page = { pageId = 0, image = imagePath, width = width, height = height }
+  local frames = { { x = 0, y = 0, width = cell, height = cell, duration = 6 } }
+  local entry = {
+    x = 0,
+    y = 0,
+    width = cell,
+    height = cell,
+    frames = frames,
+    pageId = 0,
+  }
+  if portrait then
+    -- Portrait pages carry their CPU source sidecars beside the raster
+    -- page, and portrait entries carry their palette slot with both
+    -- authored frames, exactly what the portrait manifest requires.
+    page.indexed = {
+      indices = string.rep("\0", width * height),
+      palettes = string.rep("\0", 32),
+      paletteCount = 1,
+    }
+    frames[#frames + 1] = { x = cell, y = 0, width = cell, height = cell, duration = 6 }
+    entry.paletteIndex = 0
+  end
   return {
     schema = schema,
     version = { id = "heartgold", language = "english" },
     pages = {
-      [0] = { pageId = 0, image = imagePath, width = width, height = height },
+      [0] = page,
     },
     pageIds = { 0 },
     entries = {
-      ["K/f0"] = {
-        x = 0,
-        y = 0,
-        width = cell,
-        height = cell,
-        frames = { { x = 0, y = 0, width = cell, height = cell, duration = 6 } },
-        pageId = 0,
-      },
+      ["K/f0"] = entry,
     },
     representative = { "K/f0" },
   }

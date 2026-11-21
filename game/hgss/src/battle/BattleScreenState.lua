@@ -19,7 +19,6 @@ local BattleEncounterIndexedRaster = require("game.hgss.src.battle.BattleEncount
 local BattlePresentationAssets = require("game.hgss.src.battle.BattlePresentationAssets")
 local BattlePresentationCache = require("libs.assets.src.battle.BattlePresentationCache")
 local MonCache = require("libs.assets.src.MonCache")
-local BattlePresentationFlow = require("game.hgss.src.battle.BattlePresentationFlow")
 local BattleViewRoster = require("game.hgss.src.battle.BattleViewRoster")
 local BattleScene = require("libs.hgss.src.presentation.BattleScene")
 local BattleBagPockets = require("game.hgss.src.battle.BattleBagPockets")
@@ -57,6 +56,9 @@ local Rgb555 = require("libs.codec.src.Rgb555")
 ---@field _assets BattlePresentationAssets per-launch preparation leases
 ---@field _timeline BattleTimeline ordered visible-cue player
 ---@field _player table<string, unknown> battle-private native animation interpreter over the live scene
+---@field _animationRngSeed integer? shared visual-stream seed behind occurrence playback, nil without a launch capture
+---@field _animationRngSeeded boolean true once the launch seed entered player playback
+---@field _splRandomState table<string, integer>? borrowed boot stream record shared by one boot
 ---@field _nativeHandles table<table<string, unknown>, table<string, unknown>> native occurrence tracks by player handle or pending token
 ---@field _nativeVoices table<string, table<string, unknown>> staged player voices by name behind launch-owned stops
 ---@field _nativeVoiceArmed table<string, boolean> per-play fast-rate arming behind sound-task completion
@@ -125,6 +127,8 @@ local Rgb555 = require("libs.codec.src.Rgb555")
 ---@field _cursorSelection string? selection owning the current corner animation
 ---@field _bagCursorTick integer battle-bag corner shimmer clock in presentation ticks
 ---@field _bagCursorIdentity string? focused bag page and control owning the current shimmer
+---@field _wrapperCursorTick integer battle-party wrapper corner shimmer clock in presentation ticks
+---@field _wrapperCursorIdentity string? focused wrapper page and control owning the current shimmer
 ---@field _activeEffectTick integer active player bob clock in presentation ticks
 ---@field _activeEffectRunning boolean whether the player selection bob is active
 ---@field _sourceAccum number accepted seconds banked toward the next source tick
@@ -185,6 +189,27 @@ local COMMAND_SLOT_CELLS = {
   fight = { x = 0, y = 0 },
   bag = { x = 0, y = 1 },
   pokemon = { x = 2, y = 1 },
+  run = { x = 1, y = 1 },
+}
+
+-- Compact single-pane command navigation follows the drawn two-by-two
+-- grid (Fight/Bag over Pokemon/Run): keypad motion walks its own rows
+-- and columns and clamps at the grid edges. Grid cells name ordinary
+-- slots so special contexts navigate by the slot their command
+-- replaces, like the paired grid.
+local COMPACT_COMMAND_GRID = {
+  { "fight", "bag" },
+  { "pokemon", "run" },
+}
+local COMPACT_COMMAND_WIDTH = 2
+local COMPACT_COMMAND_HEIGHT = 2
+
+-- Compact cursor cell behind one ordinary command slot, mirroring
+-- COMMAND_SLOT_CELLS for the paired layout.
+local COMPACT_SLOT_CELLS = {
+  fight = { x = 0, y = 0 },
+  bag = { x = 1, y = 0 },
+  pokemon = { x = 0, y = 1 },
   run = { x = 1, y = 1 },
 }
 
@@ -495,6 +520,8 @@ end
 ---@field battleScene boolean? scene choice for this launch, defaulting to On for previous callers
 ---@field musicRole string? chosen battle-music symbol behind the exact demand closure
 ---@field musicBanks integer[]? chosen track bank identities behind the demand
+---@field animationRngState table<string, unknown>? detached launch visual-stream capture behind the shared seed
+---@field splRandomState table<string, integer>? borrowed boot stream record shared by one boot
 ---@field overrides table<string, unknown>? per-instance scene/frame/case inputs
 
 -- The battle screen owns one animation player and its per-launch
@@ -709,74 +736,70 @@ local function renderFault(fault)
     .. tostring(detail.reason)
 end
 
----@param view table<string, unknown>? event-time view under copying
----@return table<string, unknown>? view copy with defaulted activation and position facts
-local function enrichedViewForTopology(view)
-  if type(view) ~= "table" then
-    return nil
+---@param screen BattleScreenState owning screen behind effect admission
+---@param record table<string, unknown> loaded staged effect record behind the admission
+---@param effectKey string catalog key behind diagnosis
+---@return boolean installed true once the scene carries the admitted root policy
+local function installWrapperPolicy(screen, record, effectKey)
+  -- The native script wrapper applies the admitted root's immutable
+  -- display policy around its run: healthbar updates suspend while
+  -- the policy names them, never hiding the HUD. A staged record
+  -- without the complete policy is malformed generated data and
+  -- fails with provenance instead of animating under a guessed one.
+  local policy = record.displayPolicy --[[@as table<string, unknown>?]]
+  if
+    type(policy) ~= "table"
+    or type(policy.suspendHealthbarUpdates) ~= "boolean"
+    or type(policy.updateBattlerG3) ~= "boolean"
+  then
+    failNative(
+      screen,
+      "battle effect "
+        .. effectKey
+        .. " failed for launch "
+        .. screen._launchId
+        .. ": staged record carries no complete root display policy"
+    )
+    return false
   end
-  local out = {}
-  for _, group in ipairs({ "own", "foes" }) do
-    local records = view[group]
-    if type(records) == "table" then
-      local filled = {}
-      for index, record in ipairs(records) do
-        if type(record) == "table" then
-          local copy = copyValue(record) --[[@as table<string, unknown>]]
-          -- Legacy emissions predate activation and position facts;
-          -- default to the native combatant identity so the
-          -- visual-topology resolver still binds the event-time slot.
-          -- Records carrying real facts pass through untouched.
-          -- Explicitly benched reserves keep no slot facts: inventing
-          -- positions from combatant identities would pollute the live
-          -- side order (the full own roster pictures bench) with phantom
-          -- slots, failing singles playback or misresolving it as
-          -- doubles. Records predating the active flag read as active.
-          if copy.active ~= false then
-            if copy.activation == nil then
-              copy.activation = copy.combatant
-            end
-            if copy.position == nil then
-              copy.position = copy.combatant
-            end
-          end
-          filled[index] = copy
-        end
-      end
-      out[group] = filled
-    end
-  end
-  return out
+  screen._scene:setWrapperDisplayPolicy(policy --[[@as table<string, boolean>]])
+  return true
 end
 
----@param event table<string, unknown> accepted event carrying its playback facts
----@param visualSeed integer deterministic visual seed behind the occurrence
----@return table<string, unknown> detached event with defaulted actor, target, and seed facts
-local function enrichedEventForTopology(event, visualSeed)
-  local out = copyValue(event) --[[@as table<string, unknown>]]
-  for _, group in ipairs({ "actors", "targets" }) do
-    local entries = out[group]
-    if type(entries) == "table" then
-      for _, entry in
-        ipairs(entries --[[@as table<integer, table<string, unknown>>]])
-      do
-        if type(entry) == "table" and entry.activation == nil then
-          entry.activation = entry.combatant
-        end
-      end
-    end
+---@param screen BattleScreenState owning screen behind wrapper restoration
+local function restoreWrapperPolicy(screen)
+  -- The wrapper restores the default on the source-defined exit or
+  -- exceptional cancel so no retired root leaks suspension into the
+  -- next admission. The default matches the source default branch.
+  if screen._scene ~= nil then
+    screen._scene:setWrapperDisplayPolicy({ suspendHealthbarUpdates = false, updateBattlerG3 = false })
   end
-  if out.visualSeed == nil then
-    out.visualSeed = visualSeed
-  end
-  return out
 end
 
 ---@param screen BattleScreenState owning screen behind effect admission
----@param cue table<string, unknown> native-effect cue carrying accepted event/packet identity and semantic effect key
----@param effectKey string flat semantic effect key under admission
+---@param cue table<string, unknown> native-effect cue carrying its ledgered frozen request
 ---@return table<string, unknown>? player handle behind the running occurrence, nil on terminal refusal
-local function nativeEffectAdmit(screen, cue, effectKey)
+local function nativeEffectAdmit(screen, cue)
+  local request = cue.request --[[@as table<string, unknown>?]]
+  local effectKey = cue.effectKey
+  if type(request) == "table" and type(request.effectKey) == "string" then
+    effectKey = request.effectKey --[[@as string]]
+  end
+  if type(request) ~= "table" or type(request.playback) ~= "table" then
+    failNative(
+      screen,
+      "battle effect "
+        .. tostring(effectKey)
+        .. " failed for launch "
+        .. screen._launchId
+        .. ": the cue carries no ledgered frozen request"
+    )
+    return nil
+  end
+  if type(effectKey) ~= "string" or effectKey == "" then
+    failNative(screen, "battle effect for launch " .. screen._launchId .. ": the ledgered request names no catalog key")
+    return nil
+  end
   local record, loadFailure = screen._assets:loadEffect(effectKey)
   if record == nil then
     failNative(
@@ -836,14 +859,15 @@ local function nativeEffectAdmit(screen, cue, effectKey)
     end
   end
   -- Required-context probe: a program declaring resolved move power
-  -- admits only a cue carrying the executed unsigned value. A missing
-  -- or malformed fact fails with launch, effect, packet, and event
-  -- provenance before anything stages; effects without the declaration
-  -- start exactly as before.
+  -- admits only a request freezing the executed unsigned value. A
+  -- missing or malformed fact fails with launch, effect, packet, and
+  -- event provenance before anything stages; effects without the
+  -- declaration start exactly as before.
+  local frozen = request.playback --[[@as table<string, unknown>]]
+  local frozenContext = frozen.context --[[@as table<string, unknown>?]]
   local required = record.requiredContext
   if type(required) == "table" and required.movePower ~= nil then
-    local admitted = cue.event.move
-    local power = type(admitted) == "table" and admitted.power or nil
+    local power = type(frozenContext) == "table" and frozenContext.movePower or nil
     if type(power) ~= "number" or power % 1 ~= 0 or power < 0 or power > 65535 then
       failNative(
         screen,
@@ -855,36 +879,38 @@ local function nativeEffectAdmit(screen, cue, effectKey)
           .. tostring(cue.packetId)
           .. " event "
           .. tostring(cue.eventSequence)
-          .. " kind "
-          .. tostring(cue.event.kind)
+          .. " request ordinal "
+          .. tostring((request.identity --[[@as table<string, unknown>]]).ordinal)
       )
       return nil
     end
   end
-  local slots = screen._manifest.battlefield.slots
-  local enriched = enrichedEventForTopology(cue.event, cue.visualSeed)
-  local ok, playback = pcall(BattlePresentationFlow.animationPlayback, {
-    launchId = cue.launchId,
-    packetId = cue.packetId,
-    before = enrichedViewForTopology(cue.before),
-    after = enrichedViewForTopology(cue.after),
-  }, enriched, slots)
-  if not ok then
-    failNative(
-      screen,
-      "battle effect "
-        .. effectKey
-        .. " failed for launch "
-        .. screen._launchId
-        .. ": bad source topology: "
-        .. tostring(playback)
-    )
+  -- Admission consumes the ledgered frozen request: the selector
+  -- already froze roots, context, and topology, so nothing here
+  -- re-selects or repairs them. The cue event rides along only as
+  -- task context behind the running player occurrence.
+  -- The wrapper applies the admitted root display policy before the
+  -- occurrence starts; refusal, completion, retirement, cancellation,
+  -- and failure restore the default.
+  if not installWrapperPolicy(screen, record, effectKey) then
     return nil
   end
+  -- Playback carries no occurrence-derived seed: the running
+  -- occurrence draws visual variation from the screen-owned battle
+  -- visual stream, never from cue identity arithmetic.
+  local playback = {
+    launchId = cue.launchId,
+    packetId = cue.packetId,
+    identity = request.identity,
+    event = cue.event,
+    topology = frozen.topology,
+    context = frozen.context,
+  }
   screen._liveEffectRecord = record
   local handle, refusal = screen._player:start(playback, program)
   if handle == nil then
     screen._liveEffectRecord = nil
+    restoreWrapperPolicy(screen)
     failNative(
       screen,
       "battle effect "
@@ -902,13 +928,16 @@ local function nativeEffectAdmit(screen, cue, effectKey)
 end
 
 ---@param screen BattleScreenState owning screen behind effect admission
----@param cue table<string, unknown> native-effect cue carrying accepted event/packet identity and semantic effect key
+---@param cue table<string, unknown> native-effect cue carrying its ledgered frozen request
 ---@return table<string, unknown>? player handle or pending token, nil on terminal refusal
 local function nativeEffectStart(screen, cue)
   if screen._disposed or screen._mode == "failed" then
     return nil
   end
   local effectKey = cue.effectKey
+  if (type(effectKey) ~= "string" or effectKey == "") and type(cue.request) == "table" then
+    effectKey = cue.request.effectKey
+  end
   if type(effectKey) ~= "string" or effectKey == "" then
     return nil
   end
@@ -928,7 +957,7 @@ local function nativeEffectStart(screen, cue)
     screen._nativeHandles[token] = { token = token, pending = true, effectKey = effectKey, cue = cue }
     return token
   end
-  return nativeEffectAdmit(screen, cue, effectKey)
+  return nativeEffectAdmit(screen, cue)
 end
 
 ---@param screen BattleScreenState owning screen behind occurrence polling
@@ -966,7 +995,7 @@ local function nativeEffectStatus(screen, handleOrToken)
       return "pending"
     end
     track.pending = false
-    local handle = nativeEffectAdmit(screen, track.cue, track.effectKey)
+    local handle = nativeEffectAdmit(screen, track.cue)
     if handle == nil then
       track.failed = true
       return "failed"
@@ -1029,6 +1058,7 @@ local function nativeEffectCancel(screen, handleOrToken, reason)
     if screen._liveEffectHandle == track.handle then
       screen._liveEffectHandle = nil
       screen._liveEffectRecord = nil
+      restoreWrapperPolicy(screen)
     end
   end
 end
@@ -1055,6 +1085,7 @@ local function pollNativeEffects(screen)
     if phase ~= "preparing" and phase ~= "running" and phase ~= "waiting" then
       screen._liveEffectHandle = nil
       screen._liveEffectRecord = nil
+      restoreWrapperPolicy(screen)
     end
   end
 end
@@ -1131,6 +1162,7 @@ local function nativeEffectRetire(screen, handleOrToken)
   if screen._liveEffectHandle == handle then
     screen._liveEffectHandle = nil
     screen._liveEffectRecord = nil
+    restoreWrapperPolicy(screen)
   end
   return true
 end
@@ -1206,6 +1238,10 @@ function BattleScreenState.new(opts)
   end
   local overrides = opts.overrides or {}
   assert(type(overrides) == "table", "per-instance inputs arrive as a record")
+  assert(
+    opts.splRandomState == nil or type(opts.splRandomState) == "table",
+    "the battle screen borrows the boot stream record"
+  )
   local manifest = opts.manifest --[[@as table<string, unknown>]]
   local battleSpeed = opts.battleSpeed
   if battleSpeed == nil then
@@ -1276,6 +1312,7 @@ function BattleScreenState.new(opts)
       itemCatalog = opts.itemCatalog,
       monCatalog = opts.monCatalog,
       battleMenus = opts.battleMenus,
+      partySection = type(manifest.party) == "table" and manifest.party or nil,
     }),
     _partySnapshot = nil,
     _inventorySnapshot = nil,
@@ -1334,6 +1371,8 @@ function BattleScreenState.new(opts)
     _cursorSelection = nil,
     _bagCursorTick = 0,
     _bagCursorIdentity = nil,
+    _wrapperCursorTick = 0,
+    _wrapperCursorIdentity = nil,
     _activeEffectTick = 0,
     _activeEffectRunning = false,
     _sourceAccum = 0,
@@ -1345,14 +1384,15 @@ function BattleScreenState.new(opts)
     _iconAnimationTick = 0,
     _scene = BattleScene.new(),
     _pictureAnimSeqSeen = {},
-    _encounterParticles = BattleEncounterParticles.new(),
-    _ballParticles = BattleBallParticles.new(),
+    _encounterParticles = BattleEncounterParticles.new({ splRandomState = opts.splRandomState }),
+    _ballParticles = BattleBallParticles.new({ splRandomState = opts.splRandomState, scene = nil }),
     _gaugeVisuals = {},
     _sceneHasBackground = false,
     _sceneAccum = 0,
     _outcomeDone = false,
     _lastPlayerName = nil,
     _error = nil,
+    _splRandomState = opts.splRandomState,
     _disposed = false,
   }, BattleScreenState)
   -- Foe move sets never enter the detached views, so foe narration
@@ -1403,13 +1443,44 @@ function BattleScreenState.new(opts)
   -- real task factory, a semantic voice adapter over the existing
   -- battle audio path, and a selected-effect resource adapter over the
   -- selected effect record and its dependencies. These are the real
-  -- collaborators, not fake task or voice doubles.
+  -- collaborators, not fake task or voice doubles. The injected frame
+  -- hook is the only source clock: draw runs the particle capture/
+  -- calculation and picture phases at the native graphics priority,
+  -- publish freezes the displayable frame, and every accepted tick
+  -- invokes both phases in order even with no live visual machine.
+  local screen = self
+  local function onNativeFrame(phase, sourceTick)
+    if phase == "draw" then
+      local ParticleSystems = require("libs.hgss.src.presentation.BattleParticleSystems")
+      ParticleSystems.stepSourceDrawPhase(screen._scene, sourceTick)
+      screen._scene:stepAnimationPictures(sourceTick)
+    end
+  end
   self._player = BattleAnimationPlayer.new({
     scene = self._scene,
     audio = nativeVoiceAdapter(self),
     resources = nativeResourceAdapter(self),
     tasks = BattleEffectTasks,
+    splRandomState = opts.splRandomState,
+    services = {
+      onNativeFrame = onNativeFrame,
+    },
   })
+  -- The screen owns one continuous battle-lifetime visual stream from a
+  -- single detached launch capture: it selects the shared stream seed
+  -- once, never advances the mon-service or mechanics streams, and
+  -- discards the capture at exit without writing it back.
+  local animationRngState = opts.animationRngState
+  if animationRngState ~= nil then
+    assert(
+      type(animationRngState) == "table" and type(animationRngState.state) == "number",
+      "the battle screen restores its visual stream from a detached launch capture"
+    )
+    self._animationRngSeed = math.floor(animationRngState.state) % 4294967296
+  else
+    self._animationRngSeed = nil
+  end
+  self._animationRngSeeded = false
   -- Native-effect routing engages only when the injected preparation
   -- services expose the lazy effect staging callbacks; legacy rigs without
   -- them keep the established generic cue vocabulary untouched.
@@ -1458,8 +1529,43 @@ function BattleScreenState.new(opts)
     "the battle screen binds its per-launch ball entries for launch " .. opts.launchId
   )
   local function ballFadeColor(ballKey)
-    local entry = assert(battleBalls["ball:" .. ballKey], "recall and send-out balls are in the ball inventory")
+    -- Capture balls thrown from the bag may stage outside the launch's
+    -- active send-out inventory; a missing leaf simply keeps the unfaded
+    -- vanish instead of failing the break-out.
+    local entry = battleBalls["ball:" .. ballKey]
+    if entry == nil then
+      return nil
+    end
     return entry.fadeColor
+  end
+  -- The cue player advances a send-out ball's opening animation by the
+  -- staged source durations instead of holding one cell.
+  local function ballOpening(ballKey)
+    local entry = battleBalls["ball:" .. ballKey]
+    if entry == nil then
+      return nil
+    end
+    local opening = assert(entry.opening, "a staged ball carries its opening animation")
+    local frames = {}
+    for _, frame in ipairs(opening.frames) do
+      frames[#frames + 1] = { drawableKey = frame.drawableKey, durationTicks = frame.durationTicks }
+    end
+    return { frames = frames }
+  end
+  -- The cue player ticks each thrown ball's own throw animation by its
+  -- staged source frame durations.
+  local function ballThrow(ballKey)
+    -- Capture balls thrown from the bag may stage outside the active
+    -- battlers' inventory; a missing entry simply keeps the throw cell.
+    local entry = battleBalls["ball:" .. ballKey]
+    if entry == nil then
+      return nil
+    end
+    local frames = {}
+    for _, frame in ipairs(entry.frames) do
+      frames[#frames + 1] = { drawableKey = frame.drawableKey, durationTicks = frame.durationTicks }
+    end
+    return { frames = frames }
   end
   -- The cue player times the send-out hold and cry delay from the staged
   -- motion headers: the foe reads the front header while the player
@@ -1491,6 +1597,8 @@ function BattleScreenState.new(opts)
   self._timeline = BattleTimeline.new({
     encounterFadeColor = background:match("^cave_") and "black" or "white",
     ballFadeColor = ballFadeColor,
+    ballOpening = ballOpening,
+    ballThrow = ballThrow,
     trainerPictures = trainerPictures,
     moveName = moveNameOf,
     speciesName = speciesNameOf,
@@ -1502,6 +1610,7 @@ function BattleScreenState.new(opts)
     battleScene = launchScene,
     motionFacts = motionFactsFor,
     effects = effects,
+    slotGeometry = self._manifest.battlefield.slots,
     faintAppearance = faintAppearance,
   })
   local cases = nil
@@ -1538,6 +1647,7 @@ function BattleScreenState.new(opts)
     itemCatalog = opts.itemCatalog,
     monCatalog = opts.monCatalog,
     battleMenus = opts.battleMenus,
+    partySection = type(self._manifest.party) == "table" and self._manifest.party or nil,
     audioEffect = subflowAudioEffect,
     resolveMessage = subflowResolveMessage,
   })
@@ -1620,40 +1730,6 @@ end
 -- Applies the effective blend-coefficient overlay to one battler: when
 -- the battler's sprite-context slot appears in the active patch, the
 -- per-item alpha takes the clamped sprite weight, exactly what the
--- picture pass already consumes. Retail EVA is the sprite weight
--- against the background at nominal full-strength 16, so
--- alpha = clamp(EVA, 0, 16) / 16. EVB weights the background plane the
--- composite always draws first and BLDCNT plane masks have no pixel
--- expression for this task kind, so both stay out of the mapping.
--- Sprite-context slots follow retail battler order: slot 0 names the
--- first player-side battler, slot 1 the first foe-side battler, slot 2
--- the second player-side battler, slot 3 the second foe-side battler.
--- Left/right resolves by sorted position order within the side, the
--- same order the slot geometry path trusts.
----@param battler table<string, unknown> displayed battler fact under blending
----@param order integer[] canonical claimed positions of the battler side in slot order
----@param blendSlots table<string, boolean> active sprite-context slot names
----@param coefficients table<string, unknown> effective blend register view
-local function applyBlendAlpha(battler, order, blendSlots, coefficients)
-  local sideBit = battler.side == 1 and 0 or 1
-  for index, slot in ipairs(order) do
-    if slot == battler.position then
-      local name = "sprite-context-slot-" .. ((index - 1) * 2 + sideBit)
-      if blendSlots[name] == true then
-        local eva = coefficients.blendCoefficientA
-        assert(type(eva) == "number", "blend overlays carry a numeric sprite weight")
-        if eva < 0 then
-          eva = 0
-        elseif eva > 16 then
-          eva = 16
-        end
-        battler.alpha = eva / 16
-      end
-      return
-    end
-  end
-end
-
 -- Resolves the baked send-out motion behind one battler: the program
 -- header rides the species/facing motion table while the program track
 -- carries the shared samples. Absent motion (planning manifests) plays
@@ -1725,18 +1801,15 @@ local function applyPictureMotion(self, battler)
   end
 end
 
+-- Task-owned sprite blend weights stay compositor state: the snapshot
+-- carries the raw coefficients and the renderer maps them onto blend
+-- mode, EVA/EVB and first/second targets. Per-battler alpha writes are
+-- gone; polygon alpha stays five-bit source state and color effects
+-- stay compositor state.
 ---@param self BattleScreenState
 ---@param battlers table<integer, table<string, unknown>> displayed battler facts under enriching
 local function enrichScene(self, battlers)
   local foeOrder, allyOrder = sceneSlotOrders(battlers)
-  local coefficients = self._scene:blendCoefficients()
-  local blendSlots = nil
-  if coefficients ~= nil and type(coefficients.spriteSlots) == "table" then
-    blendSlots = {}
-    for _, slot in ipairs(coefficients.spriteSlots) do
-      blendSlots[slot] = true
-    end
-  end
   for _, battler in ipairs(battlers) do
     if type(battler) == "table" then
       local pictureState = self._scene:pictureState(battler)
@@ -1823,9 +1896,6 @@ local function enrichScene(self, battlers)
       local order = nil
       if type(battler.position) == "number" then
         order = battler.side == 1 and allyOrder or foeOrder
-      end
-      if blendSlots ~= nil and coefficients ~= nil and order ~= nil then
-        applyBlendAlpha(battler, order, blendSlots, coefficients)
       end
       local row = BattleScene.slotRow(battler, order, self._manifest.battlefield.slots)
       battler.sideType = row.sideType
@@ -2216,6 +2286,10 @@ local function sourceIndexPathsAtSlot(entry, firstSlot)
     for _, frame in ipairs(entry.frames) do
       addFrame(frame)
     end
+    local opening = assert(entry.opening, "a staged ball carries its opening animation")
+    for _, frame in ipairs(opening.frames) do
+      addFrame(frame)
+    end
   else
     local animation = assert(entry.animation, "trainer source art stages its animation frames")
     local sequences = animation.sequences
@@ -2385,7 +2459,8 @@ local function snapshotMessage(self, names)
       message = timelineMessage
     else
       local shiftPrompt = self:_shiftPrompt()
-      message = shiftPrompt or commandPrompt or timelineMessage
+      local useNextPrompt = self:_useNextPrompt()
+      message = shiftPrompt or useNextPrompt or commandPrompt or timelineMessage
     end
   end
   return message, levelUpStats
@@ -2735,6 +2810,8 @@ function BattleScreenState:_snapshot(borrowStatic)
     cursorTick = self._cursorTick,
     bagCursorTick = self._bagCursorTick,
     bagCursorFrames = self:_bagCursorFrames(),
+    wrapperCursorTick = self._wrapperCursorTick,
+    wrapperCursorFrames = self:_bagCursorFrames(),
     armed = armed ~= nil and { scope = armed.scope, id = armed.id } or nil,
     buttonFeedback = buttonFeedback,
     touchFeedback = self._armed ~= nil and self._armed.id == "dialogue" and self._armed.pointerId ~= nil or false,
@@ -2746,9 +2823,18 @@ function BattleScreenState:_snapshot(borrowStatic)
     bgScroll = self._scene:scroll(),
     backgroundRaster = self._scene:hasBackground() and self._scene:backgroundRaster() or nil,
     effectInstances = self._scene:effectViews(),
-    moveParticleSystems = self._scene:particleSystems(),
-    encounterParticleSystems = self._encounterParticles:systems(),
-    ballParticleSystems = self._ballParticles:systems(),
+    -- The compositor paints the published pre-advance draw frames the
+    -- native draw phase captured, never the already-advanced live
+    -- simulation.
+    moveParticleSystems = self._scene:drawParticleSystems(),
+    encounterParticleSystems = self._encounterParticles:drawSystems(),
+    ballParticleSystems = self._ballParticles:drawSystems(),
+    -- Detached compositor state behind the typed composition frame:
+    -- engine planes, blend/window/brightness writes, mosaic and the
+    -- source scanline buffer. Task-owned sprite blend weights ride
+    -- alongside for the compositor mapping.
+    sceneAnimation = self._scene:animationFrame(),
+    spriteBlend = self._scene:blendCoefficients(),
     slotGeometry = self._manifest.battlefield.slots,
     hudSections = { player = self._manifest.hud.player, enemy = self._manifest.hud.enemy },
     -- Retained paint views borrow the immutable gauge families: the
@@ -2777,7 +2863,7 @@ function BattleScreenState:_snapshot(borrowStatic)
       target = self._manifest.menus.target.screens,
       twoOption = self._manifest.menus.twoOption.screens,
     },
-    twoOption = copyValue(self:_shiftTwoOption()),
+    twoOption = copyValue(self:_shiftTwoOption() or self:_useNextTwoOption()),
     hudPatchSpans = self._manifest.hud.patchSpans,
     cursor = self._manifest.hud.cursor,
     menuText = self:_menuText(),
@@ -3135,9 +3221,9 @@ function BattleScreenState:view()
     openingPresentation = copyValue(snapshot.openingPresentation),
     introScene = snapshot.introScene,
     terrainSprites = snapshot.terrainSprites,
-    encounterParticleSystems = self._encounterParticles:systems(),
-    ballParticleSystems = self._ballParticles:systems(),
-    moveParticleSystems = self._scene:particleSystems(),
+    encounterParticleSystems = self._encounterParticles:drawSystems(),
+    ballParticleSystems = self._ballParticles:drawSystems(),
+    moveParticleSystems = self._scene:drawParticleSystems(),
     playerTrainer = copyValue((self._pendingFinal or self._latestView or {}).playerTrainer),
     foeTrainers = copyValue((self._pendingFinal or self._latestView or {}).foeTrainers),
     actor = copyValue(snapshot.actor),
@@ -3157,6 +3243,13 @@ function BattleScreenState:_ready()
     return false
   end
   if self._child ~= nil then
+    return false
+  end
+  -- An open Yes/No prompt holds the ready barrier like an open child:
+  -- the wild replacement offer waits for its answer with no child yet
+  -- (Yes opens party, No seals flight), so a settled timeline alone
+  -- must not report ready.
+  if self._mode == "use-next" then
     return false
   end
   -- A retained terminal registration holds the ready barrier from packet
@@ -3548,6 +3641,7 @@ function BattleScreenState:_openCompletionEvolution()
   }, {
     monCatalog = self._monCatalog,
     evolutionParticles = particleSet,
+    splRandomState = self._splRandomState,
     evolutionCursor = cursorAnimations,
     summary = self._summary,
   })
@@ -4346,6 +4440,34 @@ local function leafSelectorsOf(view)
   return trainers, balls
 end
 
+-- Semantic ball selectors behind the capture throws a packet delivers:
+-- the thrown ball is a bag item, so it never appears in the active
+-- send-out records and must be demanded from the events themselves.
+---@param events table<integer, table<string, unknown>>? delivered sanitized events
+---@return string[] sorted semantic `ball:<key>` selectors
+local function thrownBallSelectors(events)
+  local selectors = {}
+  if type(events) ~= "table" then
+    return selectors
+  end
+  local seen = {}
+  for _, event in ipairs(events) do
+    if type(event) == "table" and event.kind == "throw" then
+      local payload = event.payload
+      local ball = type(payload) == "table" and payload.ball or nil
+      if type(ball) == "string" and ball:match("^[A-Z][A-Z0-9_]*$") ~= nil then
+        local selector = "ball:" .. ball
+        if not seen[selector] then
+          seen[selector] = true
+          selectors[#selectors + 1] = selector
+        end
+      end
+    end
+  end
+  table.sort(selectors)
+  return selectors
+end
+
 -- Whether every trainer and ball leaf behind the candidate views is
 -- already staged in the per-launch entries. Pending entries hold the
 -- delivering packet instead of letting cue construction dereference
@@ -4502,6 +4624,14 @@ function BattleScreenState:_portPresent(packet)
         end
       end
     end
+    local thrownBalls = thrownBallSelectors(packet.events)
+    for _, selector in ipairs(thrownBalls) do
+      if not seenBalls[selector] then
+        seenBalls[selector] = true
+        balls[#balls + 1] = selector
+      end
+    end
+    table.sort(balls)
     if #trainers > 0 then
       self._assets:addTrainerPictures(trainers)
     end
@@ -5116,6 +5246,13 @@ function BattleScreenState:_playCancelFeedback()
   self:_playCue({ kind = "effect", symbol = BattleAudio.SINK_SOUNDS.decide })
 end
 
+-- Voices one staged select cue behind a keypad focus move: cursor
+-- motion on the main battle menus answers with SELECT like the retail
+-- d-pad cursor, while edges that keep the focus stay silent.
+function BattleScreenState:_playMoveFeedback()
+  self:_playCue("select")
+end
+
 ---@param fragment table<string, unknown> prepared choice fragment under staging
 function BattleScreenState:_seal(fragment)
   assert(self._request ~= nil and self._options ~= nil, "replies answer the open request")
@@ -5413,33 +5550,17 @@ function BattleScreenState:_shiftPrompt()
   return stagedBattleText(self._manifest, "battle/prompt/shift-offer", { className, trainerName, incomingName })
 end
 
----@return table<string, unknown>? staged Yes/No labels behind the Shift prompt, nil outside the offer
+---@return table<string, unknown>? staged source option labels behind the Shift prompt, nil outside the offer
 function BattleScreenState:_shiftTwoOption()
   if self._mode ~= "shift" or self:_shiftActor() == nil then
     return nil
   end
-  local menus = assert(self._manifest.menus, "shift prompts require the staged menu catalog") --[[@as table<string, unknown>]]
-  local routes = assert(menus.routes, "shift prompts require staged source routes") --[[@as table<string, unknown>]]
-  local route = assert(routes["menu/yes-no"], "shift prompts select the source yes-no route") --[[@as table<string, unknown>]]
-  local selected = {}
-  for _, key in
-    ipairs(route.messageEntries --[[@as table<integer, string>]])
-  do
-    selected[key] = true
-  end
-  assert(
-    selected["label/yes"] == true and selected["label/no"] == true,
-    "the selected text set stages both source labels"
+  return self:_stagedTwoOption(
+    "menu/switch-or-keep",
+    "label/switch",
+    "label/keep-battling-switch",
+    "shift prompts require"
   )
-  local messages = assert(self._manifest.messages, "shift prompts require staged message entries") --[[@as table<string, unknown>]]
-  local entries = assert(messages.entries, "shift prompts require semantic message entries") --[[@as table<string, table<string, unknown>>]]
-  local topRecord = assert(entries["label/yes"], "the top source option has a staged label")
-  local bottomRecord = assert(entries["label/no"], "the bottom source option has a staged label")
-  return {
-    route = "menu/yes-no",
-    top = menuLabelText(topRecord.tokens --[[@as table<integer, table<string, unknown>>]]),
-    bottom = menuLabelText(bottomRecord.tokens --[[@as table<integer, table<string, unknown>>]]),
-  }
 end
 
 -- Seals the provided empty stay fragment for the held offer: prompt
@@ -5485,6 +5606,224 @@ function BattleScreenState:_activateShift(choice)
   self:_sealShiftStay()
 end
 
+-- Opens the wild replacement offer over the first fainted entry: the
+-- staged question asks whether to send the next mon while Yes opens the
+-- party picker and No attempts escape. The kernel keeps owning the
+-- decision; this mode only routes one epoch-bound reply per offer.
+function BattleScreenState:_enterUseNextPrompt()
+  self._targetCandidates = nil
+  self._targetRangeKey = nil
+  self._pendingMoveId = nil
+  self:cancelPointerCapture()
+  self._notice = nil
+  self._subflows:closeChild()
+  self._child = nil
+  self._selection = "yes"
+  self._mode = "use-next"
+end
+
+---@return table<string, unknown>? replacement actor behind the held wild offer, nil without one
+function BattleScreenState:_useNextActor()
+  if self._mode ~= "use-next" then
+    local offered = self:_useNextOffered()
+    if offered == nil then
+      return nil
+    end
+    return offered.actor
+  end
+  local options = self._options
+  if type(options) ~= "table" or type(options.actors) ~= "table" then
+    return nil
+  end
+  for _, actor in ipairs(options.actors) do
+    if
+      type(actor) == "table" and (actor --[[@as table<string, unknown>]]).kind == "replacement"
+    then
+      return actor --[[@as table<string, unknown>]]
+    end
+  end
+  return nil
+end
+
+-- The wild replacement offer is available only on the first acting entry
+-- of a wild launch whose projected replacement carries an enabled flight
+-- fragment (retail subscript_0231 asks once before any reserve enters;
+-- the failed-escape retry carries no flight and goes straight to party).
+-- Stepping back from a later entry keeps its staged switch without a
+-- second ask.
+---@return table<string, unknown>? run fragment behind the offer with its actor, nil when unavailable
+function BattleScreenState:_useNextOffered()
+  if self._kind ~= "wild" then
+    return nil
+  end
+  if self._actorIndex ~= 1 then
+    return nil
+  end
+  if type(self._staged) == "table" and next(self._staged) ~= nil then
+    return nil
+  end
+  local entry = self:_actorOptions()
+  if type(entry) ~= "table" or entry.kind ~= "replacement" then
+    return nil
+  end
+  if type(entry.choices) ~= "table" then
+    return nil
+  end
+  for _, choice in ipairs(entry.choices) do
+    if
+      type(choice) == "table"
+      and (choice --[[@as table<string, unknown>]]).role == "run"
+      and (choice --[[@as table<string, unknown>]]).enabled == true
+    then
+      return {
+        actor = entry,
+        choice = (choice --[[@as table<string, unknown>]]).choice,
+      }
+    end
+  end
+  return nil
+end
+
+---@return string? staged wild replacement question, nil outside the offer
+function BattleScreenState:_useNextPrompt()
+  if self._mode ~= "use-next" then
+    return nil
+  end
+  if self:_useNextActor() == nil then
+    return nil
+  end
+  return stagedBattleText(self._manifest, "battle/prompt/use-next", {})
+end
+
+---@return table<string, unknown>? staged source option labels behind the wild offer, nil outside the offer
+function BattleScreenState:_useNextTwoOption()
+  if self._mode ~= "use-next" or self:_useNextActor() == nil then
+    return nil
+  end
+  return self:_stagedTwoOption("menu/switch-or-flee", "label/use-next-mon", "label/flee", "use-next prompts require")
+end
+
+-- Stages the source option labels of one menu route through the staged
+-- menu catalog. Each offer answers with the retail words of its own
+-- BattleInput template (switch-or-flee / switch-or-keep), never the
+-- generic Yes/No pair.
+---@param routeKey string staged source menu route owning the option text
+---@param topKey string semantic label entry of the top option
+---@param bottomKey string semantic label entry of the bottom option
+---@param context string owner prefix for assertion messages
+---@return table<string, unknown> staged two-option view
+function BattleScreenState:_stagedTwoOption(routeKey, topKey, bottomKey, context)
+  local menus = assert(self._manifest.menus, context .. " the staged menu catalog") --[[@as table<string, unknown>]]
+  local routes = assert(menus.routes, context .. " staged source routes") --[[@as table<string, unknown>]]
+  local route = assert(routes[routeKey], context .. " the source " .. routeKey .. " route") --[[@as table<string, unknown>]]
+  local selected = {}
+  for _, key in
+    ipairs(route.messageEntries --[[@as table<integer, string>]])
+  do
+    selected[key] = true
+  end
+  assert(selected[topKey] == true and selected[bottomKey] == true, "the selected text set stages both source labels")
+  local messages = assert(self._manifest.messages, context .. " staged message entries") --[[@as table<string, unknown>]]
+  local entries = assert(messages.entries, context .. " semantic message entries") --[[@as table<string, table<string, unknown>>]]
+  local topRecord = assert(entries[topKey], "the top source option has a staged label")
+  local bottomRecord = assert(entries[bottomKey], "the bottom source option has a staged label")
+  return {
+    route = routeKey,
+    top = menuLabelText(topRecord.tokens --[[@as table<integer, table<string, unknown>>]]),
+    bottom = menuLabelText(bottomRecord.tokens --[[@as table<integer, table<string, unknown>>]]),
+  }
+end
+
+-- Answers the wild replacement offer from one semantic edge: Yes opens
+-- the party picker for the fainted entry while No seals flight for every
+-- addressed replacement entry at once (one escape attempt settles the
+-- batch; a failure re-opens switch-only without a second ask).
+---@param choice string yes-or-no answer behind the wild offer
+function BattleScreenState:_activateUseNext(choice)
+  if choice == "yes" then
+    self:_openUseNextParty()
+    return
+  end
+  self:_sealUseNextNo()
+end
+
+-- Opens the party picker for the fainted entry behind a Yes answer,
+-- mirroring the forced replacement child without cancellation on the
+-- first entry.
+function BattleScreenState:_openUseNextParty()
+  local intent = self:_childIntent("party", "replacement", false)
+  if intent == nil then
+    self._mode = "failed"
+    self._error = "the battle screen mirrors its request"
+    self._child = nil
+    return
+  end
+  intent.cancellable = self._actorIndex > 1
+  local ok, failure = self._subflows:open(intent)
+  if not ok then
+    self._mode = "failed"
+    self._error = type(failure) == "string" and failure
+      or "the requested child failed to open for launch " .. self._launchId
+    self._child = nil
+    return
+  end
+  local request = assert(self._request, "forced children answer the open request")
+  self._child = {
+    kind = "party",
+    cancellable = intent.cancellable == true,
+    purpose = "replacement",
+    requestId = request.requestId,
+  }
+  self._selection = nil
+  self._mode = "child"
+end
+
+-- Seals flight for every addressed replacement entry behind a No answer:
+-- each entry answers with its own projected run fragment so one reply
+-- carries the single escape attempt. A missing run fragment fails the
+-- screen instead of inventing a reply.
+function BattleScreenState:_sealUseNextNo()
+  local request = assert(self._request, "wild offers answer the open request")
+  local actors = assert(request.actors, "the open request addresses its actors")
+  local options = assert(self._options, "wild offers mirror the open request")
+  local optionActors = assert(options.actors, "the open options address their actors")
+  if self._child ~= nil then
+    self._subflows:closeChild()
+    self._child = nil
+  end
+  for index, addressed in ipairs(actors) do
+    local entry = optionActors[index]
+    local run = nil
+    if type(entry) == "table" and type(entry.choices) == "table" then
+      for _, choice in ipairs(entry.choices) do
+        if
+          type(choice) == "table"
+          and (choice --[[@as table<string, unknown>]]).role == "run"
+          and (choice --[[@as table<string, unknown>]]).enabled == true
+        then
+          run = (choice --[[@as table<string, unknown>]]).choice
+          break
+        end
+      end
+    end
+    if type(run) ~= "table" then
+      self._mode = "failed"
+      self._error = "the wild offer carries its run fragment for launch " .. self._launchId
+      return
+    end
+    local fragment = copyValue(run --[[@as table<string, unknown>]])
+    local actor = assert(fragment.actor, "staged fragments address their entry")
+    assert(
+      actor.combatant == addressed.combatant and actor.activation == addressed.activation,
+      "staged fragments answer the acting entry"
+    )
+    self._staged[index] = fragment
+  end
+  self._lastStaged = #actors
+  self._notice = nil
+  self:_submitStaged()
+end
+
 -- Moves the prompt to the acting entry: command selection for ordinary
 -- turns, the Shift question for held foe arrivals, or the forced child
 -- for replacement and learning decisions.
@@ -5517,6 +5856,10 @@ function BattleScreenState:_enterActorPrompt()
         purpose = "replacement"
       end
     end
+  end
+  if purpose == "replacement" and self:_useNextOffered() ~= nil then
+    self:_enterUseNextPrompt()
+    return
   end
   local intent = self:_childIntent(kind, purpose, false)
   if intent == nil then
@@ -6260,6 +6603,12 @@ function BattleScreenState:_consume(event)
     return
   end
   if self._buttonFeedback ~= nil or revealCursor then
+    if revealCursor then
+      -- The first keypad edge only reveals the native cursor without
+      -- moving it; the reveal still answers with SELECT like the
+      -- subflow TryActivate edge.
+      self:_playMoveFeedback()
+    end
     return
   end
   -- The bound nickname completion owns its semantic edges ahead of the
@@ -6351,13 +6700,13 @@ function BattleScreenState:_consume(event)
       -- identical fragment as keyboard confirm on every layout.
       -- Keyboard focus still moves through navigate; command and move
       -- presses keep their focus bookkeeping above.
-    elseif self._mode == "shift" then
-      -- A prompt tap arms its Yes/No cell and moves the selection so the
+    elseif self._mode == "shift" or self._mode == "use-next" then
+      -- A prompt tap arms its answer cell and moves the selection so the
       -- matched release settles the identical fragment as keyboard input.
       local control = event.control --[[@as table<string, unknown>?]]
       if
         type(control) == "table"
-        and control.scope == "shift"
+        and control.scope == self._mode
         and (control.id == "confirm" or control.id == "back")
       then
         self._armed = { scope = control.scope, id = control.id, pointerId = event.pointerId }
@@ -6401,6 +6750,15 @@ function BattleScreenState:_consume(event)
           and (control.id == "confirm" or control.id == "back")
         then
           self:_activateShift(control.id == "confirm" and "yes" or "no")
+        end
+      elseif self._mode == "use-next" then
+        local control = event.control --[[@as table<string, unknown>?]]
+        if
+          type(control) == "table"
+          and control.scope == "use-next"
+          and (control.id == "confirm" or control.id == "back")
+        then
+          self:_activateUseNext(control.id == "confirm" and "yes" or "no")
         end
       else
         self:_startButtonFeedback(self._mode, event.control.id --[[@as string]], armed)
@@ -6449,6 +6807,8 @@ function BattleScreenState:_confirm()
     end
   elseif self._mode == "shift" and type(self._selection) == "string" then
     self:_activateShift(self._selection --[[@as string]])
+  elseif self._mode == "use-next" and type(self._selection) == "string" then
+    self:_activateUseNext(self._selection --[[@as string]])
   elseif self._mode == "narration" or self._mode == "intro" then
     self._timeline:ack()
   elseif self._mode == "outcome" then
@@ -6609,6 +6969,11 @@ function BattleScreenState:_cancel()
     -- offer, matching the source replacement subscript.
     self:_playCancelFeedback()
     self:_sealShiftStay()
+  elseif self._mode == "use-next" then
+    -- Cancelling the wild offer answers No (attempt escape), matching
+    -- the retail Yes/No edge where backing out declines the reserve.
+    self:_playCancelFeedback()
+    self:_activateUseNext("no")
   elseif self._mode == "target" then
     self:_activateTarget("cancel")
   elseif self._mode == "moves" then
@@ -6668,7 +7033,16 @@ end
 
 ---@param direction string? navigation direction under selection
 function BattleScreenState:_navigate(direction)
-  if self._mode == "shift" then
+  local before = self._selection
+  self:_stepNavigation(direction)
+  if self._selection ~= before then
+    self:_playMoveFeedback()
+  end
+end
+
+---@param direction string? navigation direction under selection
+function BattleScreenState:_stepNavigation(direction)
+  if self._mode == "shift" or self._mode == "use-next" then
     if
       type(direction) == "string"
       and (direction == "up" or direction == "down" or direction == "left" or direction == "right")
@@ -6702,6 +7076,10 @@ end
 ---@param direction string? source keypad direction under selection
 function BattleScreenState:_navigateCommand(direction)
   if type(direction) ~= "string" then
+    return
+  end
+  if self:_compactLayout() then
+    self:_navigateCompactCommand(direction)
     return
   end
   local x, y = self._commandX, self._commandY
@@ -6741,6 +7119,73 @@ function BattleScreenState:_navigateCommand(direction)
   self._selection = destination
 end
 
+-- Names the ordinary command slot behind one offered command identity
+-- for cursor navigation: the slot the offered identity replaces.
+---@param id string? offered command identity under lookup
+---@return string? ordinary slot behind the identity, nil without one
+function BattleScreenState:_commandSlot(id)
+  if type(id) ~= "string" then
+    return nil
+  end
+  local ids = self:_surfaceIds()
+  for index, offered in ipairs(ids) do
+    if offered == id then
+      return SURFACE_LABEL_KEYS[index]
+    end
+  end
+  return nil
+end
+
+-- Answers whether the resolved plan is the compact single-pane
+-- composition: command navigation follows the drawn two-by-two grid
+-- there instead of the paired three-by-two cursor grid. An unknown or
+-- unpublished plan keeps the paired grid.
+---@return boolean true while the compact pane owns the battle
+function BattleScreenState:_compactLayout()
+  if self._session == nil then
+    return false
+  end
+  local ok, plan = pcall(self._session.plan, self._session)
+  if not ok or type(plan) ~= "table" then
+    return false
+  end
+  local content = plan.content
+  return type(content) == "table" and content.compact == true
+end
+
+-- Steps the main-menu cursor across the compact two-by-two grid:
+-- motion clamps at the grid edges and only settles on offered kind
+-- slots. The paired cursor cell stays synced behind every step so a
+-- layout change keeps the remembered command.
+---@param direction string source keypad direction under selection
+function BattleScreenState:_navigateCompactCommand(direction)
+  local slot = self:_commandSlot(self._selection)
+  local cell = slot ~= nil and COMPACT_SLOT_CELLS[slot] or nil
+  if cell == nil then
+    return
+  end
+  local x, y = cell.x, cell.y
+  if direction == "left" then
+    x = x - 1
+  elseif direction == "right" then
+    x = x + 1
+  elseif direction == "up" then
+    y = y - 1
+  elseif direction == "down" then
+    y = y + 1
+  else
+    return
+  end
+  x = math.max(0, math.min(COMPACT_COMMAND_WIDTH - 1, x))
+  y = math.max(0, math.min(COMPACT_COMMAND_HEIGHT - 1, y))
+  local destination = self:_surfaceCommand(COMPACT_COMMAND_GRID[y + 1][x + 1])
+  if destination == nil then
+    return
+  end
+  self:_syncCommandCursor(destination)
+  self._selection = destination
+end
+
 ---@param direction string? source keypad direction under selection
 function BattleScreenState:_navigateTargets(direction)
   if self._targetCandidates == nil or type(self._selection) ~= "string" then
@@ -6768,6 +7213,10 @@ function BattleScreenState:_navigateTargets(direction)
       self._lastTargetSelection = self._selection
       self._selection = "cancel"
     end
+    return
+  end
+  if self:_compactLayout() then
+    self:_navigateCompactTargets(direction)
     return
   end
   if self._selection == "cancel" then
@@ -6814,6 +7263,58 @@ function BattleScreenState:_navigateTargets(direction)
     end
     x = x + delta.x
     y = y + delta.y
+  end
+end
+
+-- Steps target selection across the compact vertical dock: the admitted
+-- rows walk in projected order with Back beneath, so up and down move
+-- while sideways edges keep the list. A lone upper-row target still
+-- reaches Back, which the paired grid cannot offer it.
+---@param direction string? source keypad direction under selection
+function BattleScreenState:_navigateCompactTargets(direction)
+  if direction ~= "up" and direction ~= "down" then
+    return
+  end
+  if self._selection == "cancel" then
+    if direction == "up" then
+      for _, candidate in ipairs(self._targetCandidates) do
+        local candidateId = type(candidate) == "table" and candidate.controlId or nil
+        if candidateId == self._lastTargetSelection and candidate.enabled == true then
+          self._selection = candidateId
+          return
+        end
+      end
+    end
+    return
+  end
+  local rows = {}
+  for _, candidate in ipairs(self._targetCandidates) do
+    if type(candidate) == "table" and type(candidate.controlId) == "string" and candidate.enabled == true then
+      rows[#rows + 1] = candidate.controlId
+    end
+  end
+  local at = nil
+  for index, id in ipairs(rows) do
+    if id == self._selection then
+      at = index
+      break
+    end
+  end
+  if at == nil then
+    return
+  end
+  if direction == "up" then
+    if at > 1 then
+      self._lastTargetSelection = self._selection
+      self._selection = rows[at - 1]
+    end
+    return
+  end
+  self._lastTargetSelection = self._selection
+  if at < #rows then
+    self._selection = rows[at + 1]
+  else
+    self._selection = "cancel"
   end
 end
 
@@ -7471,6 +7972,9 @@ function BattleScreenState:_updateEncounterPaletteDrawables()
     if type(child) == "table" and child.kind == "learn" and type(child.confirmation) == "table" then
       activeLayout = "two-option"
     end
+  elseif self._mode == "shift" or self._mode == "use-next" then
+    -- The held offers answer through the source two-option planes.
+    activeLayout = "two-option"
   else
     activeLayout = "command"
   end
@@ -7489,7 +7993,13 @@ function BattleScreenState:_updateEncounterPaletteDrawables()
       local key = "menu:" .. activeLayout .. ":screen:" .. tostring(index) .. "@" .. background .. touch
       addDescriptor(key, assert(screen.sourceIndices, "visible lower menu screen carries source indices"))
       local armed = self._armed
-      if type(armed) == "table" and armed.scope == activeLayout then
+      -- The held offers arm their cells under their own input scope while
+      -- the shared source two-option planes own the feedback art.
+      local armedScope = type(armed) == "table"
+          and (armed.scope == "shift" or armed.scope == "use-next")
+          and "two-option"
+        or (type(armed) == "table" and armed.scope or nil)
+      if type(armed) == "table" and armedScope == activeLayout then
         local feedback = type(screen.feedback) == "table" and screen.feedback[armed.id] or nil
         local patch = type(feedback) == "table" and feedback.pressed or nil
         if type(patch) == "table" then
@@ -7628,8 +8138,8 @@ function BattleScreenState:_updateEncounterPaletteDrawables()
         assert(type(selector) == "string", "visible ball throw names its selector")
         local ballKey = selector:match("^ball:([%w_]+)$")
         assert(ballKey ~= nil, "visible ball throw uses a staged ball selector")
-        local frame = assert(type(ball.frame) == "number" and ball.frame, "visible ball throw names its frame")
-        local frameKey = "battle-ball:" .. ballKey .. ":" .. tostring(frame)
+        local frameKey =
+          assert(type(ball.drawableKey) == "string" and ball.drawableKey, "visible ball throw names its staged cell")
         local layout = assert(layer.nativePaletteLayout, "ball throw has its accepted physical palette layout")
         local selected = nil
         for _, candidate in ipairs(layout.balls) do
@@ -7640,7 +8150,7 @@ function BattleScreenState:_updateEncounterPaletteDrawables()
         end
         assert(selected ~= nil, "visible ball throw resolves to an accepted native palette instance")
         local selectedPath =
-          assert(selected.sourceIndexPaths[frameKey], "visible ball frame has a selected slot variant")
+          assert(selected.sourceIndexPaths[frameKey], "visible ball cell has a selected slot variant")
         local key = "battle-palette:ball:" .. tostring(selected.firstSlot) .. ":" .. frameKey
         ball.paletteDrawableKey = key
         addDescriptor(key, { path = selectedPath })
@@ -8141,7 +8651,14 @@ function BattleScreenState:updateFixed(dt)
       -- this cue tick. Stage immediately after that handoff and before
       -- particle stepping so its first source frame sees the palette.
       self:_stageEncounterSource()
-      self._player:stepSourceTick({ tick = 1 })
+      local playerTick = { tick = 1 }
+      if not self._animationRngSeeded then
+        self._animationRngSeeded = true
+        if self._animationRngSeed ~= nil then
+          playerTick.seed = self._animationRngSeed
+        end
+      end
+      self._player:stepSourceTick(playerTick)
       local completion = self._completion
       local child = self._completionChild
       local summaryOpen = false
@@ -8149,7 +8666,7 @@ function BattleScreenState:updateFixed(dt)
         summaryOpen = child:status().phase == "summary"
       end
       if not summaryOpen then
-        self._scene:stepSourceTick()
+        self._scene:stepHostTick()
       end
       if completion ~= nil and completion.kind == "evolution" and child ~= nil then
         self:_stepEvolutionPalette(completion, child)
@@ -8250,6 +8767,22 @@ function BattleScreenState:updateFixed(dt)
     self._bagCursorTick = self._bagCursorTick + sourceTicks
   end
   self._bagCursorIdentity = bagIdentity
+  -- The battle-party wrapper d-pad cursor shimmers while active and
+  -- restarts on every focus move or page turn, like the bag cursor
+  -- (BattleDpadCursor_SetRect reseats the corner animation through
+  -- BattleCursor_SetCorners).
+  local wrapperIdentity = nil
+  if type(bagChild) == "table" and (bagChild.kind == "party" or bagChild.kind == "target") then
+    if bagChild.cursorActive == true and type(bagChild.partyPage) == "string" then
+      wrapperIdentity = tostring(bagChild.partyPage) .. "|" .. tostring(bagChild.focusId)
+    end
+  end
+  if wrapperIdentity == nil or wrapperIdentity ~= self._wrapperCursorIdentity then
+    self._wrapperCursorTick = 0
+  else
+    self._wrapperCursorTick = self._wrapperCursorTick + sourceTicks
+  end
+  self._wrapperCursorIdentity = wrapperIdentity
   self._cursorWasVisible = cursorVisible
   self._cursorSelection = cursorVisible and self._selection or nil
   -- Palette-dependent images materialize once after the fixed tick has

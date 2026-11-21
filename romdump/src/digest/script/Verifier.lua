@@ -14,7 +14,7 @@
 -- 7. Call/return balance is preserved.
 -- 8. Movement sequence termination is preserved.
 -- 9. No command disappears except an explicitly documented erasure.
--- 10. Unsupported instructions prevent a `complete` result.
+-- 10. Reachable unsupported instructions prevent a `complete` result.
 --
 -- the caller signal is cleared before the common script's following command
 -- runs, matching the pinned `ScrCmd_RestartCurrentScript` bit protocol. Pure
@@ -59,6 +59,7 @@ local BLOCKING_OPS = {
   context_choice = true,
   choose_starter = true,
   pokemon_nickname_input = true,
+  rival_naming = true,
   party_select = true,
   menu_exec = true,
   warp = true,
@@ -75,6 +76,7 @@ local BLOCKING_OPS = {
   pokegear_open = true,
   phone_run_call = true,
   prop_animation_wait = true,
+  elevator_anim = true,
   follower_appearance = true,
   follower_recall = true,
   easy_chat_edit = true,
@@ -88,7 +90,9 @@ local YIELD_OPS = {
   yield_tick = true,
   lock_all = true,
   release_all = true,
+  follower_reset_movement = true,
   menu_begin = true,
+  menu_anchor_right = true,
   signpost_direction = true,
   signpost_set = true,
   signpost_command = true,
@@ -157,6 +161,21 @@ local function operandMatches(raw, node)
     end
   end
   return node == raw
+end
+
+-- Compare a ScriptGetVar direction operand with a node field: the script
+-- variable stays the value reference the step names, while a literal code is
+-- the cardinal direction both sides derive from the pinned source table. An
+-- unknown literal code matches nothing.
+---@param raw unknown
+---@param direction unknown
+---@return boolean
+local function directionOperandMatches(raw, direction)
+  if operandMatches(raw, direction) then
+    return true
+  end
+  local ok, cardinal = pcall(Operands.normalizeFacing, raw)
+  return ok and cardinal == direction
 end
 
 -- The per-opcode operand-equivalence checkers (item 6): `(ins, step)` ->
@@ -276,6 +295,44 @@ end
 local function checkClearFlagVar(ins, step)
   if not operandMatches(ins.operands[1].raw, step.flag) then
     return "ClearFlagVar id changed by translation"
+  end
+end
+
+-- The trainer-flag value a covering node carries: the flag write's flag or
+-- the comparison left side of the check, in its folded or fallback form.
+---@param step table<string, unknown>
+---@return table<string, unknown>|nil
+local function trainerFlagValueOf(step)
+  if step.op == "set_flag" or step.op == "clear_flag" then
+    return step.flag --[[@as table<string, unknown>|nil]]
+  end
+  local compared = nil
+  if step.op == "compare" then
+    compared = step.left
+  elseif step.op == "if_cond" or step.op == "call_if" or step.op == "goto_if" or step.op == "if" then
+    compared = step.condition and step.condition.left
+  end
+  if type(compared) == "table" and compared.value == "flag_value" then
+    return compared.flag --[[@as table<string, unknown>]]
+  end
+  return nil
+end
+
+-- Trainer number -> native event flag keeps the source operand: the flag id
+-- stays TRAINER_FLAG_BASE + the live 16-bit trainer number.
+local function checkTrainerFlag(ins, step)
+  local value = trainerFlagValueOf(step)
+  if type(value) ~= "table" or value.value ~= "trainer_flag_id" then
+    return "trainer flag command lost its trainer flag value"
+  end
+  if not operandMatches(ins.operands[1].raw, value.trainer) then
+    return "trainer number changed by translation"
+  end
+end
+
+local function checkNameRival(ins, step)
+  if step.op ~= "rival_naming" or not operandMatches(ins.operands[1].raw, step.result) then
+    return "NameRival result variable changed by translation"
   end
 end
 
@@ -674,8 +731,8 @@ local function checkSetPhoneCall(ins, step)
   end
   if
     not operandMatches(ins.operands[1].raw, step.contact)
-    or not operandMatches(ins.operands[2].raw, step.direction)
-    or not operandMatches(ins.operands[3].raw, step.kind)
+    or not operandMatches(ins.operands[2].raw, step.scriptedCall)
+    or not operandMatches(ins.operands[3].raw, step.callScriptID)
   then
     return "opcode 430 call setup operands changed by translation"
   end
@@ -800,6 +857,222 @@ local function checkBuenasPassword(ins, step)
   return nil
 end
 
+-- ScrCmd_Multichoice* (64/65/66/841) carries its window geometry, cursor,
+-- cancellability and result halfword at initialization, the immediate message
+-- id and result byte per item, and the anchor selector. The foreground family
+-- has no list-family help-metadata operand.
+local function checkMultichoice(ins, step)
+  if ins.opcode == 66 then
+    if step.op ~= "menu_add" then
+      return "multichoice item changed by translation"
+    end
+    if not operandMatches(ins.operands[1].raw, step.messageId) then
+      return "multichoice message id changed by translation"
+    end
+    if not operandMatches(ins.operands[2].raw, step.value) then
+      return "multichoice item value changed by translation"
+    end
+    if step.vanillaMetadata ~= nil then
+      return "foreground multichoice item acquired list help metadata"
+    end
+    return nil
+  end
+  if ins.opcode == 841 then
+    if step.op ~= "menu_anchor_right" or step.enabled ~= (Operands.operandValue(ins.operands[1]) ~= 0) then
+      return "multichoice anchor changed by translation"
+    end
+    return nil
+  end
+  if step.op ~= "menu_begin" or step.kind ~= "multichoice" then
+    return "multichoice initialization changed by translation"
+  end
+  if not operandMatches(ins.operands[1].raw, step.tileX) then
+    return "multichoice window column changed by translation"
+  end
+  if not operandMatches(ins.operands[2].raw, step.tileY) then
+    return "multichoice window row changed by translation"
+  end
+  if not operandMatches(ins.operands[3].raw, step.initialCursor) then
+    return "multichoice initial cursor changed by translation"
+  end
+  if step.cancellable ~= (Operands.operandValue(ins.operands[4]) ~= 0) then
+    return "multichoice cancellability changed by translation"
+  end
+  if not operandMatches(ins.operands[5].raw, step.result) then
+    return "multichoice result variable changed by translation"
+  end
+  return nil
+end
+
+-- Source money commands (scrcmd_money.c): the immediate forms carry a u32
+-- amount, the value forms carry a ScriptGetVar amount, and each check reads
+-- its result pointer before the amount. The money box commands carry the two
+-- source tile coordinates only on show.
+local function checkMoney(ins, step)
+  local opcode = ins.opcode
+  if opcode == 110 or opcode == 111 or opcode == 360 then
+    local action = opcode == 110 and "add" or "subtract"
+    if step.op ~= "money_change" or step.action ~= action then
+      return "source money change lost its action"
+    end
+    if not operandMatches(ins.operands[1].raw, step.amount) then
+      return "source money amount changed by translation"
+    end
+  elseif opcode == 112 or opcode == 368 then
+    if step.op ~= "money_check" then
+      return "source money check changed by translation"
+    end
+    if not operandMatches(ins.operands[1].raw, step.result) then
+      return "money check result variable changed by translation"
+    end
+    if not operandMatches(ins.operands[2].raw, step.amount) then
+      return "money check amount changed by translation"
+    end
+  elseif opcode == 113 then
+    if step.op ~= "money_box" or step.action ~= "show" then
+      return "money box show changed by translation"
+    end
+    if not operandMatches(ins.operands[1].raw, step.tileX) then
+      return "money box column changed by translation"
+    end
+    if not operandMatches(ins.operands[2].raw, step.tileY) then
+      return "money box row changed by translation"
+    end
+  elseif opcode == 114 then
+    if step.op ~= "money_box" or step.action ~= "hide" then
+      return "money box hide changed by translation"
+    end
+  elseif opcode == 115 then
+    if step.op ~= "money_box" or step.action ~= "update" then
+      return "money box update changed by translation"
+    end
+  end
+  return nil
+end
+
+-- Source field primitives (scrcmd_c.c, map_events.c, field/script_menu.c and
+-- field/map_prop_anims.c): the object commands carry a ScriptGetVar object id
+-- plus either an immediate movement selector or a ScriptGetVar direction, the
+-- travel commands carry their ScriptGetVar operands, the floor window
+-- separates its two immediate tile bytes from its result pointer and floor
+-- variable, and the elevator task reads both operands through ScriptGetVar.
+-- Each checker re-derives the operand kind from the raw instruction so a
+-- changed actor, a dropped warp coordinate, or a swapped result pointer fails
+-- instead of passing through the generic coverage rule.
+local function actorReferenceMatches(raw, actor)
+  if type(actor) ~= "table" or actor.ref ~= "actor" then
+    return false
+  end
+  local expected = Operands.actorRef(raw)
+  if expected.special ~= nil then
+    return actor.special == expected.special
+  end
+  if expected.id ~= nil then
+    return actor.special == nil and actor.id == expected.id
+  end
+  local index = actor.mapIndex
+  local expectedIndex = expected.mapIndex
+  if type(expectedIndex) == "table" then
+    return type(index) == "table" and index.id == expectedIndex.id and index.value == expectedIndex.value
+  end
+  return index == expectedIndex
+end
+
+local function sourceVariableOperandsMatch(ins, step, fields)
+  for position, field in ipairs(fields) do
+    if not operandMatches(ins.operands[position].raw, step[field]) then
+      return false
+    end
+  end
+  return true
+end
+
+local function checkFieldPrimitive(ins, step)
+  local opcode = ins.opcode
+  if opcode == 109 then
+    if step.op ~= "set_object_movement_type" or step.changeMovement ~= true then
+      return "opcode 109 movement change lost its source operation"
+    end
+    if not actorReferenceMatches(ins.operands[1].raw, step.actor) then
+      return "opcode 109 object changed by translation"
+    end
+    if step.movementType ~= Operands.movementType(ins) then
+      return "opcode 109 movement selector changed by translation"
+    end
+    return nil
+  end
+  if opcode == 240 then
+    if step.op ~= "set_dynamic_warp" then
+      return "opcode 240 dynamic warp changed by translation"
+    end
+    if not sourceVariableOperandsMatch(ins, step, { "map", "warpId", "fieldX", "fieldZ" }) then
+      return "opcode 240 dynamic warp operands changed by translation"
+    end
+    if not directionOperandMatches(ins.operands[5].raw, step.direction) then
+      return "opcode 240 dynamic warp direction changed by translation"
+    end
+    return nil
+  end
+  if opcode == 241 then
+    if step.op ~= "get_dynamic_warp_floor" or not operandMatches(ins.operands[1].raw, step.result) then
+      return "opcode 241 dynamic warp floor result changed by translation"
+    end
+    return nil
+  end
+  if opcode == 242 then
+    if step.op ~= "floor_window_show" then
+      return "opcode 242 floor window changed by translation"
+    end
+    if step.tileX ~= ins.operands[1].raw or step.tileY ~= ins.operands[2].raw then
+      return "opcode 242 floor window tile changed by translation"
+    end
+    if not operandMatches(ins.operands[3].raw, step.result) then
+      return "opcode 242 floor window result changed by translation"
+    end
+    if not operandMatches(ins.operands[4].raw, step.floor) then
+      return "opcode 242 floor window floor changed by translation"
+    end
+    return nil
+  end
+  if opcode == 342 then
+    if step.op ~= "move_warp_event" then
+      return "opcode 342 warp event move changed by translation"
+    end
+    if not sourceVariableOperandsMatch(ins, step, { "warpId", "fieldX", "fieldZ" }) then
+      return "opcode 342 warp event operands changed by translation"
+    end
+    return nil
+  end
+  if opcode == 344 then
+    if step.op ~= "set_object_facing" then
+      return "opcode 344 facing refresh changed by translation"
+    end
+    if not actorReferenceMatches(ins.operands[1].raw, step.actor) then
+      return "opcode 344 object changed by translation"
+    end
+    if not directionOperandMatches(ins.operands[2].raw, step.direction) then
+      return "opcode 344 facing direction changed by translation"
+    end
+    return nil
+  end
+  if opcode == 488 then
+    if step.op ~= "elevator_anim" then
+      return "opcode 488 elevator animation changed by translation"
+    end
+    if not sourceVariableOperandsMatch(ins, step, { "direction", "length" }) then
+      return "opcode 488 elevator animation operands changed by translation"
+    end
+    return nil
+  end
+  if opcode == 522 then
+    if step.op ~= "field_clock_hour" or not operandMatches(ins.operands[1].raw, step.result) then
+      return "opcode 522 clock result changed by translation"
+    end
+    return nil
+  end
+  return nil
+end
+
 local CHECKERS = {
   [3] = checkWaitFrames,
   [22] = checkGotoTarget,
@@ -808,6 +1081,10 @@ local CHECKERS = {
   [31] = checkClearFlag,
   [33] = checkSetFlagVar,
   [34] = checkClearFlagVar,
+  [36] = checkTrainerFlag,
+  [37] = checkTrainerFlag,
+  [38] = checkTrainerFlag,
+  [143] = checkNameRival,
   [39] = checkAddVar,
   [40] = checkSubVar,
   [41] = checkSetVar,
@@ -825,6 +1102,10 @@ local CHECKERS = {
   [57] = checkSetSignpostAction,
   [59] = checkTrainerTips,
   [60] = checkWaitSignpost,
+  [64] = checkMultichoice,
+  [65] = checkMultichoice,
+  [66] = checkMultichoice,
+  [841] = checkMultichoice,
   [275] = checkMartLaunch,
   [276] = checkMartLaunch,
   [277] = checkMartLaunch,
@@ -860,6 +1141,22 @@ local CHECKERS = {
   [812] = checkMomGiftTake,
   [813] = checkMomGift,
   [821] = checkBuenasPassword,
+  [110] = checkMoney,
+  [111] = checkMoney,
+  [112] = checkMoney,
+  [113] = checkMoney,
+  [114] = checkMoney,
+  [115] = checkMoney,
+  [360] = checkMoney,
+  [368] = checkMoney,
+  [109] = checkFieldPrimitive,
+  [240] = checkFieldPrimitive,
+  [241] = checkFieldPrimitive,
+  [242] = checkFieldPrimitive,
+  [342] = checkFieldPrimitive,
+  [344] = checkFieldPrimitive,
+  [488] = checkFieldPrimitive,
+  [522] = checkFieldPrimitive,
   [256] = checkFashionTitleWord,
   [260] = checkUnionOwnChatMessage,
   [264] = checkUnionPartnerLanguage,
@@ -956,7 +1253,12 @@ local function verifyCoverage(context)
     local node = context.byOffset[ins.offset]
     if node ~= nil then
       context.covered = context.covered + 1
-      if node.op == "unsupported" then
+      -- Only a reachable unsupported command is support debt: an
+      -- unsupported instruction in a region this script's own entry never
+      -- reaches (a shared tail that another script calls) is translated but
+      -- not counted here, so the report's reachable accounting stays
+      -- self-consistent and `complete` states what the entry path covers.
+      if node.op == "unsupported" and isReachable then
         context.reachableUnsupported = context.reachableUnsupported + 1
         context.unsupportedNodes[#context.unsupportedNodes + 1] = node
       end

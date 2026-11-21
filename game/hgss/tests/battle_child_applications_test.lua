@@ -8,10 +8,24 @@
 local Assert = require("tests.support.Assert")
 local CatalogFixture = require("libs.mons.tests.catalog_fixture")
 local ItemFixture = require("libs.items.tests.item_fixture")
+local PartyPresentationFixture = require("tests.support.PartyPresentationFixture")
 
 local BattleChildApplications = require("game.hgss.src.battle.BattleChildApplications")
 
 local T = {}
+
+-- Native party menus behind composed children: production always lends
+-- the staged party manifest, so composition resolves through the same
+-- generated geometry instead of an invented fallback.
+local function nativePartyServices(extra)
+  local services = { battleMenus = { party = { manifest = PartyPresentationFixture.manifest() } } }
+  if type(extra) == "table" then
+    for key, value in pairs(extra) do
+      services[key] = value
+    end
+  end
+  return services
+end
 
 ---@return table<integer, table<string, unknown>> detached own-party snapshot
 local function twoEeveeRoster()
@@ -242,6 +256,10 @@ function T.bag_child_stages_value_only_intents_over_detached_stock()
   child:stepSourceTick(1)
   child:stepSourceTick(1)
   Assert.equal(child:draw().bagPage, "item_list", "selecting a pocket opens its item list")
+  -- The first key after touch only activates the d-pad cursor
+  -- (BattleDpadCursor_TryActivate); the second selects the cell.
+  child:input({ { type = "confirm" } })
+  child:stepSourceTick(1)
   child:input({ { type = "confirm" } })
   child:stepSourceTick(1)
   child:stepSourceTick(1)
@@ -270,6 +288,8 @@ function T.empty_stock_composes_a_resting_browser_without_sealing()
   assert(child ~= nil, "the empty bag child composes")
   Assert.equal(child:application(), "bag", "the resting browser carries its native receipt")
   Assert.equal(child:draw().bagPage, "pocket_menu", "the empty bag opens on its pocket menu")
+  child:input({ { type = "confirm" } })
+  child:stepSourceTick(1)
   child:input({ { type = "confirm" } })
   child:stepSourceTick(1)
   child:stepSourceTick(1)
@@ -457,12 +477,12 @@ function T.party_child_translates_native_selections_into_kernel_fragments()
     inventory = {},
   }
   local rosterCopy = copyRoster(twoEeveeRoster())
-  local child, openErr = BattleChildApplications.open(intent, {})
+  local child, openErr = BattleChildApplications.open(intent, nativePartyServices({}))
   Assert.notNil(child, "the voluntary party composes: " .. tostring(openErr))
   assert(child ~= nil, "the party child composes")
   Assert.equal(child:application(), "party", "the party child carries its native receipt")
   Assert.isNil(child:takeResult(), "opening consumes the initiating edge: nothing is staged")
-  child:input({ { type = "navigate", direction = "down" } })
+  child:input({ { type = "navigate", direction = "right" } })
   child:input({ { type = "confirm" } })
   Assert.equal(child:draw().state, "context", "the selected mon opens the native party action menu")
   child:input({ { type = "confirm" } })
@@ -497,7 +517,7 @@ function T.party_child_refuses_stale_slots_without_inventing_replies()
     party = twoEeveeRoster(),
     inventory = {},
   }
-  local child, openErr = BattleChildApplications.open(intent, {})
+  local child, openErr = BattleChildApplications.open(intent, nativePartyServices({}))
   Assert.notNil(child, "the voluntary party composes: " .. tostring(openErr))
   assert(child ~= nil, "the party child composes")
   Assert.isNil(child:translateSelection(5), "an empty slot translates to nothing")
@@ -617,7 +637,11 @@ function T.native_bag_focus_and_target_continuation()
       },
     }
   end
-  local flows = BattleSubflows.new({ launchId = "launch-native-bag", itemCatalog = catalog })
+  local flows = BattleSubflows.new({
+    launchId = "launch-native-bag",
+    itemCatalog = catalog,
+    battleMenus = { party = { manifest = PartyPresentationFixture.manifest() } },
+  })
   Assert.isTrue(flows:open(healingIntent({ POTION = 5 }, healingActors())), "the stocked bag opens")
   local function step(events)
     flows:update(events)
@@ -635,20 +659,24 @@ function T.native_bag_focus_and_target_continuation()
   flows:tick()
   Assert.equal(flows:status().childView.currentPocket, "hp_pp", "taps reach the serving pocket")
   Assert.equal(focusId(), "bag:0", "the serving cell owns the opening focus")
+  -- The touch entry left the cursor inactive; the first key only
+  -- activates it without moving.
+  step({ { type = "navigate", direction = "down" } })
+  Assert.equal(focusId(), "bag:0", "the first key only activates the cursor")
   -- A bare input moves no focus: edges wait for the accepted tick.
   flows:update({ { type = "navigate", direction = "down" } })
   Assert.equal(focusId(), "bag:0", "the navigation edge waits for the accepted source tick")
   flows:tick()
   Assert.equal(focusId(), "bag:2", "the cursor roams onto the empty cell")
   -- The d-pad cursor roams freely, even onto empty cells: only a stocked
-  -- cell stages. Touch never moves the dpad cursor
-  -- (battle_bag_menu.c cursor boxes versus CheckTouchHitbox).
+  -- cell stages. Touch deactivates with ResetPosition, so an empty tap
+  -- reseats the hidden cursor at 0 instead of keeping the roamed box.
   Assert.isTrue(flows:activateControl("bag:1"), "the empty cell tap belongs to the open child")
   flows:tick()
-  Assert.equal(focusId(), "bag:2", "the empty tap moves no cursor and stages nothing")
+  Assert.equal(focusId(), "bag:0", "the empty tap resets the hidden cursor and stages nothing")
   Assert.isNil(flows:takeResult(), "the empty tap stages nothing")
   step({ { type = "navigate", direction = "up" } })
-  Assert.equal(focusId(), "bag:0", "keys return the cursor to the serving cell")
+  Assert.equal(focusId(), "bag:0", "keys keep the reset cursor on the serving cell")
   -- Selecting a cell opens the use-item page. The battle barrier must
   -- wait for USE before opening a target.
   step({ { type = "confirm" } })
@@ -715,6 +743,8 @@ function T.native_bag_focus_and_target_continuation()
   Assert.equal(thrown:status().childView.currentPocket, "balls", "taps reach the ball pocket")
   thrown:update({ { type = "confirm" } })
   thrown:tick()
+  thrown:update({ { type = "confirm" } })
+  thrown:tick()
   thrown:tick()
   thrown:tick()
   thrown:update({ { type = "confirm" } })
@@ -769,6 +799,9 @@ function T.battle_bag_retail_navigation_edges()
   Assert.equal(focusId(), "bag:0", "the pocket opens on its first cell")
   -- A disabled last-used touch is ignored without moving focus
   -- (HandlePocketMenuInput breaks when lastUsedItem is none).
+  -- The touch entry left the cursor inactive, so the first B only
+  -- activates it.
+  step({ { type = "cancel" } })
   step({ { type = "cancel" } })
   flows:tick()
   flows:tick()
@@ -782,10 +815,12 @@ function T.battle_bag_retail_navigation_edges()
   flows:tick()
   step({ { type = "navigate", direction = "down" } })
   step({ { type = "navigate", direction = "down" } })
+  step({ { type = "navigate", direction = "down" } })
   Assert.equal(focusId(), "bag:4", "setup: keys walk to the bottom row")
   -- Turning the page resets the saved cell (ChangeItemPage clears
-  -- pocketPositions) while the cursor keeps its box: re-entering the
-  -- pocket lands on the first cell.
+  -- pocketPositions); touch also deactivates with ResetPosition, so the
+  -- tap stepper reseats the cursor at 0 while d-pad edge turns keep
+  -- their box. Re-entering the pocket lands on the first cell either way.
   Assert.isTrue(flows:activateControl("page_next"), "the next-page stepper takes its tap")
   flows:tick()
   flows:tick()
@@ -794,7 +829,7 @@ function T.battle_bag_retail_navigation_edges()
   Assert.notNil(turned, "the turned page projects its view")
   Assert.equal(turned.bagPage, "item_list", "the page turn stays on the list")
   Assert.equal(turned.page.current, 2, "the stepper advances the page")
-  Assert.equal(focusId(), "bag:4", "the cursor keeps its box across the turn")
+  Assert.equal(focusId(), "bag:0", "touch deactivates the cursor back to the first cell")
   Assert.isTrue(flows:activateControl("back"), "the list Back takes its tap")
   flows:tick()
   flows:tick()
@@ -824,6 +859,8 @@ function T.battle_bag_retail_navigation_edges()
   short:tick()
   short:tick()
   short:tick()
+  shortStep({ { type = "navigate", direction = "down" } })
+  Assert.equal(shortFocus(), "bag:0", "the first key only activates the cursor")
   shortStep({ { type = "navigate", direction = "down" } })
   Assert.equal(shortFocus(), "bag:2", "setup: keys walk to the middle row")
   shortStep({ { type = "navigate", direction = "down" } })
@@ -897,6 +934,8 @@ function T.battle_bag_restores_and_reports_its_cursor()
   thrown:tick()
   thrown:update({ { type = "confirm" } })
   thrown:tick()
+  thrown:update({ { type = "confirm" } })
+  thrown:tick()
   thrown:tick()
   thrown:tick()
   thrown:update({ { type = "confirm" } })
@@ -936,7 +975,7 @@ function T.battle_bag_lists_in_carried_slot_order()
 end
 function T.target_picker_disposes_alone_behind_the_retained_browser()
   local catalog = ItemFixture.makeCatalog()
-  local child, openErr = BattleChildApplications.open(bagIntent({ POTION = 5 }), { itemCatalog = catalog })
+  local child, openErr = BattleChildApplications.open(bagIntent({ POTION = 5 }), nativePartyServices({ itemCatalog = catalog }))
   Assert.notNil(child, "the stocked bag composes: " .. tostring(openErr))
   assert(child ~= nil, "the bag child composes")
   child:openTarget("POTION")

@@ -221,10 +221,11 @@ end
 ---@param route table<string, unknown> source-normalized route
 ---@param resources table<string, unknown> prepared immutable source assets
 ---@param context table<string, unknown>? captured semantic launch context
----@param _ table<string, unknown>? unused source callback services
+---@param services table<string, unknown>? unused source callback services
 ---@return table<string, unknown>
-function Overlay115Effect.new(route, resources, context, _)
+function Overlay115Effect.new(route, resources, context, services)
   assert(type(route) == "table" and type(resources) == "table", "overlay 115 requires its selected route and resources")
+  assert(services == nil or type(services) == "table", "overlay 115 borrows its presentation services record")
   local task = assert(route.task, "overlay 115 route carries its source intro task")
   local groups = assert(route.assetGroups, "overlay 115 route carries normalized asset groups")
   local state = {
@@ -270,7 +271,7 @@ function Overlay115Effect.new(route, resources, context, _)
     for name, count in pairs(ELITE_EMITTER_COUNT) do
       local set = loaded(particles[name], resources)
       assert(
-        type(set.seed) == "number" and type(set.textures) == "table" and type(set.emitters) == "table",
+        type(set.textures) == "table" and type(set.emitters) == "table",
         "elite particle groups are staged emitter sets"
       )
       assert(#set.emitters >= count, "elite particle set declares every emitter the intro creates")
@@ -281,6 +282,9 @@ function Overlay115Effect.new(route, resources, context, _)
     error("overlay 115 received an unknown normalized intro task", 2)
   end
   local effect = setmetatable(state, Overlay115Effect)
+  if type(services) == "table" and type(services.splRandomState) == "table" then
+    effect._splRandomState = services.splRandomState
+  end
   if state.kind == "gym-rival" then
     effect:_createGymSprites()
   else
@@ -327,9 +331,19 @@ function Overlay115Effect:prepareGraphics(graphics)
         for _, texture in ipairs(loaded(key, self.resources).textures) do
           local imageData = love.image.newImageData(texture.width, texture.height, "rgba8", texture.pixels)
           local image = assert(graphics.newImage(imageData), "graphics driver uploads an overlay 115 particle texture")
-          -- The retail 3D engine samples nearest and repeats emitter textures.
+          -- The retail 3D engine samples nearest with the header wrap per
+          -- axis: mirrored-repeat quarter tiles mirror to the full viewport.
           image:setFilter("nearest", "nearest")
-          image:setWrap("repeat", "repeat")
+          local sampler = texture.sampler --[[@as table<string, unknown>?]]
+          local wrapX, wrapY = "repeat", "repeat"
+          if
+            type(sampler) == "table"
+            and (sampler.wrapX == "clamp" or sampler.wrapX == "repeat" or sampler.wrapX == "mirroredrepeat")
+            and (sampler.wrapY == "clamp" or sampler.wrapY == "repeat" or sampler.wrapY == "mirroredrepeat")
+          then
+            wrapX, wrapY = sampler.wrapX, sampler.wrapY
+          end
+          image:setWrap(wrapX, wrapY)
           images[texture.id] = image
           handles[#handles + 1] = image
         end
@@ -760,7 +774,11 @@ function Overlay115Effect:_loadParticles(name)
   particles.resource = name
   particles.set = set
   -- Emitters keep their resource position (EncounterEffect_CreateEmitters).
-  particles.simulation = SplParticleSimulation.new(set.seed, 0)
+  -- EncounterEffect_LoadParticles: a fresh particle system borrowing the
+  -- boot stream when threaded, or the staged seed while older callers
+  -- still stage it.
+  particles.simulation =
+    SplParticleSimulation.new(assert(self._splRandomState, "overlay borrows its boot stream record"), 0, set.emitters)
   particles.resourceLoads = particles.resourceLoads + 1
   self.particleResource = name
 end
@@ -770,8 +788,11 @@ function Overlay115Effect:_createParticleEmitters(count)
   local particles = self._particles
   assert(particles.simulation ~= nil, "native emitter creation follows particle loading")
   for index = 1, count do
-    local record = assert(particles.set.emitters[index], "particle set declares every created emitter")
-    SplParticleSimulation.addEmitter(particles.simulation, record.id, nil, record)
+    assert(particles.set.emitters[index], "particle set declares every created emitter")
+    assert(
+      SplParticleSimulation.addEmitter(particles.simulation, index - 1, nil) ~= nil,
+      "transition particles create their emitters while manager nodes are free"
+    )
   end
 end
 

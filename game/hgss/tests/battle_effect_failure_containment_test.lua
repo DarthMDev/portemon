@@ -174,6 +174,7 @@ function T.mid_run_resource_and_voice_failures_fail_loudly_and_stay_live()
     audio = audio,
     resources = resources,
     tasks = Factory,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(playbackPacket(), program))
   local failure = nil
@@ -368,6 +369,7 @@ local function openFailingScreen(launchId, staging, audioOverride)
     end
   end
   local screen = BattleScreenState.new({
+    splRandomState = { state = 0 },
     launchId = launchId,
     manifest = manifest,
     model = Model,
@@ -413,6 +415,27 @@ local function presentFailingStrike(screen, launchId)
         effectKey = "TACKLE",
         payload = { target = 3, damage = 14, hitIndex = 1 },
         after = { hp = { [1] = 52, [3] = 43 } },
+        -- The strike carries its producer execution moment so the
+        -- selector admits the selected effect instead of omitting an
+        -- unfactored hit; the staged failure then fails the screen.
+        presentation = {
+          context = {},
+          execution = {
+            selectedMove = "TACKLE",
+            executedMove = "TACKLE",
+            moment = "use",
+            branch = "default",
+            attacker = { combatant = 1, activation = 1 },
+            defender = { combatant = 3, activation = 3 },
+            targets = { { combatant = 3, activation = 3 } },
+            damage = -14,
+            power = 0,
+            friendship = 0,
+            hitOrdinal = 1,
+            hitCount = 1,
+            hitCycle = 1,
+          },
+        },
       },
     },
     before = failingView(57),
@@ -666,6 +689,28 @@ local function presentStrikeCarryingMove(screen, launchId, move)
         effectKey = "MAGNITUDE",
         payload = { target = 3, damage = 14, hitIndex = 1 },
         after = { hp = { [1] = 52, [3] = 43 } },
+        -- The cue carries its producer execution moment with the
+        -- playback move fact resolved into power: missing, fractional,
+        -- and out-of-range values refuse admission, a matching value
+        -- admits.
+        presentation = {
+          context = {},
+          execution = {
+            selectedMove = "MAGNITUDE",
+            executedMove = "MAGNITUDE",
+            moment = "use",
+            branch = "default",
+            attacker = { combatant = 1, activation = 1 },
+            defender = { combatant = 3, activation = 3 },
+            targets = { { combatant = 3, activation = 3 } },
+            damage = -14,
+            power = move.power,
+            friendship = 0,
+            hitOrdinal = 1,
+            hitCount = 1,
+            hitCycle = 1,
+          },
+        },
       },
     },
     before = failingView(57),
@@ -787,6 +832,7 @@ function T.faulted_occurrences_keep_provenance_until_the_owner_releases_them()
     audio = audio,
     resources = resources,
     tasks = tasks,
+    services = { onNativeFrame = function() end },
   }))
   local retired = {}
   local admitted = nil
@@ -846,6 +892,26 @@ function T.faulted_occurrences_keep_provenance_until_the_owner_releases_them()
         payload = { target = 3, damage = 14, hitIndex = 1 },
         after = { hp = { [1] = 52, [3] = 43 } },
         visualSeed = 4,
+        -- The faulted strike carries its producer execution moment
+        -- so the selector admits the selected effect.
+        presentation = {
+          context = {},
+          execution = {
+            selectedMove = "TACKLE",
+            executedMove = "TACKLE",
+            moment = "use",
+            branch = "default",
+            attacker = { combatant = 1, activation = 1 },
+            defender = { combatant = 3, activation = 3 },
+            targets = { { combatant = 3, activation = 3 } },
+            damage = -14,
+            power = 0,
+            friendship = 0,
+            hitOrdinal = 1,
+            hitCount = 1,
+            hitCycle = 1,
+          },
+        },
       },
     },
   }, failingView(43), { launchId = "failure-containment-probe", packetId = 2 })
@@ -995,7 +1061,9 @@ function T.unanswerable_voice_query_fails_the_live_screen_with_provenance()
     return true
   end
   local screen = openFailingScreen(launchId, staging, portless)
-  local program = lowered("TACKLE", { 29, 50, 4 })
+  -- The play stages a real source-timed voice; the wait then parks on
+  -- it until the missing query port fails the occurrence.
+  local program = lowered("TACKLE", { 5, 1918, 29, 50, 4 })
   local record = EffectStagingFixture.effectRecord("TACKLE", {})
   record.program = {
     entry = program.entry,
@@ -1106,6 +1174,7 @@ function T.worker_ready_effect_demands_without_preloading_its_payload()
     end,
   }
   local envelope = FieldBattlePresentation.new({
+    splRandomState = { state = 0 },
     cacheFs = cacheFs,
     windows = {},
     text = {},
@@ -1118,10 +1187,7 @@ function T.worker_ready_effect_demands_without_preloading_its_payload()
   local ready, failure = envelope._services.requestEffect("probe-effect")
   Assert.isTrue(ready, "a worker-ready effect is demandable without preloading its payload: " .. tostring(failure))
   for _, touch in ipairs(touched) do
-    Assert.isNil(
-      touch:find("probe-tex", 1, true),
-      "effect entrance never probes the requested payload: " .. touch
-    )
+    Assert.isNil(touch:find("probe-tex", 1, true), "effect entrance never probes the requested payload: " .. touch)
   end
   local loaded, loadFailure = envelope._services.loadEffect("probe-effect")
   Assert.isNil(loadFailure, "the staged effect record loads on execution")

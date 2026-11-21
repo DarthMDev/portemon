@@ -76,6 +76,7 @@ local function startNew(program, parts)
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = player:start(packet(), program)
   return player, handle, helpers
@@ -92,6 +93,7 @@ function T.admission_refuses_malformed_programs_without_raising()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   Assert.isNil(player:start(packet(), nil), "no program never admits")
   Assert.isNil(player:start(nil, programOf({ { op = "reset-blend-alpha" } })), "no playback never admits")
@@ -117,13 +119,58 @@ function T.admission_refuses_malformed_programs_without_raising()
     player:start(packet(), programOf({ { op = "branch-on-parameter", values = { 1, 2 }, branchTarget = 99 } })),
     "destinations past the stream end never admit"
   )
-  Assert.isNil(
-    player:start(
-      packet(),
-      programOf({ { op = "reserve-loop-slot", values = { 0 }, branchTarget = 1, resumeTarget = 1 } })
-    ),
-    "empty loops never admit"
+  local wrapped, wrapReason = player:start(
+    packet(),
+    programOf({ { op = "reserve-loop-slot", values = { 0 }, branchTarget = 1, resumeTarget = 1 } })
   )
+  Assert.notNil(wrapped, "empty loops admit and wrap their unsigned counter: " .. tostring(wrapReason))
+end
+
+function T.opening_origin_playback_admits_without_a_packet_identity()
+  local helpers = collaborators()
+  local player = assert(BattleAnimationPlayer.new({
+    scene = {},
+    audio = helpers.audio,
+    resources = helpers.resources,
+    tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
+  }))
+  -- Opening calls happen before the first delivery, so they carry no
+  -- per-launch packet identity: the packet number stays an optional
+  -- diagnostic and must never be fabricated for opening feedback.
+  local opening = {
+    launchId = "owner-probe",
+    identity = {
+      launchId = "owner-probe",
+      origin = "opening",
+      combatant = 1,
+      activation = 1,
+      entryStage = "before-cry",
+      ordinal = 1,
+    },
+  }
+  local program = programOf({ { op = "reset-blend-alpha" } })
+  local handle, refusal = player:start(opening, program)
+  Assert.notNil(handle, "opening playback admits with no packet identity: " .. tostring(refusal))
+  for _, bad in ipairs({ 0, -1, 1.5, "1", true }) do
+    local refused, cause = player:start({ launchId = "owner-probe", packetId = bad }, program)
+    Assert.isNil(refused, "a present packet identity stays a positive integer")
+    Assert.isTrue(type(cause) == "string" and cause ~= "", "a present malformed packet names its cause")
+  end
+end
+
+function T.fresh_occurrences_default_all_systems_to_perspective_projection()
+  local player, handle = startNew(programOf({ { op = "reset-blend-alpha" } }))
+  Assert.notNil(handle, "the probe occurrence admits")
+  local occurrence = player._occurrences[#player._occurrences]
+  Assert.notNil(occurrence, "the admitted occurrence is retained")
+  for slot = 0, 15 do
+    Assert.equal(
+      occurrence.particles.perspective[slot],
+      1,
+      "logical system " .. slot .. " requests perspective projection until explicitly set"
+    )
+  end
 end
 
 function T.tick_waits_count_exact_source_ticks()
@@ -134,13 +181,17 @@ function T.tick_waits_count_exact_source_ticks()
   }))
   Assert.equal(player:status(handle), "preparing", "admitted occurrences open preparing")
   player:stepSourceTick({ tick = 1 })
-  Assert.equal(#helpers.log.played, 0, "the countdown holds its first tick")
+  Assert.equal(#helpers.log.played, 0, "the native delay holds its first tick")
   player:stepSourceTick({ tick = 2 })
-  Assert.equal(#helpers.log.played, 0, "the countdown holds its second tick")
+  Assert.equal(#helpers.log.played, 0, "the native delay holds its second tick")
   player:stepSourceTick({ tick = 3 })
-  Assert.equal(#helpers.log.played, 1, "the drained countdown releases in its own tick")
-  helpers.audio.done["counted-cue"] = true
+  Assert.equal(#helpers.log.played, 0, "the native delay holds its third tick")
   player:stepSourceTick({ tick = 4 })
+  Assert.equal(#helpers.log.played, 0, "the native delay holds its fourth tick")
+  player:stepSourceTick({ tick = 5 })
+  Assert.equal(#helpers.log.played, 1, "a two-frame wait releases on its fifth tick")
+  helpers.audio.done["counted-cue"] = true
+  player:stepSourceTick({ tick = 6 })
   Assert.equal(player:status(handle), "complete", "the released stream completes")
 end
 
@@ -221,6 +272,7 @@ function T.loops_execute_bounded_bodies_inline()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(
     packet(),
@@ -341,8 +393,12 @@ function T.battle_phase_waits_release_without_background_work()
   end
 end
 
-function T.stuck_effect_tasks_fail_loudly_instead_of_escaping()
-  local player, handle = startNew(programOf({
+function T.effects_waits_release_while_unrelated_raw_tasks_run()
+  -- Native opcode 50 (WaitForParticles) polls only the active SPL
+  -- emitter count: a stuck raw task never holds the wait, and the
+  -- stream end keeps that raw work under its own legitimate ownership
+  -- instead of abandoning it past the wait.
+  local player, handle, helpers = startNew(programOf({
     {
       op = "schedule-battle-task",
       taskKind = "battle-background-blend-transition",
@@ -350,9 +406,81 @@ function T.stuck_effect_tasks_fail_loudly_instead_of_escaping()
       values = { 1 },
     },
     { op = "wait-for-battler-effects" },
+    { op = "play-sound", sound = "downstream-cue" },
     { op = "reset-blend-alpha" },
   }))
-  for _ = 1, 100 do
+  for _ = 1, 30 do
+    player:stepSourceTick({ tick = 1 })
+  end
+  Assert.deepEqual(
+    helpers.log.played,
+    { "downstream-cue" },
+    "the effects wait releases with no particle work even while raw work runs"
+  )
+  Assert.equal(player:status(handle), "waiting", "the stuck raw task still holds the stream end")
+  Assert.isNil(player:failure(handle), "the released wait carries no failure")
+  Assert.equal(#helpers.log.disposed, 0, "the running raw task retires nothing")
+end
+
+-- Plants one live emitter in the occurrence particle registry through the
+-- fake task factory: the native wait polls the active-list length, so the
+-- emitter holds the wait from creation until it leaves the list.
+-- Returns a holder the test drives to drain the emitter.
+---@param helpers table collaborator bundle behind the player
+---@return { simulation: table<string, unknown>?, runtime: table<string, unknown>? } holder carrying the planted emitter
+local function plantEmitter(helpers)
+  local holder = {}
+  local factory = helpers.tasks.create
+  function helpers.tasks.create(kind, args, context, services)
+    local task = factory(kind, args, context, services)
+    if kind == "battler-effect-continuation" and holder.runtime == nil and type(context) == "table" then
+      local registry = context.particles
+      if type(registry) == "table" and type(registry.systems) == "table" then
+        holder.runtime = { particles = { { age = 0, life = 100 } } }
+        holder.simulation = { emitters = { holder.runtime } }
+        registry.systems[0] = { simulation = holder.simulation }
+      end
+    end
+    return task
+  end
+  return holder
+end
+
+-- Drains the holder's planted emitter the way emitter retirement does:
+-- the runtime leaves the simulation's active list.
+---@param holder { simulation: table<string, unknown>?, runtime: table<string, unknown>? } planted emitter holder
+local function drainEmitter(holder)
+  local simulation = holder.simulation
+  local runtime = holder.runtime
+  assert(type(simulation) == "table", "the emitter plants before the wait polls")
+  for index, live in ipairs(simulation.emitters --[[@as table<string, unknown>[] ]]) do
+    if live == runtime then
+      table.remove(simulation.emitters, index)
+      holder.runtime = nil
+      return
+    end
+  end
+  error("the planted emitter leaves its simulation exactly once")
+end
+
+function T.effects_waits_fail_stuck_particle_work_loudly()
+  -- A particle emitter that never drains holds its own wait past the
+  -- long watchdog instead of releasing the occurrence silently; raw
+  -- tasks never join this condition.
+  local helpers = collaborators()
+  plantEmitter(helpers)
+  local player, handle = startNew(programOf({
+    {
+      op = "create-parameterized-battler-effect",
+      taskKind = "battler-effect-continuation",
+      actionProfile = "particle-emitter-default",
+      emitter = 0,
+      systemIndex = 0,
+    },
+    { op = "wait-for-battler-effects" },
+    { op = "reset-blend-alpha" },
+  }), helpers)
+  for _ = 1, 950 do
     player:stepSourceTick({ tick = 1 })
     if player:status(handle) == "failed" then
       break
@@ -361,9 +489,143 @@ function T.stuck_effect_tasks_fail_loudly_instead_of_escaping()
   Assert.equal(
     player:status(handle),
     "failed",
-    "a battler-effects wait over stuck tasks fails instead of escaping silently"
+    "a battler-effects wait over stuck emitters fails instead of escaping silently"
   )
   Assert.notNil(player:failure(handle), "the stuck effects wait carries its failure detail")
+end
+
+function T.effects_waits_release_long_lived_particles_without_failing()
+  -- A real emitter living past the old short horizon still releases
+  -- its wait once it drains: the watchdog never changes valid source
+  -- timing.
+  local helpers = collaborators()
+  local holder = plantEmitter(helpers)
+  local ticks = 0
+  local factory = helpers.tasks.create
+  function helpers.tasks.create(kind, args, context, services)
+    local task = factory(kind, args, context, services)
+    local stepped = task.stepSourceTick
+    function task.stepSourceTick(tick)
+      stepped(tick)
+      -- The fake task body retires the planted emitter the way emitter
+      -- retirement does: the runtime leaves the active list at tick 25,
+      -- and the bookkeeping task retires just after, as a drained
+      -- emitter task does.
+      ticks = ticks + 1
+      if ticks == 25 then
+        drainEmitter(holder)
+      end
+      if ticks >= 27 then
+        task._state = "complete"
+      end
+    end
+    return task
+  end
+  local player = assert(BattleAnimationPlayer.new({
+    scene = {},
+    audio = helpers.audio,
+    resources = helpers.resources,
+    tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
+  }))
+  local handle = assert(player:start(
+    packet(),
+    programOf({
+      {
+        op = "create-parameterized-battler-effect",
+        taskKind = "battler-effect-continuation",
+        actionProfile = "particle-emitter-default",
+        emitter = 0,
+        systemIndex = 0,
+      },
+      { op = "wait-for-battler-effects" },
+      { op = "reset-blend-alpha" },
+    })
+  ))
+  for _ = 1, 40 do
+    player:stepSourceTick({ tick = 1 })
+    if player:status(handle) == "complete" then
+      break
+    end
+  end
+  Assert.equal(player:status(handle), "complete", "the drained emitter releases its wait")
+  Assert.isNil(player:failure(handle), "the long-lived emitter carries no failure")
+end
+
+function T.effects_waits_follow_emitter_counts_not_task_records()
+  -- Native opcode 50 polls ParticleSystem_GetActiveEmitterCount: a
+  -- retired bookkeeping task with a live emitter still holds the wait,
+  -- while a lingering non-emitter particle task past emitter drain does
+  -- not.
+  local helpers = collaborators()
+  local holder = plantEmitter(helpers)
+  local factory = helpers.tasks.create
+  function helpers.tasks.create(kind, args, context, services)
+    local task = factory(kind, args, context, services)
+    function task.stepSourceTick(_tick)
+    end
+    function task.status()
+      -- The bookkeeping task retires immediately while its emitter
+      -- stays live.
+      return "complete"
+    end
+    return task
+  end
+  local player, handle = startNew(programOf({
+    {
+      op = "create-parameterized-battler-effect",
+      taskKind = "battler-effect-continuation",
+      actionProfile = "particle-emitter-default",
+      emitter = 0,
+      systemIndex = 0,
+    },
+    { op = "wait-for-battler-effects" },
+    { op = "reset-blend-alpha" },
+  }), helpers)
+  for _ = 1, 10 do
+    player:stepSourceTick({ tick = 1 })
+  end
+  Assert.equal(player:status(handle), "waiting", "a live emitter holds the wait past its retired task")
+  drainEmitter(holder)
+  for _ = 1, 5 do
+    player:stepSourceTick({ tick = 1 })
+    if player:status(handle) == "complete" then
+      break
+    end
+  end
+  Assert.equal(player:status(handle), "complete", "the drained emitter releases the wait")
+end
+
+function T.effects_waits_release_while_particle_group_tasks_linger()
+  -- A still-running particle-group task with no live emitter never
+  -- holds the wait: the condition follows the emitter count, not the
+  -- task count. The default fake tasks plant no emitters, so the wait
+  -- releases while the task still holds the stream end.
+  local player, handle, helpers = startNew(programOf({
+    {
+      op = "create-parameterized-battler-effect",
+      taskKind = "battler-effect-continuation",
+      actionProfile = "particle-emitter-default",
+      emitter = 0,
+      systemIndex = 0,
+    },
+    { op = "wait-for-battler-effects" },
+    { op = "play-sound", sound = "downstream-cue" },
+    { op = "reset-blend-alpha" },
+  }))
+  for _ = 1, 10 do
+    player:stepSourceTick({ tick = 1 })
+  end
+  Assert.deepEqual(
+    helpers.log.played,
+    { "downstream-cue" },
+    "the wait releases with no live emitter even while its task runs"
+  )
+  Assert.equal(
+    player:status(handle),
+    "waiting",
+    "the lingering particle task still holds the stream end"
+  )
 end
 
 function T.stream_end_with_unfinished_voices_fails_loudly()
@@ -376,10 +638,14 @@ function T.stream_end_with_unfinished_voices_fails_loudly()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
-  local handle = assert(player:start(packet(), programOf({
-    { op = "play-sound", sound = "lingering-cue" },
-  })))
+  local handle = assert(player:start(
+    packet(),
+    programOf({
+      { op = "play-sound", sound = "lingering-cue" },
+    })
+  ))
   for _ = 1, 300 do
     player:stepSourceTick({ tick = 1 })
     if player:status(handle) == "failed" then
@@ -394,26 +660,89 @@ function T.stream_end_with_unfinished_voices_fails_loudly()
   Assert.notNil(player:failure(handle), "the parked stream end carries its failure detail")
 end
 
-function T.stuck_background_work_fails_loudly_instead_of_escaping()
-  local player, handle, helpers = startNew(programOf({
-    {
-      op = "schedule-battle-task",
-      taskKind = "battle-background-blend-transition",
-      taskInputRule = "raw-rule",
-      values = { 1 },
-    },
-    { op = "wait-for-battle-phase", values = { 0 } },
-    { op = "reset-blend-alpha" },
-  }))
-  for _ = 1, 1000 do
-    player:stepSourceTick({ tick = 1 })
-    if player:status(handle) == "failed" then
-      break
+function T.background_phase_waits_track_switch_state_not_raw_tasks()
+  -- Native op19/20 poll bgSwitchState (loaded == 2, complete == 0):
+  -- the owned resource load settles the loaded phase while any owned
+  -- background switch task holds the complete phase. An unrelated raw
+  -- task never joins either condition, and the source transition owns
+  -- its own timing with no completion horizon.
+  local helpers = collaborators()
+  local completeAfter = {
+    ["battle-background-resource-load"] = 3,
+    ["battle-background-alternating-scroll-transition"] = 8,
+  }
+  function helpers.tasks.create(kind, _args, _context, _services)
+    helpers.log.created[#helpers.log.created + 1] = kind
+    local task = { _state = "running" }
+    function task.stepSourceTick(_tick)
+      helpers.log.steps[#helpers.log.steps + 1] = kind
+      if completeAfter[kind] ~= nil and #helpers.log.steps >= completeAfter[kind] then
+        task._state = "complete"
+      end
     end
+    function task.status()
+      return task._state
+    end
+    function task.cancel(_reason)
+      task._state = "cancelled"
+    end
+    function task.dispose()
+      helpers.log.disposed[#helpers.log.disposed + 1] = kind
+    end
+    return task
   end
-  Assert.equal(player:status(handle), "failed", "a stuck background switch fails instead of escaping silently")
-  Assert.notNil(player:failure(handle), "the stuck wait carries its failure detail")
-  Assert.equal(#helpers.log.created, 1, "the stuck switch task still constructs once")
+  local function startPhase(values)
+    local player = assert(BattleAnimationPlayer.new({
+      scene = {},
+      audio = helpers.audio,
+      resources = helpers.resources,
+      tasks = helpers.tasks,
+      services = { onNativeFrame = function() end },
+    }))
+    return player, assert(player:start(
+      packet(),
+      programOf({
+        {
+          op = "schedule-battle-task",
+          taskKind = "battle-background-resource-load",
+          taskInputRule = "raw-rule",
+          values = { 1 },
+        },
+        {
+          op = "schedule-battle-task",
+          taskKind = "battle-background-alternating-scroll-transition",
+          taskInputRule = "raw-rule",
+          values = { 1 },
+        },
+        {
+          op = "schedule-battle-task",
+          taskKind = "battle-palette-fade",
+          taskInputRule = "raw-rule",
+          values = { 1 },
+        },
+        { op = "wait-for-battle-phase", values = values },
+        { op = "play-sound", sound = "downstream-cue" },
+        { op = "reset-blend-alpha" },
+      })
+    ))
+  end
+  local loadedPlayer, loadedHandle = startPhase({ 2 })
+  local completePlayer, completeHandle = startPhase({ 0 })
+  for _ = 1, 12 do
+    loadedPlayer:stepSourceTick({ tick = 1 })
+    completePlayer:stepSourceTick({ tick = 1 })
+  end
+  Assert.deepEqual(
+    helpers.log.played,
+    { "downstream-cue", "downstream-cue" },
+    "both phases release once their own switch work drains despite the stuck raw task"
+  )
+  Assert.equal(loadedPlayer:status(loadedHandle), "waiting", "the stuck raw task holds the loaded stream end")
+  Assert.equal(
+    completePlayer:status(completeHandle),
+    "waiting",
+    "the stuck raw task holds the complete stream end"
+  )
 end
 
 function T.non_background_visual_spawns_keep_their_existing_arguments()
@@ -453,16 +782,19 @@ function T.parameterized_emitter_spawns_carry_their_script_config()
     },
   }))
   player:stepSourceTick({ tick = 1 })
-  Assert.deepEqual(
-    helpers.log.spawnArgs,
+  Assert.deepEqual(helpers.log.spawnArgs, {
     {
-      {
-        kind = "battler-effect-continuation",
-        args = { actionProfile = "particle-emitter-battler-class-camera-position", systemIndex = 0, emitter = 3, continuationSlot = nil, emitterConfig = config, emitterOffset = nil },
+      kind = "battler-effect-continuation",
+      args = {
+        actionProfile = "particle-emitter-battler-class-camera-position",
+        systemIndex = 0,
+        emitter = 3,
+        continuationSlot = nil,
+        emitterConfig = config,
+        emitterOffset = nil,
       },
     },
-    "configured emitter spawns carry their script config words"
-  )
+  }, "configured emitter spawns carry their script config words")
 end
 
 function T.missing_context_reads_fail_before_side_effects()
@@ -481,28 +813,67 @@ function T.missing_context_reads_fail_before_side_effects()
 end
 
 function T.counter_waits_track_the_general_group_only()
-  local player, handle, helpers = startNew(programOf({
-    {
-      op = "wait-interpreter-counter",
-      branchTarget = 1,
-      cursorRule = "pending-redispatch-current-opcode; zero-advances-past-current-opcode",
-    },
-    {
-      op = "schedule-battle-task",
-      taskKind = "battle-background-blend-transition",
-      taskInputRule = "raw-rule",
-      values = { 1 },
-    },
-    { op = "reset-blend-alpha" },
+  -- The interpreter-counter wait observes only the general group: a
+  -- pending uncounted raw task never parks it, while the stream end
+  -- still drains that same raw task before completing.
+  local helpers = collaborators()
+  function helpers.tasks.create(kind, args, _context, _services)
+    helpers.log.created[#helpers.log.created + 1] = kind
+    helpers.log.spawnArgs[#helpers.log.spawnArgs + 1] = { kind = kind, args = args }
+    local task = { _state = "running" }
+    function task.stepSourceTick(_tick)
+      helpers.log.steps[#helpers.log.steps + 1] = kind
+      task._state = "complete"
+    end
+    function task.status()
+      return task._state
+    end
+    function task.finish()
+      task._state = "complete"
+    end
+    function task.cancel(_reason)
+      task._state = "cancelled"
+      helpers.log.cancelled[#helpers.log.cancelled + 1] = kind
+    end
+    function task.dispose()
+      helpers.log.disposed[#helpers.log.disposed + 1] = kind
+    end
+    return task
+  end
+  local player = assert(BattleAnimationPlayer.new({
+    scene = {},
+    audio = helpers.audio,
+    resources = helpers.resources,
+    tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
+  local handle = assert(player:start(
+    packet(),
+    programOf({
+      {
+        op = "schedule-battle-task",
+        taskKind = "battle-background-blend-transition",
+        taskInputRule = "raw-rule",
+        values = { 1 },
+      },
+      {
+        op = "wait-interpreter-counter",
+        branchTarget = 2,
+        cursorRule = "pending-redispatch-current-opcode; zero-advances-past-current-opcode",
+      },
+      { op = "reset-blend-alpha" },
+    })
+  ))
+  player:stepSourceTick({ tick = 1 })
+  Assert.equal(#helpers.log.created, 1, "the raw task still constructs")
   for _ = 1, 5 do
     player:stepSourceTick({ tick = 1 })
     if player:status(handle) == "complete" then
       break
     end
   end
-  Assert.equal(player:status(handle), "complete", "uncounted raw tasks never hold the counter wait")
-  Assert.equal(#helpers.log.created, 1, "the raw task still constructs")
+  Assert.equal(player:status(handle), "complete", "the drained raw task releases the stream end")
+  Assert.isNil(player:failure(handle), "the drained stream end carries no failure")
 end
 
 function T.cancel_and_dispose_stay_silent_and_exact()
@@ -549,6 +920,7 @@ function T.occurrences_step_in_stable_admission_order()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local first = assert(player:start(
     packet("first"),
@@ -606,7 +978,7 @@ function T.construction_failures_release_every_acquisition_once()
   local helpers = collaborators()
   function helpers.tasks.create(_kind, _args, _context, _services)
     attempts = attempts + 1
-    if attempts == 2 then
+    if attempts == 1 then
       error("synthetic child construction failure")
     end
     local task = { _state = "running" }
@@ -625,6 +997,7 @@ function T.construction_failures_release_every_acquisition_once()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(
     packet(),
@@ -646,12 +1019,12 @@ function T.construction_failures_release_every_acquisition_once()
       break
     end
   end
-  Assert.equal(player:status(handle), "failed", "the second construction fails the occurrence")
+  Assert.equal(player:status(handle), "failed", "the failing construction fails the occurrence")
   local fault = player:failure(handle)
   Assert.notNil(fault, "failure carries occurrence and instruction detail")
   Assert.equal(fault.op, "schedule-battle-task", "the detail names the failing instruction")
-  Assert.equal(#helpers.log.played, 1, "the staged voice starts once")
-  Assert.equal(#helpers.log.stopped, 1, "the staged voice stops once")
+  Assert.equal(#helpers.log.played, 0, "the sound wait invents no voice")
+  Assert.equal(#helpers.log.stopped, 0, "unstaged voices stop nothing")
   Assert.equal(#helpers.log.acquired, 0, "the staged voice stages no holder lease")
   Assert.equal(#helpers.log.released, 0, "unstaged voices release nothing")
 end
@@ -677,6 +1050,7 @@ function T.task_step_failures_fail_the_occurrence()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(
     packet(),
@@ -712,6 +1086,7 @@ function T.unknown_task_states_fail_closed()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(
     packet(),
@@ -740,6 +1115,7 @@ function T.malformed_factory_products_fail_admission_work()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(
     packet(),
@@ -766,6 +1142,7 @@ function T.resource_failures_fail_before_side_effects()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(
     packet(),
@@ -796,6 +1173,7 @@ function T.stuck_voices_fail_loudly_instead_of_escaping()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(
     packet(),
@@ -872,6 +1250,7 @@ function T.particle_creation_repeats_once_per_loop_visit()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(
     packet(),
@@ -939,6 +1318,7 @@ function T.parked_creation_cancels_and_fails_without_leaking()
     audio = throwing.audio,
     resources = throwing.resources,
     tasks = throwing.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local failed = assert(failPlayer:start(
     packet(),
@@ -968,6 +1348,7 @@ function T.parked_creation_cancels_and_fails_without_leaking()
     audio = exploding.audio,
     resources = exploding.resources,
     tasks = exploding.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local burst = assert(burstPlayer:start(
     packet(),
@@ -995,6 +1376,7 @@ function T.parked_creation_cancels_and_fails_without_leaking()
     audio = hollow.audio,
     resources = hollow.resources,
     tasks = hollow.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local hollowHandle = assert(hollowPlayer:start(
     packet(),
@@ -1035,6 +1417,7 @@ local function startWithSides(program, attacker, targets)
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(sidePacket(attacker, targets), program))
   return player, handle, helpers
@@ -1058,6 +1441,7 @@ function T.positioned_sound_pan_follows_both_battler_sides()
       audio = parts.audio,
       resources = parts.resources,
       tasks = parts.tasks,
+      services = { onNativeFrame = function() end },
     }))
     local handle = assert(
       player:start(
@@ -1082,6 +1466,7 @@ function T.animation_cry_carries_source_parameters_and_attacker()
     audio = parts.audio,
     resources = parts.resources,
     tasks = parts.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(
     player:start(
@@ -1286,6 +1671,7 @@ local function startFlagged(program, playback)
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(playback, program))
   for _ = 1, 3 do
@@ -1324,6 +1710,7 @@ function T.serial_completed_occurrences_leave_no_retained_records()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local started = {}
   local retired = {}
@@ -1362,9 +1749,11 @@ function T.serial_completed_occurrences_leave_no_retained_records()
       return true
     end,
   }
+  local ManifestFixture = require("tests.support.BattlePresentationManifestFixture")
   local timeline = BattleTimeline.new({
     encounterFadeColor = "white",
     effects = effects,
+    slotGeometry = ManifestFixture.manifest().battlefield.slots,
     messageText = function(_, key)
       return key
     end,
@@ -1421,6 +1810,26 @@ function T.serial_completed_occurrences_leave_no_retained_records()
       observation = { hp = { [1] = 52, [2] = foeHp } },
       after = { hp = { [1] = 52, [2] = foeHp } },
       visualSeed = sequence * 3 + 1,
+      -- Each serial strike is its own source call cycle: the producer
+      -- execution moment admits the visual the lifecycle then drains.
+      presentation = {
+        context = {},
+        execution = {
+          selectedMove = "TACKLE",
+          executedMove = "TACKLE",
+          moment = "use",
+          branch = "default",
+          attacker = { combatant = 1, activation = 1 },
+          defender = { combatant = 2, activation = 2 },
+          targets = { { combatant = 2, activation = 2 } },
+          damage = -14,
+          power = 35,
+          friendship = 70,
+          hitOrdinal = 1,
+          hitCount = 1,
+          hitCycle = 1,
+        },
+      },
     }
   end
   timeline:reset(timelineView(57))
@@ -1513,6 +1922,7 @@ function T.interpreter_state_contest_indicator_falls_through_to_the_battle_half(
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(
     playbackWithPhase("charge"),
@@ -1551,6 +1961,7 @@ function T.carved_out_context_families_stay_loud_on_any_phase()
     audio = helpers.audio,
     resources = helpers.resources,
     tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
   }))
   Assert.isNil(player:start(playbackWithPhase("charge"), refused), "the no-values interpreter-state form never admits")
   local ops = {
@@ -1586,6 +1997,310 @@ function T.carved_out_context_families_stay_loud_on_any_phase()
     Assert.equal(fault.op, probe.op, probe.op .. " names the failing instruction")
     Assert.equal(#helpers.log.created, 0, probe.op .. " constructs no child")
   end
+end
+
+function T.stream_end_holds_uncounted_tasks_then_retires_everything_once()
+  -- Uncounted raw work holds the stream end instead of leaking past
+  -- it: completion retires every owned record, voice, and lease exactly
+  -- once.
+  local helpers = collaborators()
+  local finishesAt = { [1] = 3 }
+  local ticks = 0
+  function helpers.tasks.create(kind, args, _context, _services)
+    helpers.log.created[#helpers.log.created + 1] = kind
+    local id = #helpers.log.created
+    local task = { _state = "running" }
+    function task.stepSourceTick(_tick)
+      ticks = ticks + 1
+      helpers.log.steps[#helpers.log.steps + 1] = kind
+      if ticks >= (finishesAt[id] or 1) then
+        task._state = "complete"
+      end
+    end
+    function task.status()
+      return task._state
+    end
+    function task.cancel(_reason)
+      task._state = "cancelled"
+      helpers.log.cancelled[#helpers.log.cancelled + 1] = kind
+    end
+    function task.dispose()
+      helpers.log.disposed[#helpers.log.disposed + 1] = kind
+    end
+    return task
+  end
+  function helpers.audio.isFinished(_name)
+    return true
+  end
+  local player = assert(BattleAnimationPlayer.new({
+    scene = {},
+    audio = helpers.audio,
+    resources = helpers.resources,
+    tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
+  }))
+  local handle = assert(player:start(
+    packet(),
+    programOf({
+      {
+        op = "schedule-battle-task",
+        taskKind = "battle-background-blend-transition",
+        taskInputRule = "tail-rule",
+        values = { 1 },
+      },
+      { op = "reset-blend-alpha" },
+    })
+  ))
+  player:stepSourceTick({ tick = 1 })
+  Assert.equal(player:status(handle), "waiting", "the live tail holds the stream end")
+  player:stepSourceTick({ tick = 2 })
+  Assert.equal(player:status(handle), "waiting", "the tail still holds the stream end")
+  for _ = 1, 6 do
+    player:stepSourceTick({ tick = 1 })
+    if player:status(handle) == "complete" then
+      break
+    end
+  end
+  Assert.equal(player:status(handle), "complete", "the drained tail releases the stream end")
+  Assert.equal(#helpers.log.disposed, 1, "the tail task disposes exactly once")
+  Assert.equal(#helpers.log.cancelled, 0, "completion cancels nothing")
+  Assert.isTrue(player:retire(handle), "the terminal occurrence retires")
+  Assert.isTrue(not player:retire(handle), "retirement never repeats")
+end
+
+function T.effects_waits_stay_parked_until_every_particle_task_drains()
+  -- Two overlapping emitters: the first drain must not release a wait
+  -- that still names running particle work. Unrelated raw tasks never
+  -- join this condition (see the release-while-raw test above).
+  local helpers = collaborators()
+  local finishesAt = { 2, 5 }
+  local ticks = 0
+  function helpers.tasks.create(kind, _args, _context, _services)
+    helpers.log.created[#helpers.log.created + 1] = kind
+    local id = #helpers.log.created
+    local task = { _state = "running" }
+    function task.stepSourceTick(_tick)
+      ticks = ticks + 1
+      if ticks >= finishesAt[id] then
+        task._state = "complete"
+      end
+    end
+    function task.status()
+      return task._state
+    end
+    function task.cancel(_reason)
+      task._state = "cancelled"
+    end
+    function task.dispose() end
+    return task
+  end
+  local player = assert(BattleAnimationPlayer.new({
+    scene = {},
+    audio = helpers.audio,
+    resources = helpers.resources,
+    tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
+  }))
+  local handle = assert(player:start(
+    packet(),
+    programOf({
+      {
+        op = "create-parameterized-battler-effect",
+        taskKind = "battler-effect-continuation",
+        actionProfile = "particle-emitter-default",
+        emitter = 0,
+        systemIndex = 0,
+      },
+      {
+        op = "create-parameterized-battler-effect",
+        taskKind = "battler-effect-continuation",
+        actionProfile = "particle-emitter-default",
+        emitter = 1,
+        systemIndex = 0,
+      },
+      { op = "wait-for-battler-effects" },
+      { op = "reset-blend-alpha" },
+    })
+  ))
+  for tick = 1, 4 do
+    player:stepSourceTick({ tick = tick })
+    Assert.equal(player:status(handle), "waiting", "the long emitter holds the wait on tick " .. tick)
+  end
+  for _ = 1, 6 do
+    player:stepSourceTick({ tick = 1 })
+    if player:status(handle) == "complete" then
+      break
+    end
+  end
+  Assert.equal(player:status(handle), "complete", "the drained pair releases the wait")
+end
+
+function T.sound_waits_create_no_sound_and_escape_stuck_voices()
+  -- A wait with no pending sound work advances without playing
+  -- anything; a stuck voice holds only until the source 90-tick escape
+  -- releases past the wait, and the stream end still fails loudly.
+  local played = {}
+  local helpers = collaborators()
+  function helpers.audio.play(name)
+    played[#played + 1] = name
+  end
+  function helpers.audio.isFinished(_name)
+    return false
+  end
+  local player = assert(BattleAnimationPlayer.new({
+    scene = {},
+    audio = helpers.audio,
+    resources = helpers.resources,
+    tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
+  }))
+  local handle = assert(player:start(
+    packet(),
+    programOf({
+      { op = "wait-for-sound", values = { 90 } },
+      { op = "play-sound", sound = "after-wait-cue" },
+    })
+  ))
+  player:stepSourceTick({ tick = 1 })
+  Assert.deepEqual(played, { "after-wait-cue" }, "the empty wait invents no voice")
+  local stuck = assert(player:start(
+    packet(),
+    programOf({
+      { op = "play-sound", sound = "stuck-cue" },
+      { op = "wait-for-sound", values = { 90 } },
+      { op = "play-sound", sound = "downstream-cue" },
+    })
+  ))
+  for tick = 1, 95 do
+    player:stepSourceTick({ tick = tick })
+  end
+  Assert.isTrue(
+    #played >= 3 and played[#played] == "downstream-cue",
+    "the stuck voice escapes past the wait instead of parking forever"
+  )
+  for _ = 1, 200 do
+    player:stepSourceTick({ tick = 1 })
+    if player:status(stuck) == "failed" then
+      break
+    end
+  end
+  Assert.equal(player:status(stuck), "failed", "the stuck stream end still fails loudly")
+  Assert.notNil(player:failure(stuck), "the stuck stream end carries its failure detail")
+end
+
+function T.sound_waits_drain_every_unfinished_voice_before_releasing()
+  -- Native WaitForSoundTasks holds until the global SE-playing
+  -- condition clears: the newest voice finishing first must not
+  -- release the wait while an earlier started SE still plays.
+  local helpers = collaborators()
+  local player = assert(BattleAnimationPlayer.new({
+    scene = {},
+    audio = helpers.audio,
+    resources = helpers.resources,
+    tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
+  }))
+  local handle = assert(player:start(
+    packet(),
+    programOf({
+      { op = "play-sound", sound = "long-cue" },
+      { op = "play-sound", sound = "short-cue" },
+      { op = "wait-for-sound", values = { 90 } },
+      { op = "play-sound", sound = "downstream-cue" },
+      { op = "reset-blend-alpha" },
+    })
+  ))
+  player:stepSourceTick({ tick = 1 })
+  Assert.deepEqual(
+    helpers.log.played,
+    { "long-cue", "short-cue" },
+    "both voices start before the wait"
+  )
+  -- The downstream cue finishes at once when played: only the two
+  -- awaited voices may hold the wait and the stream end.
+  helpers.audio.done["downstream-cue"] = true
+  helpers.audio.done["short-cue"] = true
+  for _ = 1, 5 do
+    player:stepSourceTick({ tick = 2 })
+  end
+  Assert.deepEqual(
+    helpers.log.played,
+    { "long-cue", "short-cue" },
+    "the finished newest voice never releases the wait past the still-playing first voice"
+  )
+  Assert.equal(player:status(handle), "waiting", "the first voice still holds the wait")
+  helpers.audio.done["long-cue"] = true
+  for _ = 1, 5 do
+    player:stepSourceTick({ tick = 3 })
+    if player:status(handle) == "complete" then
+      break
+    end
+  end
+  Assert.deepEqual(
+    helpers.log.played,
+    { "long-cue", "short-cue", "downstream-cue" },
+    "the drained voices release the wait in source order"
+  )
+  Assert.equal(player:status(handle), "complete", "the drained voices complete the stream")
+end
+
+function T.overlapping_occurrences_retire_cancelled_work_without_touching_survivors()
+  -- A cancelled long occurrence disposes its live tail exactly once
+  -- while a short overlapping occurrence still completes on its own.
+  local helpers = collaborators()
+  local ticks = 0
+  function helpers.tasks.create(kind, _args, _context, _services)
+    helpers.log.created[#helpers.log.created + 1] = kind
+    local task = { _state = "running" }
+    function task.stepSourceTick(_tick)
+      ticks = ticks + 1
+      helpers.log.steps[#helpers.log.steps + 1] = kind
+      if kind == "battle-palette-fade" then
+        task._state = "complete"
+      end
+    end
+    function task.status()
+      return task._state
+    end
+    function task.cancel(_reason)
+      task._state = "cancelled"
+      helpers.log.cancelled[#helpers.log.cancelled + 1] = kind
+    end
+    function task.dispose()
+      helpers.log.disposed[#helpers.log.disposed + 1] = kind
+    end
+    return task
+  end
+  local player = assert(BattleAnimationPlayer.new({
+    scene = {},
+    audio = helpers.audio,
+    resources = helpers.resources,
+    tasks = helpers.tasks,
+    services = { onNativeFrame = function() end },
+  }))
+  local function spawn(kind)
+    return assert(player:start(
+      packet(),
+      programOf({
+        { op = "schedule-battle-task", taskKind = kind, taskInputRule = "tail-rule", values = { 1 } },
+        { op = "reset-blend-alpha" },
+      })
+    ))
+  end
+  local long = spawn("battle-background-blend-transition")
+  local short = spawn("battle-palette-fade")
+  player:stepSourceTick({ tick = 1 })
+  player:cancel(long, "withdrawn")
+  for _ = 1, 8 do
+    player:stepSourceTick({ tick = 1 })
+    if player:status(short) == "complete" then
+      break
+    end
+  end
+  Assert.equal(player:status(long), "cancelled", "the withdrawn occurrence stays cancelled")
+  Assert.equal(player:status(short), "complete", "the survivor completes on its own")
+  Assert.equal(#helpers.log.disposed, 2, "both tails dispose exactly once")
+  Assert.equal(#helpers.log.cancelled, 1, "only the withdrawn tail cancels")
 end
 
 return { tests = T }

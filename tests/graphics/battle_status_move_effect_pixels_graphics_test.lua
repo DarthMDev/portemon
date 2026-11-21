@@ -10,6 +10,7 @@ local BattleRenderer = require("game.hgss.src.battle.BattleRenderer")
 local BattlePresentationCache = require("libs.assets.src.battle.BattlePresentationCache")
 local BattlePresentationFlow = require("game.hgss.src.battle.BattlePresentationFlow")
 local BattleScene = require("libs.hgss.src.presentation.BattleScene")
+local BattleParticleSystems = require("libs.hgss.src.presentation.BattleParticleSystems")
 local CacheFs = require("libs.storage.src.CacheFs")
 local GameVersion = require("romdump.src.source.GameVersion")
 local ManifestFixture = require("tests.support.BattlePresentationManifestFixture")
@@ -17,10 +18,12 @@ local RomImporter = require("romdump.src.source.RomImporter")
 
 local T = {}
 local MOVES = { "TAIL_WHIP", "HYPNOSIS" }
--- Pixels are fingerprinted on a coarse grid at a coarse tick cadence; the
--- programs run to completion every tick, only the readback is sampled.
+-- Pixels are fingerprinted on a coarse grid on every source tick: an effect
+-- view can paint and disappear inside its own short source window (a
+-- battler-sprite copy loop is only a few frames long), so a coarser readback
+-- cadence can miss the only change a program makes. The programs still run to
+-- completion every tick; only the readback is per tick.
 local PIXEL_STRIDE = 2
-local SAMPLE_EVERY = 3
 
 local function firstReadyVersion()
   for _, versionId in ipairs(GameVersion.ORDER) do
@@ -104,6 +107,10 @@ local function runVersion(scope, versionId)
         position = 1,
         portraitSelector = "probe/player",
         visible = true,
+        -- Synthetic probe pictures carry no species geometry, so the
+        -- settled visual center names an explicit zero species height
+        -- instead of inheriting a default.
+        sourceHeight = 0,
         pictureVisible = true,
         pictureWidth = 48,
         pictureHeight = 48,
@@ -117,6 +124,10 @@ local function runVersion(scope, versionId)
         position = 2,
         portraitSelector = "probe/foe",
         visible = true,
+        -- Synthetic probe pictures carry no species geometry, so the
+        -- settled visual center names an explicit zero species height
+        -- instead of inheriting a default.
+        sourceHeight = 0,
         pictureVisible = true,
         pictureWidth = 48,
         pictureHeight = 48,
@@ -133,6 +144,15 @@ local function runVersion(scope, versionId)
       audio = audio,
       resources = resources,
       tasks = BattleEffectTasks,
+      splRandomState = { state = 0 },
+      services = {
+        onNativeFrame = function(phase, sourceTick)
+          if phase == "draw" then
+            BattleParticleSystems.stepSourceDrawPhase(scene, sourceTick)
+            scene:stepAnimationPictures(sourceTick)
+          end
+        end,
+      },
     }))
     local packet = {
       launchId = "named-effect-pixels",
@@ -142,15 +162,26 @@ local function runVersion(scope, versionId)
     }
     local event = {
       sequence = index,
+      kind = "struck",
+      cause = { kind = "move", key = key },
       actionId = index,
       hitIndex = 1,
-      effectKey = key,
       actors = { { combatant = 1, activation = 1 } },
       targets = { { combatant = 3, activation = 3 } },
       move = { selected = key, executed = key, phase = "direct", power = 0 },
+      payload = { target = 3, hitIndex = 1, damage = 1, calculated = 1 },
       visualSeed = 0x5151 + index,
     }
-    local playback = BattlePresentationFlow.animationPlayback(packet, event, slots)
+    local requests = BattlePresentationFlow.animationPlayback(packet, event, slots)
+    local selected = assert(requests[1], key .. " selects its frozen request")
+    local playback = {
+      launchId = packet.launchId,
+      packetId = packet.packetId,
+      event = event,
+      visualSeed = event.visualSeed,
+      topology = selected.playback.topology,
+      context = selected.playback.context,
+    }
     local handle = assert(player:start(playback, effect.program), key .. " admits its source program")
     local pass = scope:own(BattlePicturePass.new(graphics))
     local canvas = scope:own(graphics.newCanvas(256, 192, { format = "rgba8", readable = true, dpiscale = 1 }))
@@ -195,7 +226,8 @@ local function runVersion(scope, versionId)
         end
         renderBattlers[#renderBattlers + 1] = copy
       end
-      for _, view in ipairs(scene:effectViews()) do
+      local effectViews = scene:effectViews()
+      for _, view in ipairs(effectViews) do
         local source = view.picture
         if source ~= nil then
           battlerSpriteObserved = battlerSpriteObserved or source.battlerActivation ~= nil
@@ -204,29 +236,26 @@ local function runVersion(scope, versionId)
       local battleView = {
         battlers = renderBattlers,
         slotGeometry = slots,
-        effectInstances = scene:effectViews(),
+        effectInstances = effectViews,
         bgScroll = scene:scroll(),
         hudSections = {},
       }
-      local sampled = tick % SAMPLE_EVERY == 1
-      if sampled then
-        graphics.setCanvas(canvas)
-        graphics.clear(0, 0, 0, 0)
-        BattleRenderer.drawPane({
-          graphics = graphics,
-          text = {},
-          windows = {},
-          assets = battleAssets,
-          sceneImageKey = "missing-scene",
-        }, battleView, "detail", {}, { x = 0, y = 0, scale = 1 })
-        graphics.setCanvas()
-        local hash, covered = nativePixels(scope:own(canvas:newImageData()))
-        visible = visible or covered > 0
-        if firstHash == nil then
-          firstHash = hash
-        elseif hash ~= firstHash then
-          changed = true
-        end
+      graphics.setCanvas(canvas)
+      graphics.clear(0, 0, 0, 0)
+      BattleRenderer.drawPane({
+        graphics = graphics,
+        text = {},
+        windows = {},
+        assets = battleAssets,
+        sceneImageKey = "missing-scene",
+      }, battleView, "detail", {}, { x = 0, y = 0, scale = 1 })
+      graphics.setCanvas()
+      local hash, covered = nativePixels(scope:own(canvas:newImageData()))
+      visible = visible or covered > 0
+      if firstHash == nil then
+        firstHash = hash
+      elseif hash ~= firstHash then
+        changed = true
       end
       if player:status(handle) == "complete" or player:status(handle) == "failed" then
         break

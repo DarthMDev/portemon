@@ -126,6 +126,7 @@ local BERRY_FLAVORS = {
 ---@field private _shiftOfferHandler (fun(state: table<string, unknown>, obligations: table<integer, table<string, unknown>>): ShiftOffer?)?
 ---@field private _resumeTurnHandler fun(state: table<string, unknown>, budget: integer)
 ---@field private _commitSwitchIntentHandler fun(state: table<string, unknown>)
+---@field private _buildReplacementBatch (fun(state: table<string, unknown>, obligations: table<integer, table<string, unknown>>, allowRunOverride: boolean?))?
 ---@field private _decisionLease boolean?
 ---@field private _trainerProvisional table<integer, table<string, integer>>
 ---@field private _finalized boolean
@@ -363,6 +364,7 @@ local function checkRestoredShape(state)
         or not isPositiveInt(intent.actionId)
         or type(intent.mode) ~= "string"
         or type(intent.cause) ~= "table"
+        or (intent.readyEventSequence ~= nil and not isPositiveInt(intent.readyEventSequence))
       then
         error(BattleErrors.incompatibleSnapshot("switch continuations preserve their active move owner", {}))
       end
@@ -2885,6 +2887,22 @@ local function answerAbilityPhase(state, context, health, ceilings, answeredPois
           kind = "ability",
           key = answer.key,
           combatant = combatantId,
+        }, {
+          operation = {
+            kind = "stage-changed",
+            subject = { combatant = combatantId, activation = facts.activation },
+            source = {
+              kind = "ability",
+              key = answer.key,
+              actor = { combatant = combatantId, activation = facts.activation },
+            },
+            stat = "speed",
+            before = stages.speed,
+            after = stages.speed + 1,
+            method = "delta",
+            profile = "standard",
+            feedbackOwner = true,
+          },
         })
       end
       events[#events + 1] = { origin = "innate", kind = "ability", key = answer.key, target = combatantId }
@@ -4217,6 +4235,7 @@ end
 ---@field bindRuleset fun(ruleset: HgssRuleset)
 ---@field settleEntryTiming fun(state: table<string, unknown>, entrant: integer)
 ---@field settlePostReplacement fun(state: table<string, unknown>, held: table<integer, table<string, unknown>>?)
+---@field buildReplacementBatch fun(state: table<string, unknown>, obligations: table<integer, table<string, unknown>>, allowRunOverride: boolean?)
 
 ---@param state table<string, unknown>
 ---@param actor table<string, unknown>
@@ -4779,6 +4798,69 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
     end
   end
 
+  --- Detached semantic facts behind one timing outcome: blocked or
+  --- expiring gates and connected confusion self-hits carry their
+  --- applied operation (and ordered health change) so the selector
+  --- admits their feedback without re-reading the spent marker.
+  --- Other timing outcomes ride bare; narration and health cues
+  --- still translate from the event itself.
+  ---@param state table<string, unknown> live battle state under the activity read
+  ---@param record table<string, unknown> timing outcome under projection
+  ---@return table<string, unknown>? detached semantic facts, nil when the outcome carries none
+  local function timingFacts(state, record)
+    local kind = record.kind --[[@as string]]
+    local key = record.key
+    if type(key) ~= "string" then
+      return nil
+    end
+    local combatant = record.combatant
+    if type(combatant) ~= "number" or combatant % 1 ~= 0 or combatant < 1 then
+      return nil
+    end
+    local live = BattleState.combatant(state, combatant --[[@as integer]])
+    local entry = live.active
+    local activation = type(entry) == "table" and (entry --[[@as table<string, unknown>]]).activation or false
+    local subject = { combatant = combatant, activation = activation }
+    local source = { kind = "system", key = "status-gate" }
+    if kind == "blocked" and (key == "confusion" or key == "infatuation") then
+      return {
+        operation = { kind = "status-gate", subject = subject, source = source, condition = key, outcome = "blocked" },
+      }
+    end
+    if kind == "expire" and key == "confusion" then
+      return {
+        operation = { kind = "status-gate", subject = subject, source = source, condition = key, outcome = "expired" },
+      }
+    end
+    if kind == "tick" and key == "confusion" then
+      local amount = record.amount
+      if type(amount) ~= "number" or amount < 0 then
+        return nil
+      end
+      local operation =
+        { kind = "status-gate", subject = subject, source = source, condition = key, outcome = "self-hit" }
+      local before = live.hp
+      local ceiling = live.maxHp
+      if type(before) ~= "number" or type(ceiling) ~= "number" then
+        return { operation = operation }
+      end
+      return {
+        operation = operation,
+        healthChanges = {
+          {
+            combatant = combatant,
+            activation = activation,
+            before = before,
+            after = math.max(0, before - amount),
+            maxHp = ceiling,
+            kind = "body",
+          },
+        },
+      }
+    end
+    return nil
+  end
+
   -- Invokes one named finite timing through the shared dispatcher over
   -- the live bag: entry once an arrival is established, beforeAction for
   -- a due actor. Handler mutations commit through the residual health
@@ -4810,7 +4892,19 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
     -- activity, and health guards hold exactly as on the move path; the
     -- resulting status event joins the pass events below.
     local function writeStatus(combatant, key, conditionState)
-      return view:applyStatus(combatant, key, conditionState, { kind = timing })
+      local writtenEntry = BattleState.combatant(state, combatant).active
+      local writtenActivation = type(writtenEntry) == "table"
+          and (writtenEntry --[[@as table<string, unknown>]]).activation
+        or false
+      return view:applyStatus(combatant, key, conditionState, { kind = timing }, {
+        operation = {
+          kind = "status-applied",
+          subject = { combatant = combatant, activation = writtenActivation },
+          source = { kind = "system", key = timing },
+          condition = key,
+          application = "standard",
+        },
+      })
     end
     local dispatchOwner ---@type table<string, unknown>
     if timing == "entry" then
@@ -4893,7 +4987,13 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
         record.kind --[[@as string]]
         ~= "faint"
       then
-        view:emit(record.kind --[[@as string]], { kind = record.kind }, copyValue(record))
+        view:emit(
+          record.kind --[[@as string]],
+          { kind = record.kind },
+          copyValue(record),
+          nil,
+          timingFacts(state, record)
+        )
       end
     end
     context.blockedBy = context.blockedBy
@@ -5003,11 +5103,43 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
       NativeAbilitySupport.handlers.earlyBird(state, actor.combatant --[[@as integer]])
     )
     if gate.event ~= nil then
+      local gateKey = gate.event.key --[[@as string]]
+      local gateOutcome = gate.event.outcome --[[@as string]]
+      local gateFacts = nil ---@type table<string, unknown>?
+      if
+        (
+          gateKey == "sleep"
+          or gateKey == "freeze"
+          or gateKey == "paralysis"
+          or gateKey == "confusion"
+          or gateKey == "infatuation"
+        )
+        and (
+          gateOutcome == "passed"
+          or gateOutcome == "blocked"
+          or gateOutcome == "self-hit"
+          or gateOutcome == "expired"
+          or gateOutcome == "cured"
+        )
+      then
+        local gateEntry = BattleState.combatant(state, actor.combatant --[[@as integer]]).active
+        local gateActivation = type(gateEntry) == "table" and (gateEntry --[[@as table<string, unknown>]]).activation
+          or false
+        gateFacts = {
+          operation = {
+            kind = "status-gate",
+            subject = { combatant = actor.combatant, activation = gateActivation },
+            source = { kind = "system", key = "status-gate" },
+            condition = gateKey,
+            outcome = gateOutcome,
+          },
+        }
+      end
       context:emit("status-gate", { kind = "status-gate", combatant = actor.combatant }, {
         combatant = actor.combatant,
         key = gate.event.key,
         outcome = gate.event.outcome,
-      })
+      }, nil, gateFacts)
     end
     if not gate.acts then
       return
@@ -5085,7 +5217,51 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
         local outcome = context:damage(target --[[@as integer]], storedDamage * 2, cause)
         local dealt = outcome.before - outcome.after
         context:noteDamageTaken(target --[[@as integer]], actor.combatant --[[@as integer]], "physical", dealt)
-        local strike = context:emit("struck", cause, { target = target, hitIndex = 1, damage = dealt })
+        local targetEntry = BattleState.combatant(state, target --[[@as integer]]).active
+        local targetActivation = type(targetEntry) == "table"
+            and (targetEntry --[[@as table<string, unknown>]]).activation
+          or nil
+        local releaseFacts = nil ---@type table<string, unknown>?
+        if type(targetActivation) == "number" then
+          local releaser = { combatant = actor.combatant, activation = actor.activation }
+          local released = { combatant = target, activation = targetActivation }
+          releaseFacts = {
+            execution = {
+              selectedMove = "BIDE",
+              executedMove = "BIDE",
+              moment = "bide-release",
+              branch = "default",
+              attacker = releaser,
+              defender = released,
+              targets = { released },
+              damage = -dealt,
+              power = 0,
+              friendship = 0,
+              hitOrdinal = 1,
+              hitCount = 1,
+              hitCycle = 1,
+            },
+          }
+          local releasedMon = BattleState.combatant(state, target --[[@as integer]])
+          local ceiling = releasedMon.maxHp
+          if type(ceiling) ~= "number" then
+            ceiling = releasedMon.entryHp
+          end
+          if type(ceiling) == "number" then
+            releaseFacts.healthChanges = {
+              {
+                combatant = target,
+                activation = targetActivation,
+                before = outcome.before,
+                after = outcome.after,
+                maxHp = ceiling,
+                kind = "body",
+              },
+            }
+          end
+        end
+        local strike =
+          context:emit("struck", cause, { target = target, hitIndex = 1, damage = dealt }, nil, releaseFacts)
         strike.actionId = ordinal
       end
       context:removeBattleEffect(actor.combatant --[[@as integer]], "bide")
@@ -5502,7 +5678,8 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
   ---@param ordinal integer commit order of this action
   ---@param cause table<string, unknown> semantic reason carried by the emitted event
   ---@param reason string? optional switch reason overriding voluntary departure
-  local function executeSwitch(state, context, action, ordinal, cause, reason)
+  ---@param readyEventSequence integer? switch event sequence ordering the arrival feedback
+  local function executeSwitch(state, context, action, ordinal, cause, reason, readyEventSequence)
     local actor = action.actor --[[@as table<string, unknown>]]
     local payload = action.payload --[[@as table<string, unknown>]]
     local combatant = BattleState.combatant(state, actor.combatant --[[@as integer]])
@@ -5621,11 +5798,28 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
     -- now face, so a reserve taking the field before the knockout still
     -- counts as a recipient; arriving foes open their own fresh record.
     noteBattleEntry(state, payload.replacement --[[@as integer]])
+    local switchFacts = nil ---@type table<string, unknown>?
+    if readyEventSequence ~= nil and (reason == "u_turn" or reason == "baton_pass") then
+      local pivotReason = reason == "baton_pass" and "baton-pass" or "u-turn"
+      local departingRole = { combatant = actor.combatant, activation = actor.activation }
+      local incomingRole = { combatant = payload.replacement, activation = activation }
+      switchFacts = {
+        operation = {
+          kind = "switch-applied",
+          subject = incomingRole,
+          source = { kind = "move", key = cause.key, actor = departingRole },
+          reason = pivotReason,
+          departing = departingRole,
+          incoming = incomingRole,
+          readyEventSequence = readyEventSequence,
+        },
+      }
+    end
     local event = context:emit("switch", cause, {
       position = slot,
       from = actor.combatant,
       to = payload.replacement,
-    })
+    }, nil, switchFacts)
     event.actionId = ordinal
     -- The arrival runs its entry pass before it may act: a hazard faint
     -- queues through ordinary faint ownership for the turn-close drain.
@@ -5933,6 +6127,36 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
     local intentCause = intent.cause
     local payload = intent.payload --[[@as table<string, unknown>]]
     assert(type(intentCause) == "table", "pivot intents retain the move cause")
+    -- The connected pivot publishes its departure readiness before the
+    -- replacement decision opens: later translation finishes the
+    -- prepared departure before exposing the party choice, and the
+    -- committed arrival carries the same readiness without replaying it.
+    local pivotCtx = BattleContext.wrap(state)
+    local departing = { combatant = actor.combatant, activation = actor.activation }
+    local pivotReason = (type(payload.mode) == "string" and payload.mode == "pass-markers") and "baton-pass" or "u-turn"
+    local moveKey = (intentCause --[[@as table<string, unknown>]]).key
+    if type(moveKey) ~= "string" or moveKey == "" then
+      moveKey = pivotReason == "baton-pass" and "BATON_PASS" or "U_TURN"
+    end
+    local readyEvent = pivotCtx:emit(
+      "switch-ready",
+      copyValue(intentCause),
+      {
+        departing = actor.combatant,
+        position = active.position,
+      },
+      nil,
+      {
+        operation = {
+          kind = "switch-ready",
+          subject = departing,
+          source = { kind = "move", key = moveKey, actor = departing },
+          reason = pivotReason,
+          departing = departing,
+          position = active.position,
+        },
+      }
+    )
     state.pending = {
       batch = { id = counter, epoch = counter, requests = {} },
       submitted = {},
@@ -5943,6 +6167,7 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
         mode = payload.mode,
         actionId = intent.actionId,
         cause = copyValue(intentCause),
+        readyEventSequence = readyEvent.sequence,
       },
     }
     local controller = BattleState.participant(state, combatant.participant --[[@as integer]]).controller
@@ -6210,6 +6435,69 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
       end
       return cured
     end
+    -- Closed residual-operation vocabulary behind one damage outcome:
+    -- only effects the selector roots admit operations. The condition
+    -- family replays its feedback on damage; sandstorm and hail damage
+    -- ride the weather continuation; every other residual key stays bare
+    -- and narrates without a root, exactly as the kind-derived table did
+    -- before the selector conversion.
+    local RESIDUAL_OPERATION_EFFECTS = {
+      poison = "poison",
+      toxic = "toxic",
+      burn = "burn",
+      curse = "curse",
+      nightmare = "nightmare",
+    }
+    local WEATHER_CONTINUATION_BY_KEY = {
+      sandstorm = "sand",
+      hail = "hail",
+    }
+    ---@param outcomeRecord table<string, unknown> residual outcome under projection
+    ---@param passOrdinal integer residual pass ordinal ordering weather continuations
+    ---@return table<string, unknown>? detached semantic facts, nil when the key stays bare
+    local function residualTickFacts(outcomeRecord, passOrdinal)
+      if type(outcomeRecord) ~= "table" or outcomeRecord.kind ~= "tick" then
+        return nil
+      end
+      local outcomeKey = outcomeRecord.key
+      if type(outcomeKey) ~= "string" then
+        return nil
+      end
+      local victim = outcomeRecord.combatant
+      if type(victim) ~= "number" or victim % 1 ~= 0 or victim < 1 then
+        return nil
+      end
+      local victimState = BattleState.combatant(state, victim --[[@as integer]])
+      local victimEntry = victimState.active
+      local victimActivation = type(victimEntry) == "table"
+          and (victimEntry --[[@as table<string, unknown>]]).activation
+        or false
+      local subject = { combatant = victim, activation = victimActivation }
+      local effect = RESIDUAL_OPERATION_EFFECTS[outcomeKey]
+      if effect ~= nil then
+        return {
+          operation = {
+            kind = "residual",
+            subject = subject,
+            source = { kind = "system", key = outcomeKey },
+            effect = effect,
+          },
+        }
+      end
+      local weather = WEATHER_CONTINUATION_BY_KEY[outcomeKey]
+      if weather ~= nil then
+        return {
+          operation = {
+            kind = "weather-continued",
+            subject = subject,
+            source = { kind = "weather", key = outcomeKey },
+            weather = weather,
+            passOrdinal = passOrdinal,
+          },
+        }
+      end
+      return nil
+    end
     -- One unified residual frame drives the pass a phase at a time:
     -- each committed phase settles through the existing faint owner
     -- before any later phase runs, and holders that left the field
@@ -6217,7 +6505,9 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
     -- no continuation survives the turn and capture only ever sees
     -- settled state.
     local resume = nil ---@type table<string, unknown>?
+    local passOrdinal = 0
     while true do
+      passOrdinal = passOrdinal + 1
       local outcome = Residuals.step({ collect = collectResiduals, invoke = invokeResiduals }, {
         speeds = speeds,
         health = health,
@@ -6253,7 +6543,13 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
           then
             payload.noBlink = true
           end
-          context:emit(record.kind --[[@as string]], { kind = "residual", key = record.key }, payload)
+          context:emit(
+            record.kind --[[@as string]],
+            { kind = "residual", key = record.key },
+            payload,
+            nil,
+            residualTickFacts(record, passOrdinal)
+          )
         elseif record.origin == "condition" then
           local noBlink = type(record.key) == "string" and NO_BLINK_RESIDUAL_TICKS[record.key] == true
           context:emit("tick", { kind = "residual", key = record.key }, {
@@ -6261,7 +6557,7 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
             key = record.key,
             amount = record.amount,
             noBlink = noBlink and true or nil,
-          })
+          }, nil, residualTickFacts(record, passOrdinal))
         else
           local cause = { kind = record.kind }
           if record.cause ~= nil then
@@ -6286,7 +6582,49 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
           if record.kind == "tick" and type(record.key) == "string" and NO_BLINK_RESIDUAL_TICKS[record.key] == true then
             payload.noBlink = true
           end
-          context:emit(record.kind --[[@as string]], cause, payload)
+          -- Delayed residual strikes mark their release moment from the
+          -- frozen launch facts: the hit plays the release variant
+          -- against the actual struck position.
+          local residualFacts = nil ---@type table<string, unknown>?
+          if
+            record.kind == "struck"
+            and record.delayed == true
+            and type(record.target) == "number"
+            and type(cause.combatant) == "number"
+            and type(cause.activation) == "number"
+          then
+            local delayedCause = cause --[[@as table<string, unknown>]]
+            local attacker = { combatant = delayedCause.combatant, activation = delayedCause.activation }
+            local defenderEntry = BattleState.combatant(state, record.target --[[@as integer]]).active
+            local defenderActivation = type(defenderEntry) == "table"
+                and (defenderEntry --[[@as table<string, unknown>]]).activation
+              or nil
+            if type(defenderActivation) == "number" then
+              local defender = { combatant = record.target, activation = defenderActivation }
+              local calculated = record.calculated
+              if type(calculated) ~= "number" then
+                calculated = record.damage
+              end
+              residualFacts = {
+                execution = {
+                  selectedMove = delayedCause.key,
+                  executedMove = delayedCause.key,
+                  moment = "delayed-hit",
+                  branch = "default",
+                  attacker = attacker,
+                  defender = defender,
+                  targets = { defender },
+                  damage = -calculated,
+                  power = 0,
+                  friendship = 0,
+                  hitOrdinal = 1,
+                  hitCount = 1,
+                  hitCycle = 1,
+                },
+              }
+            end
+          end
+          context:emit(record.kind --[[@as string]], cause, payload, nil, residualFacts)
         end
       end
       commitTimingHealth(state, health, ceilings)
@@ -6324,7 +6662,8 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
 
   ---@param state table<string, unknown> live battle state under replacement work
   ---@param obligations table<integer, table<string, unknown>> ordered replacement obligations
-  local function buildReplacementBatch(state, obligations)
+  ---@param allowRunOverride boolean? false forces switch-only after a failed wild escape; nil derives from the encounter
+  local function buildReplacementBatch(state, obligations, allowRunOverride)
     local context = BattleContext.wrap(state)
     local counter = state.batchCounter --[[@as integer]] + 1
     state.batchCounter = counter
@@ -6340,11 +6679,18 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
         internal = obligation.internal,
       }
     end
+    -- Retail ReplaceFainted offers flight beside replacement in wild
+    -- battles only (subscript_0231): trainer faints stay switch-only,
+    -- and a failed wild escape retries switch-only without a second ask.
+    local allowRun = allowRunOverride
+    if allowRun == nil then
+      allowRun = battleKind == "wild"
+    end
     state.pending = {
       batch = { id = counter, epoch = counter, requests = {} },
       submitted = {},
       reserved = { replacements = {}, items = {} },
-      replacement = { obligations = stored },
+      replacement = { obligations = stored, allowRun = allowRun },
     }
     context:pushFrame({
       kind = "round",
@@ -6370,14 +6716,69 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
       end
     end
     for _, controller in ipairs(controllerOrder) do
+      local kinds = { "switch" }
+      if allowRun == true then
+        kinds[#kinds + 1] = "run"
+      end
       context:requestDecision({
         controller = controller,
         kind = HgssSessionExecutor.DECISION_KIND,
         actors = byController[controller],
-        legalChoices = { kinds = { "switch" } },
+        legalChoices = { kinds = kinds },
       })
     end
     state.status = "waiting"
+  end
+
+  --- Derives the ordered experience boundaries behind one reward
+  --- recipient: one record per crossed level with its original
+  --- experience-bar segment index, or an empty list when no level
+  --- crossed. The recipient's entry token rides the subject when the
+  --- recipient still holds the field; reserves carry no token.
+  ---@param state table<string, unknown> live battle state under the activity read
+  ---@param event table<string, unknown> reward experience record under projection
+  ---@return table<string, unknown>? detached experience-awarded operation, nil for malformed boundaries
+  local function experienceOperation(state, event)
+    local recipient = event.combatant
+    if type(recipient) ~= "number" or recipient % 1 ~= 0 or recipient < 1 then
+      return nil
+    end
+    local combatant = BattleState.combatant(state, recipient)
+    local active = combatant.active ~= nil
+    local subject = { combatant = recipient, activation = false }
+    if active then
+      local entry = combatant.active --[[@as table<string, unknown>]]
+      if type(entry.activation) ~= "number" then
+        return nil
+      end
+      subject = { combatant = recipient, activation = entry.activation }
+    end
+    local levelUps = event.levelUps
+    local segments = event.expSegments
+    if type(levelUps) ~= "table" or type(segments) ~= "table" then
+      return nil
+    end
+    local boundaries = {} ---@type table<integer, table<string, unknown>>
+    for index, crossing in ipairs(levelUps) do
+      if type(crossing) ~= "table" then
+        return nil
+      end
+      local level = (crossing --[[@as table<string, unknown>]]).level
+      if type(level) ~= "number" or level % 1 ~= 0 or level < 2 or level > 100 then
+        return nil
+      end
+      if type(segments[index]) ~= "table" then
+        return nil
+      end
+      boundaries[#boundaries + 1] = { fromLevel = level - 1, toLevel = level, expSegment = index }
+    end
+    return {
+      kind = "experience-awarded",
+      subject = subject,
+      source = { kind = "system", key = "experience" },
+      active = active,
+      boundaries = boundaries,
+    }
   end
 
   --- Publishes one reward-owner event through the session stream,
@@ -6394,9 +6795,20 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
       end
     end
     local defeated = child.defeated --[[@as table<string, unknown>]]
-    local emitted =
-      BattleContext.wrap(state)
-        :emit(event.kind --[[@as string]], { kind = "progression", combatant = defeated.combatant }, payload)
+    local facts = nil ---@type table<string, unknown>?
+    if event.kind == "exp" then
+      local operation = experienceOperation(state, event)
+      if operation ~= nil then
+        facts = { operation = operation }
+      end
+    end
+    local emitted = BattleContext.wrap(state):emit(
+      event.kind --[[@as string]],
+      { kind = "progression", combatant = defeated.combatant },
+      payload,
+      nil,
+      facts
+    )
     for key, value in pairs(payload) do
       emitted[key] = value
     end
@@ -6933,10 +7345,11 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
     local cause = intent.cause --[[@as table<string, unknown>]]
     local ordinal = intent.actionId --[[@as integer]]
     local reason = cause.key == "BATON_PASS" and "baton_pass" or "u_turn"
+    local readyEventSequence = (intent --[[@as table<string, unknown>]]).readyEventSequence
     state.pending = nil
     state.status = "running"
     local context = BattleContext.wrap(state)
-    executeSwitch(state, context, action, ordinal, cause, reason)
+    executeSwitch(state, context, action, ordinal, cause, reason, readyEventSequence)
     -- The post-switch after-move machine answers the newcomer first:
     -- a damaged reserve arriving with a pinch or status berry spends
     -- it before the turn resumes, mirroring the post-switch
@@ -7027,6 +7440,7 @@ local function bindTurnHandlers(executor, moveFacts, speciesFacts, itemFacts, ch
     settleEntryTiming = settleEntryTiming,
     settlePostReplacement = settlePostReplacement,
     shiftOfferFor = shiftOfferFor,
+    buildReplacementBatch = buildReplacementBatch,
   }
 end
 
@@ -7536,6 +7950,9 @@ function HgssSessionExecutor:_bindLifecycle()
   -- seam for commit-time replacement work outside the turn handlers.
   self._settleEntryTiming = turnHandlers.settleEntryTiming
   self._settlePostReplacement = turnHandlers.settlePostReplacement
+  -- Failed wild escapes retry switch-only through the same batch builder
+  -- the turn seam owns, preserving the encounter flight law there.
+  self._buildReplacementBatch = turnHandlers.buildReplacementBatch
   self._ruleset = ruleset
   ruleset:initialize(self)
 end
@@ -7620,8 +8037,10 @@ function HgssSessionExecutor:_commitReplacement(state)
   local submitted = pending.submitted --[[@as table<integer, table<string, unknown>>]]
   -- Index externally chosen arrivals by fainted combatant. Replies were
   -- validated on submit and suspension stages no intervening mechanics,
-  -- so every open obligation answers exactly once here.
+  -- so every open obligation answers exactly once here. Wild runners
+  -- divert to the escape attempt below instead of naming a reserve.
   local picks = {} ---@type table<integer, integer>
+  local runners = {} ---@type table<integer, table<string, unknown>>
   for _, request in ipairs(DecisionBatch.requests(state)) do
     local reply = submitted[
       request.requestId --[[@as integer]]
@@ -7635,11 +8054,23 @@ function HgssSessionExecutor:_commitReplacement(state)
       local payload = entry.payload --[[@as table<string, unknown>]]
       assert(picks[
         actor.combatant --[[@as integer]]
-      ] == nil, "replacements answer once per fainted entry")
-      picks[
+      ] == nil and runners[
         actor.combatant --[[@as integer]]
-      ] = payload.replacement --[[@as integer]]
+      ] == nil, "replacements answer once per fainted entry")
+      if entry.kind == "run" then
+        runners[
+          actor.combatant --[[@as integer]]
+        ] = actor
+      else
+        picks[
+          actor.combatant --[[@as integer]]
+        ] = payload.replacement --[[@as integer]]
+      end
     end
+  end
+  if next(runners) ~= nil then
+    self:_commitReplacementEscape(state, obligations, runners)
+    return
   end
   local claimed = {} ---@type table<integer, boolean>
   -- A batch that already carries a compulsory player entry settles
@@ -7719,12 +8150,108 @@ function HgssSessionExecutor:_commitReplacement(state)
   settleReplacements(state)
 end
 
+--- Commits a wild replacement batch where at least one fainted entry
+--- chose flight: one escape attempt settles the batch, matching retail
+--- ReplaceFainted (answering No to "Use next Pokemon?" tries escape
+--- before any reserve enters). Success emits the flight fact and ends
+--- the battle; failure records the attempt, emits the hold fact, and
+--- re-opens the same obligations switch-only without a second ask.
+---@param state table<string, unknown> live battle state under replacement commit
+---@param obligations table<integer, table<string, unknown>> ordered replacement obligations under commit
+---@param runners table<integer, table<string, unknown>> fainted actors that chose flight by combatant
+function HgssSessionExecutor:_commitReplacementEscape(state, obligations, runners)
+  local runnerId = nil
+  for _, obligation in ipairs(obligations) do
+    if
+      runners[
+        obligation.combatant --[[@as integer]]
+      ] ~= nil
+    then
+      runnerId = obligation.combatant --[[@as integer]]
+      break
+    end
+  end
+  assert(runnerId ~= nil, "wild escapes name their fainted runner")
+  local runner = BattleState.combatant(state, runnerId --[[@as integer]])
+  local player, enemy = stagedEscapeSpeeds(state, runner, self._speciesFacts)
+  -- Assured flight reads the fainted entry through the effective-ability
+  -- and effective-item readers, matching retail BattleTryRun
+  -- (GetBattlerAbility/GetBattlerHeldItemEffect on the fainted battler):
+  -- Run Away or a Smoke Ball leaves outright without a roll, while
+  -- Gastro Acid suppression, Klutz, and Embargo suppress the guarantee
+  -- exactly like the turn escape law. Trapping died with the faint, so
+  -- BattleTryRun applies without a trap check.
+  local assured = false
+  local runAwaySource = nil
+  local itemSource = nil
+  local Bridge = require("libs.battle.src.gen4.NativePassiveBridge")
+  local bridge = Bridge.wrap(state)
+  if
+    bridge:abilityOf(runnerId --[[@as integer]]) == "RUN_AWAY"
+  then
+    assured = true
+    runAwaySource = { kind = "ability", key = "RUN_AWAY" }
+  elseif
+    bridge:effectiveHeldItem(runnerId --[[@as integer]]) == "SMOKE_BALL"
+  then
+    assured = true
+    itemSource = { kind = "item", key = "SMOKE_BALL" }
+  end
+  local result = Escape.attempt({
+    battleKind = self._battleKind,
+    trapped = nil,
+    guaranteed = assured,
+    speeds = { player = player, enemy = enemy },
+    attempts = state.escapeAttempts,
+    stream = state.rng,
+  })
+  local context = BattleContext.wrap(state)
+  local runnerActor = runners[runnerId] --[[@as table<string, unknown>]]
+  if result.escaped == true then
+    local payload = {
+      combatant = runnerId,
+      activation = runnerActor.activation,
+      escaped = true,
+      reason = result.reason,
+      attempts = result.attempts,
+    } --[[@as table<string, unknown>]]
+    payload.escapeSource = itemSource or runAwaySource
+    context:emit("flee", { kind = "run", combatant = runnerId }, payload)
+    local frames = state.frames --[[@as table<integer, table<string, unknown>>]]
+    local roundFrame = frames[#frames]
+    assert(roundFrame ~= nil and roundFrame.kind == "round", "replacement escape closes its round frame")
+    frames[#frames] = nil
+    state.pending = nil
+    state.queue = {}
+    endBattleEarly(state, { kind = "escaped", rounds = state.round })
+    return
+  end
+  state.escapeAttempts = result.attempts
+  context:emit("flee", { kind = "run", combatant = runnerId }, {
+    combatant = runnerId,
+    activation = runnerActor.activation,
+    escaped = false,
+    reason = result.reason,
+    attempts = result.attempts,
+  })
+  local frames = state.frames --[[@as table<integer, table<string, unknown>>]]
+  local roundFrame = frames[#frames]
+  assert(roundFrame ~= nil and roundFrame.kind == "round", "a failed escape closes its round frame")
+  frames[#frames] = nil
+  state.pending = nil
+  state.queue = {}
+  local rebuild = self._buildReplacementBatch
+  assert(type(rebuild) == "function", "failed escapes retry through the replacement batch builder")
+  rebuild(state, obligations, false)
+end
+
 ---@param state table<string, unknown>
 ---@param replacement table<string, unknown> open replacement continuation
 ---@param choice table<string, unknown>
 ---@param staged table<string, unknown> reservation maps staged for the reply under admission
 ---@return table<string, unknown>? input error, or nil when the replacement binds
-local function checkReplacementBinding(state, replacement, choice, staged)
+---@param battleKind string wild-or-trainer encounter policy selecting flight law for replacement escapes
+local function checkReplacementBinding(state, replacement, choice, staged, battleKind)
   local actor = choice.actor --[[@as table<string, unknown>]]
   local payload = choice.payload --[[@as table<string, unknown>]]
   local obligations = replacement.obligations --[[@as table<integer, table<string, unknown>>]]
@@ -7740,6 +8267,20 @@ local function checkReplacementBinding(state, replacement, choice, staged)
   end
   if wanted == nil then
     return BattleErrors.input("replies must address exactly the requested entries", {})
+  end
+  if choice.kind == "run" then
+    -- Retail ReplaceFainted offers flight beside replacement in wild
+    -- battles (subscript_0231 asks "Use next Pokemon?" with No
+    -- attempting escape): the fainted entry may flee outright, ending
+    -- the battle, while trainer faints stay switch-only. Trapping died
+    -- with the faint, so BattleTryRun applies without a trap check.
+    if battleKind ~= "wild" then
+      return BattleErrors.input("flight refuses trainer battles", {})
+    end
+    if replacement.allowRun ~= true then
+      return BattleErrors.input("replacements answer with switches", {})
+    end
+    return nil
   end
   if choice.kind ~= "switch" then
     return BattleErrors.input("replacements answer with switches", {})
@@ -7942,7 +8483,13 @@ local function checkChoiceBinding(state, choice, admitted, battleKind, staged, m
     -- Replacement batches address fainted entries: the live-entry binding
     -- below cannot hold, so obligations bind instead. Stale pre-faint
     -- actions still fail here when they name no open obligation.
-    return checkReplacementBinding(state, openBatch.replacement --[[@as table<string, unknown>]], choice, staged)
+    return checkReplacementBinding(
+      state,
+      openBatch.replacement --[[@as table<string, unknown>]],
+      choice,
+      staged,
+      battleKind
+    )
   end
   if openBatch ~= nil and openBatch.shift ~= nil then
     -- Shift batches address the standing player entry for one optional
@@ -8829,6 +9376,18 @@ local function replacementActorOptions(state, actor, admitted, battleKind)
       nil,
       nil
     )
+  end
+  -- Retail ReplaceFainted offers flight beside the reserve picker in
+  -- wild battles (answering No to "Use next Pokemon?" attempts escape):
+  -- the run fragment rides the same replacement request so one reply
+  -- either replaces or flees. Trainer replacements stay switch-only.
+  if battleKind == "wild" and type(replacement) == "table" and replacement.allowRun == true then
+    local runChoice = {
+      actor = fragmentActor(actor),
+      kind = "run",
+      payload = {},
+    } --[[@as table<string, unknown>]]
+    choices[#choices + 1] = probedOption(state, runChoice, "run", "run", {}, admitted, battleKind, nil, nil)
   end
   return entry
 end

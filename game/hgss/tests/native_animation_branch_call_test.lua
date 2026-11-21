@@ -74,6 +74,9 @@ local function taskFactory(log)
     function task.stepSourceTick(_tick)
       task._steps = task._steps + 1
       log.steps[#log.steps + 1] = kind
+      if log.completeAfter ~= nil and log.completeAfter[kind] == #log.steps then
+        task._state = "complete"
+      end
     end
     function task.status()
       return task._state
@@ -120,7 +123,7 @@ local function playerModule()
   return Player
 end
 
-function T.branch_call_zero_wait_and_two_tasks_keep_their_normalized_form()
+function T.branch_call_zero_wait_and_terminal_reset_keep_their_normalized_form()
   local program = lowered("branch-call-form", {
     30,
     1,
@@ -189,12 +192,21 @@ function T.branch_call_zero_wait_and_two_tasks_keep_their_normalized_form()
     audio = audio,
     resources = resources,
     tasks = taskFactory(log),
+    services = { onNativeFrame = function() end },
   }))
   local handle = assert(player:start(playbackPacket(), program))
   local trace = {}
   local previous = nil
   for _ = 1, 60 do
     player:stepSourceTick({ tick = 1 })
+    -- The terminal reset drains the scheduled child before completing,
+    -- so the child finishes on its next step once it exists.
+    for _, kind in ipairs(log.created) do
+      log.completeAfter = log.completeAfter or {}
+      if log.completeAfter[kind] == nil then
+        log.completeAfter[kind] = #log.steps + 1
+      end
+    end
     local state = player:status(handle)
     if state ~= previous then
       trace[#trace + 1] = state
@@ -205,7 +217,7 @@ function T.branch_call_zero_wait_and_two_tasks_keep_their_normalized_form()
     end
   end
   Assert.equal(trace[#trace], "complete", "the branched program with its call block runs to completion")
-  Assert.equal(#log.created, 2, "both scheduled tasks are created in order")
+  Assert.equal(#log.created, 1, "the terminal reset ends the stream after the first schedule")
   Assert.equal(player:status(handle), "complete", "reaching the end state is stable")
 end
 

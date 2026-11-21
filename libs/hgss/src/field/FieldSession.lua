@@ -150,7 +150,7 @@ local MetatileBehavior = require("libs.hgss.src.world.MetatileBehavior")
 ---@field private fieldMoves FieldSession.FieldMoves? validated push/disembark port; absent sessions bump boulders
 ---@field private overworld table<string, unknown>|nil
 ---@field incomingCalls FieldSession.IncomingCalls? ambient incoming-call collaborator; absent sessions offer no phone opportunity
----@field private acceptedAmbientCallHandle table<string, unknown>? private incoming call handle owned by this field session
+---@field private fieldCallHandle table<string, unknown>? private foreground call handle this field session steps and releases
 ---@field childResumePending boolean
 ---@field battleActive boolean whether an application battle owns player input
 ---@field foregroundHold boolean whether a presented battle holds field gameplay advancement
@@ -229,6 +229,8 @@ end
 ---@field entranceInput { map: RuntimeFieldMap, player: FieldPlayer, transition: { ownsField: boolean } }
 ---@field coordinateProbe { fieldX: integer, fieldZ: integer, facing: string }
 ---@field terrainResponseInput table<string, unknown>
+---@field terrainOwners table<string, { fieldX: integer, fieldZ: integer, facing: string }>
+---@field terrainOwnerRecords table<string, { fieldX: integer, fieldZ: integer, facing: string }>
 ---@field playerPresentation { locomotionActive: boolean, gesturePose: string?, gestureTick: integer?, gestureOffsetY: number, ordinaryStepSpeed: ("normal"|"run")?, scriptedPoseDelta: integer? }
 ---@field carriedMovementInput table<string, unknown>
 ---@field heldMovementInput table<string, unknown>
@@ -256,6 +258,8 @@ local function newTickScratch(actorLocked)
     cameraTarget = { x = 0, y = 0, z = 0 },
     entranceInput = { map = nil, player = nil, transition = { ownsField = false } },
     coordinateProbe = { fieldX = 0, fieldZ = 0, facing = "south" },
+    terrainOwners = {},
+    terrainOwnerRecords = {},
     terrainResponseInput = {
       committed = true,
       destination = {
@@ -503,6 +507,11 @@ function FieldSession.new(options)
       autoAcknowledgePresentation = options.autoAcknowledgePresentation == true,
     }),
     childResumePending = false,
+    -- A map entry that lands the player on a terrain tile (tall grass)
+    -- owes the standing tile's overlay: committed steps emit it, but the
+    -- entry itself completes without one. The flag arms on every entry
+    -- begin and clears on the first emission after the entry settles.
+    _entryTerrainPending = false,
     battleActive = false,
     foregroundHold = false,
     _committedStepSerial = 0,
@@ -513,7 +522,7 @@ function FieldSession.new(options)
     incomingCalls = options.incomingCalls,
     pokegearApplications = options.pokegearApplications,
     easyChatScriptHost = options.easyChatScriptHost,
-    acceptedAmbientCallHandle = nil,
+    fieldCallHandle = nil,
     tick = 0,
     accumulator = 0,
     _boundaryMovementDirection = nil,
@@ -536,32 +545,34 @@ function FieldSession:beginMapEntry()
   end
   self:validateSurfSpawn()
   self.mapEntryController:begin("full")
+  self._entryTerrainPending = true
 end
 
--- Cancels only the incoming-call handle admitted by this session. Scripted
--- Pokegear tasks remain owned by their scheduler and never enter this lane.
+-- Cancels only the foreground call handle this session opened (an
+-- answered ring or a forced source trigger). Scripted Pokegear tasks
+-- remain owned by their scheduler and never enter this lane.
 ---@param self FieldSession
 ---@param reason string
-function FieldSession:_cancelAmbientCall(reason)
-  local handle = self.acceptedAmbientCallHandle
+function FieldSession:_cancelFieldCall(reason)
+  local handle = self.fieldCallHandle
   if handle == nil then
     return
   end
-  local host = assert(self.pokegearApplications, "an accepted ambient call keeps its composed host")
+  local host = assert(self.pokegearApplications, "an owned field call keeps its composed host")
   local activeHandle = host:activeHandle()
   if activeHandle == handle then
     host:cancel(reason)
   elseif activeHandle == nil then
     host:close(handle)
   end
-  self.acceptedAmbientCallHandle = nil
+  self.fieldCallHandle = nil
   self.input:clearUi()
 end
 
 -- Releases the session-owned call before FieldRuntime disposes the shared
 -- phone host. The host's cancel operation releases the feature lease once.
 function FieldSession:dispose()
-  self:_cancelAmbientCall("field-session-disposed")
+  self:_cancelFieldCall("field-session-disposed")
 end
 
 -- A surfing avatar must stand on surfable water: an old save, warp, or
@@ -740,7 +751,7 @@ function FieldSession:_phoneClaimed()
   if hostModal(self.martHost) or hostModal(self.monNaming) or hostModal(self.pcApplications) then
     return true
   end
-  if hostModal(self.pokegearApplications) or self.acceptedAmbientCallHandle ~= nil then
+  if hostModal(self.pokegearApplications) or self.fieldCallHandle ~= nil then
     return true
   end
   local easyChatHost = self.easyChatScriptHost
@@ -754,9 +765,11 @@ function FieldSession:_phoneClaimed()
 end
 
 -- Offers one phone opportunity to the ambient incoming-call collaborator:
--- a claimed tick clears only transient ring state, a settled tick
--- evaluates. Mid-step ticks offer nothing so the banner never interrupts
--- motion. Absent collaborators cost nothing.
+-- a claimed tick quiets the line, a settled tick evaluates. Mid-step ticks
+-- offer nothing so the banner never interrupts motion. Absent
+-- collaborators cost nothing. A forced source trigger answers itself: the
+-- collaborator stages its caller and starts the source scene script, which
+-- then owns the field until the call returns.
 ---@param self FieldSession
 ---@param claimed boolean
 local function offerPhoneOpportunity(self, claimed)
@@ -776,11 +789,12 @@ end
 -- The idle-boundary gate for the Start Menu open edge: the menu may open
 -- only at a settled field boundary -- player idle, transition idle, no
 -- dialogue/signpost/script menu/context choice, no active foreground
--- script owner and no explicit player input lock. Any non-idle player
--- motion means "not idle"; the active application branch above has already
--- returned before this code runs.
+-- script owner, no script-owned companion call, and no explicit player
+-- input lock. Any non-idle player motion means "not idle"; the active
+-- application branch above has already returned before this code runs.
 ---@return boolean
 local function canOpenStartMenu(self)
+  local pokegearBusy = self.pokegearApplications ~= nil and self.pokegearApplications:isActive()
   return self.player.motion == "idle"
     and self.transition.phase == FieldTransition.PHASES.idle
     and not self.dialogue:isModal()
@@ -789,6 +803,7 @@ local function canOpenStartMenu(self)
     and not self.contextChoice:isActive()
     and not isForegroundActive(self.scriptScheduler)
     and not isPlayerInputOwned(self.scriptScheduler)
+    and not pokegearBusy
     and not self.battleActive
 end
 
@@ -799,6 +814,101 @@ function FieldSession:_advanceTick()
   entranceInput.transition.ownsField = self.transition.phase == FieldTransition.PHASES.idle
   self.fieldEntranceIndicator:updateFixed(entranceInput)
   self.tick = self.tick + 1
+end
+
+-- Every live object on the actor world's current map owns the held effect it
+-- stepped into, plus the player. Reuses one owner record per actor across
+-- ticks so a stationary field allocates nothing.
+---@param self FieldSession
+---@return table<string, { fieldX: integer, fieldZ: integer, facing: string }>
+function FieldSession:_collectTerrainOwners()
+  local owners = self._tickScratch.terrainOwners
+  for key in pairs(owners) do
+    owners[key] = nil
+  end
+  local playerOwner = self._tickScratch.terrainInput
+  playerOwner.fieldX = self.player.fieldX
+  playerOwner.fieldZ = self.player.fieldZ
+  playerOwner.facing = self.player.facing
+  owners.player = playerOwner
+  local mapId = self.actors.currentMapId
+  if mapId == nil then
+    return owners
+  end
+  local records = self._tickScratch.terrainOwnerRecords
+  for _, actor in ipairs(self.actors:actorsOf(mapId)) do
+    local record = records[actor.actorId]
+    if record == nil then
+      record = { fieldX = 0, fieldZ = 0, facing = "south" }
+      records[actor.actorId] = record
+    end
+    local position = actor:getFieldPosition()
+    record.fieldX = position.fieldX
+    record.fieldZ = position.fieldZ
+    record.facing = actor.facing
+    owners[actor.actorId] = record
+  end
+  for actorId in pairs(records) do
+    if owners[actorId] == nil then
+      records[actorId] = nil
+    end
+  end
+  return owners
+end
+
+-- Publish one committed tile step as that stepping object's source terrain
+-- responses at its own tile (MapObject_SpawnStepStartEffects), including the
+-- tile behind a large east/west-facing follower.
+---@param step { fieldX: integer, fieldZ: integer, worldY: number, facing: string, cellKey: string?, sourceSurfaceId: integer?, large: boolean? }
+---@param ownerKey string
+function FieldSession:_emitStepResponses(step, ownerKey)
+  if self.terrainEffects == nil or self.currentMap.collision == nil then
+    return
+  end
+  local responses = require("libs.hgss.src.world.FieldTerrainResponse").resolveActorStep({
+    map = self.currentMap,
+    fieldX = step.fieldX,
+    fieldZ = step.fieldZ,
+    worldY = step.worldY,
+    facing = step.facing,
+    cellKey = step.cellKey,
+    sourceSurfaceId = step.sourceSurfaceId,
+    large = step.large,
+  })
+  for _, response in ipairs(responses) do
+    response.ownerKey = ownerKey
+  end
+  self.terrainEffects:emitAll(responses)
+end
+
+-- Publish every map-object tile step committed since the previous drain. An
+-- invisible object spawns no presentation response (the source hides its
+-- billboard); the effect otherwise belongs to the object that stepped, so it
+-- holds and releases on that object's own displacement. The composition calls
+-- this again after its own post-session actor reconciliation; the drain is
+-- idempotent.
+function FieldSession:emitCommittedActorSteps()
+  local steps = self.actors:takeCommittedSteps()
+  if steps == nil then
+    return
+  end
+  for _, step in ipairs(steps) do
+    if step.visible then
+      self:_emitStepResponses(step, step.actorId)
+    end
+  end
+end
+
+-- Publish every player tile step this tick. Ordinary input steps, jumps,
+-- planned traversal, and scripted walks all reach this one owner.
+function FieldSession:_emitCommittedPlayerSteps()
+  local steps = self.player:takeCommittedTerrainSteps()
+  if steps == nil then
+    return
+  end
+  for _, step in ipairs(steps) do
+    self:_emitStepResponses(step, "player")
+  end
 end
 
 function FieldSession:_emitTerrainResponse()
@@ -825,6 +935,9 @@ function FieldSession:_emitTerrainResponse()
   destination.cellKey = self.player.committedSourceCellKey
   destination.sourceSurfaceId = self.player.committedSourceSurfaceId
   local responses = require("libs.hgss.src.world.FieldTerrainResponse").resolve(terrainResponseInput)
+  for _, response in ipairs(responses) do
+    response.ownerKey = "player"
+  end
   self.terrainEffects:emitAll(responses)
 end
 
@@ -957,6 +1070,17 @@ local function finishTick(self)
   return TICK_CONSUMED
 end
 
+-- Emits the standing tile's terrain overlay once the pending map entry
+-- settles: a completed entry never steps, so without this the player
+-- loads standing on tall grass instead of in it. Still-active entries
+-- (blocked advances) and already-served entries are no-ops.
+local function refreshEntryTerrain(self)
+  if self._entryTerrainPending and not self.mapEntryController:isActive() then
+    self._entryTerrainPending = false
+    self:_emitTerrainResponse()
+  end
+end
+
 ---@param self FieldSession
 ---@return FieldTickOutcome
 local function advancePreSchedulerBoundary(self)
@@ -964,6 +1088,7 @@ local function advancePreSchedulerBoundary(self)
     if self.mapEntryController:advance(self.tick + 1) then
       return finishTick(self)
     end
+    refreshEntryTerrain(self)
   elseif self.childResumePending and foregroundEnvironmentId(self.scriptScheduler) == nil then
     self.childResumePending = false
     -- The resume tick is consumed only when a map on_resume lifecycle
@@ -991,6 +1116,7 @@ local function advancePostSchedulerBoundary(self)
     if self.mapEntryController:advance(self.tick + 1) or self.mapEntryController:isActive() then
       return finishTick(self)
     end
+    refreshEntryTerrain(self)
   end
   if self.mapEntryController:takeConnectionArrival() then
     local arrivalIntent = resolveCoordinate(self)
@@ -1260,11 +1386,11 @@ function FieldSession:updateFixed(inputSnapshot)
   local carriedBoundaryDirection = self._boundaryMovementDirection
   self._boundaryMovementDirection = nil
   if self.terrainEffects then
-    local terrainInput = self._tickScratch.terrainInput
-    terrainInput.fieldX = self.player.fieldX
-    terrainInput.fieldZ = self.player.fieldZ
-    terrainInput.facing = self.player.facing
-    self.terrainEffects:updateFixed(terrainInput)
+    -- The effect clock advances with every live owner: the player and every
+    -- object on the current actor map. Each effect remembers the object that
+    -- stepped into it, so held grass releases on that object's own
+    -- displacement instead of on the player's.
+    self.terrainEffects:updateFixed(self:_collectTerrainOwners())
   end
   -- The door/stair choreography drives the player during the locked
   -- transition: the pose clock hears the locomotion state at tick start, the
@@ -1280,8 +1406,8 @@ function FieldSession:updateFixed(inputSnapshot)
     transitionInput = nil -- the map-entry script, not the preview, owns A
   end
   local playerAdvanced = self.transition:updateFixed(transitionInput)
-  if self.acceptedAmbientCallHandle ~= nil and self.transition.phase ~= FieldTransition.PHASES.idle then
-    self:_cancelAmbientCall("field-transition-started")
+  if self.fieldCallHandle ~= nil and self.transition.phase ~= FieldTransition.PHASES.idle then
+    self:_cancelFieldCall("field-transition-started")
   end
   if self.transition.locked or self.transition.completed then
     if not playerAdvanced and self.player.motion == "idle" then
@@ -1318,20 +1444,20 @@ function FieldSession:updateFixed(inputSnapshot)
     return
   end
 
-  local ambientCallHandle = self.acceptedAmbientCallHandle
-  if ambientCallHandle ~= nil then
-    local host = assert(self.pokegearApplications, "an accepted ambient call keeps its composed host")
+  local callHandle = self.fieldCallHandle
+  if callHandle ~= nil then
+    local host = assert(self.pokegearApplications, "an owned field call keeps its composed host")
     local activeHostHandle = host:activeHandle()
-    if activeHostHandle ~= nil and activeHostHandle ~= ambientCallHandle then
-      self.acceptedAmbientCallHandle = nil
+    if activeHostHandle ~= nil and activeHostHandle ~= callHandle then
+      self.fieldCallHandle = nil
       self.input:clearUi()
     else
-      if activeHostHandle == ambientCallHandle then
-        host:step(ambientCallHandle, self.input:uiSnapshot(self.tick + 1))
+      if activeHostHandle == callHandle then
+        host:step(callHandle, self.input:uiSnapshot(self.tick + 1))
       end
-      if host:result(ambientCallHandle) ~= nil then
-        host:close(ambientCallHandle)
-        self.acceptedAmbientCallHandle = nil
+      if host:result(callHandle) ~= nil then
+        host:close(callHandle)
+        self.fieldCallHandle = nil
         self.input:clearUi()
       end
     end
@@ -1436,6 +1562,10 @@ function FieldSession:updateFixed(inputSnapshot)
   local scriptedLocomotionAtTickStart =
     self.player:presentationStateInto(self._tickScratch.playerPresentation).locomotionActive
   local playerInputOwnedAtTickStart, modalInputOwnedAtTickStart = runScriptPhase(self, inputSnapshot)
+  -- A scripted walk commits during the script phase, before the ordinary
+  -- update: publish its step before any higher-priority owner can claim the
+  -- tick and return early.
+  self:_emitCommittedPlayerSteps()
   if advancePostSchedulerBoundary(self) == TICK_CONSUMED then
     return
   end
@@ -1454,20 +1584,23 @@ function FieldSession:updateFixed(inputSnapshot)
     or playerInputOwnedAfterScheduler
     or self.battleActive
     or modalInputOwnedAtTickStart
-
   -- Start Menu arbitration: a pending script reopen request (opcode 61's
-  -- startMenuReopen service) opens the menu unconditionally at this point,
-  -- then the menu edge is gated by the idle-boundary check (checked after
-  -- the single script-scheduler step established the field lock state,
-  -- before actor stepping, interaction resolution, warps, or player
-  -- movement). The host's boolean answers "did the open consume this tick?":
-  -- true for a successful open and for a fatal composition failure (the
-  -- host has entered its terminal failed state, which must freeze the rest
-  -- of this tick); false means the menu is unavailable and the field
-  -- continues stepping normally. This arbitration freezes world
-  -- presentation (actors, player, camera) on its tick, so it runs before
-  -- the actor step.
-  if self.applicationHost:takeReopen(self.tick + 1) then
+  -- startMenuReopen service) opens the menu at this point, then the menu
+  -- edge is gated by the idle-boundary check (checked after the single
+  -- script-scheduler step established the field lock state, before actor
+  -- stepping, interaction resolution, warps, or player movement). The host's
+  -- boolean answers "did the open consume this tick?": true for a successful
+  -- open and for a fatal composition failure (the host has entered its
+  -- terminal failed state, which must freeze the rest of this tick); false
+  -- means the menu is unavailable and the field continues stepping normally.
+  -- This arbitration freezes world presentation (actors, player, camera) on
+  -- its tick, so it runs before the actor step. The source samples the menu
+  -- edge only on a settled avatar (FieldInput_Update, field_control.c:121-171,
+  -- admits PLAYER_MOVE_STATE_END/NONE), so an edge read while the player's own
+  -- step or turn is in flight dies with its tick: canOpenStartMenu rejects it
+  -- and nothing is retained for the settle tick. The player presses again once
+  -- settled.
+  if self.player.motion == "idle" and self.applicationHost:takeReopen(self.tick + 1) then
     self:_advanceTick()
     return
   end
@@ -1501,9 +1634,9 @@ function FieldSession:updateFixed(inputSnapshot)
     and self.incomingCalls:notification() ~= false
   then
     assert(self.pokegearApplications, "incoming calls require the composed companion host")
-    self.acceptedAmbientCallHandle = self.incomingCalls:accept("field:incoming")
+    self.fieldCallHandle = self.incomingCalls:accept("field:incoming")
     assert(
-      self.pokegearApplications:activeHandle() == self.acceptedAmbientCallHandle,
+      self.pokegearApplications:activeHandle() == self.fieldCallHandle,
       "accepted incoming call handle belongs to the composed companion host"
     )
     self.input:beginUi(self.tick + 1)
@@ -1523,6 +1656,7 @@ function FieldSession:updateFixed(inputSnapshot)
   actorContext.autonomousLocked = self.scriptScheduler:autonomousActorsLocked()
   actorContext.playerCandidates = self.player:collisionCandidatesInto(self._tickScratch.collisionCandidates)
   self.actors:step(self.tick + 1, actorContext)
+  self:emitCommittedActorSteps()
 
   if self.childResumePending then
     self:_advanceTick()
@@ -1531,7 +1665,12 @@ function FieldSession:updateFixed(inputSnapshot)
 
   if self.initController and self.initController.startLifecycle then
     local evaluateFrame = self.initController.evaluateFrame
-    if evaluateFrame and evaluateFrame(self.initController, self.tick + 1) then
+    -- On-frame map scripts start only on a settled player boundary. A script
+    -- that took the field mid-step would freeze the unfinished step (its
+    -- follower trail included) and could then never move a player that is
+    -- still physically walking. The next step boundary always offers the rule
+    -- again, because the committed tile ends its tick with an idle motion.
+    if evaluateFrame and self.player.motion == "idle" and evaluateFrame(self.initController, self.tick + 1) then
       self:_advanceTick()
       return
     end
@@ -1673,9 +1812,10 @@ function FieldSession:updateFixed(inputSnapshot)
 
   -- The pose clock treats a tick as locomoting if the player was locomoting at either
   -- end of it, so the gait phase carries across the tile commit instead of
-  -- restarting on every arrival (the ROM's walk range spans two tiles).
+  -- restarting on every arrival (the ROM's walk range spans two tiles). The
+  -- pre-scheduler capture is the true tick-start half: a script phase that
+  -- commits its scripted action must not make the arrival tick look idle.
   local ordinaryPresentation = self.player:presentationStateInto(self._tickScratch.playerPresentation)
-  local ordinaryLocomotionAtTickStart = ordinaryPresentation.locomotionActive
   local ordinaryStepSpeedAtTickStart = ordinaryPresentation.ordinaryStepSpeed
 
   local movementInput = inputSnapshot
@@ -1805,7 +1945,7 @@ function FieldSession:updateFixed(inputSnapshot)
         self.mapEntryController:begin("connection")
       end
     end
-    self:_emitTerrainResponse()
+    self:_emitCommittedPlayerSteps()
     if self.audio and not zoneChanged then
       self.audio:updateField()
     end
@@ -1853,13 +1993,13 @@ function FieldSession:updateFixed(inputSnapshot)
   -- Pose clocks advance only on a tick that could change the world, so a fade or
   -- a locked transition freezes animation instead of walking it in place.
   if self.playerVisual then
-    self.playerVisual:updateFixed(ordinaryLocomotionAtTickStart, ordinaryStepSpeedAtTickStart)
+    self.playerVisual:updateFixed(scriptedLocomotionAtTickStart, ordinaryStepSpeedAtTickStart)
   end
   self.camera:updateFixed(cameraTargetInto(self))
   -- The ambient phone opportunity lives at this settled boundary, after
   -- every higher-priority owner declined the tick by falling through.
-  -- A claimed tick clears only transient ring state; a settled idle tick
-  -- evaluates. Ticks that moved the player offer nothing.
+  -- A claimed tick quiets the line; a settled idle tick evaluates. Ticks
+  -- that moved the player offer nothing.
   if self.incomingCalls ~= nil and self.player.motion == "idle" then
     offerPhoneOpportunity(self, self:_phoneClaimed())
   end

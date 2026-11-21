@@ -320,6 +320,10 @@ local function buildDoubles(sink, calls)
     ["libs.hgss.src.ui.MailboxRenderer"] = {
       new = function(_)
         local renderer = releasable(calls, "mailbox")
+        function renderer:prepare(_)
+          calls.mailboxPrepares = (calls.mailboxPrepares or 0) + 1
+          return true
+        end
         function renderer:drawMailPane(view, paneId, _)
           calls.mailPanes = calls.mailPanes or {}
           calls.mailPanes[#calls.mailPanes + 1] = { view = view, pane = paneId }
@@ -619,6 +623,83 @@ function T.pokemon_routes_only_to_the_party_presenter()
   end
 end
 
+-- The Party menu's Mail read and confirmation leaves are Mailbox
+-- surfaces: their plan draws through the borrowed host bag the Mailbox
+-- renderer needs.
+function T.party_mail_leaves_present_the_fitted_mailbox_surface()
+  local sink, calls = {}, {}
+  local savedLove = rawget(_G, "love")
+  local graphics = require("tests.support.FakeGraphics").new({})
+  rawset(_G, "love", { graphics = graphics })
+  local ok, err = pcall(function()
+    withProductionComposition(sink, calls, compositionRuntime(), function(resources)
+      local drawn = 0
+      local plan
+      plan = {
+        panes = {},
+        frames = {},
+        content = { mode = "read" },
+        inputKey = "mailbox",
+        render = function(borrowed, view, drawing)
+          Assert.isTrue(borrowed.graphics == graphics, "the Mail leaf borrows the host graphics namespace")
+          Assert.isTrue(borrowed.mailboxRenderer == resources.mailboxRenderer, "the Mail leaf borrows its renderer")
+          Assert.isTrue(borrowed.textRenderer == resources.textRenderer, "the Mail leaf borrows the text renderer")
+          Assert.isTrue(
+            borrowed.monIconProvider == resources.monIconProvider,
+            "the Mail leaf borrows the icon provider"
+          )
+          Assert.isTrue(borrowed.itemIconProvider == resources.itemIconProvider, "the Mail list borrows item icons")
+          Assert.isTrue(borrowed.windowRenderer == resources.windowRenderer, "the Mail prompts borrow the window")
+          Assert.notNil(borrowed.mailViewGeometry, "the Mail letter borrows the source MailView geometry")
+          Assert.notNil(borrowed.applicationFrameIndex, "the Mail prompts borrow the selected frame")
+          Assert.isTrue(drawing == plan, "the Mail leaf draws its own published plan")
+          drawn = drawn + 1
+        end,
+        mapInput = function()
+          return nil
+        end,
+      }
+      resources:drawApplication(FieldApplicationIds.POKEMON, { presentation = plan }, drawRuntime())
+      Assert.equal(drawn, 1, "the Party Mail leaf draws through the mailbox plan once")
+      resources:dispose()
+    end)
+  end)
+  rawset(_G, "love", savedLove)
+  if not ok then
+    error(err, 0)
+  end
+end
+
+-- A parked give-target picker owns the screen, so Mailbox preparation keeps
+-- only the list chrome hot: it never polls the list's empty icon demand over
+-- the pages the picker adopted, and the list resumes its own icons after the
+-- picker closes.
+function T.mailbox_picker_preparation_keeps_list_chrome_without_icon_demand()
+  local sink, calls = {}, {}
+  withProductionComposition(sink, calls, compositionRuntime(), function(resources)
+    local parked = { app = "mailbox", phase = "picker", rows = {}, visibleSlots = {} }
+    local ready, failure = resources:preparePcApplication(parked, { monCatalog = {} })
+    Assert.isTrue(ready, "the parked picker keeps the list chrome ready")
+    Assert.isNil(failure, "the parked picker reports no failure")
+    Assert.equal(calls.mailboxPrepares, 1, "the parked picker prepares the mailbox renderer")
+    Assert.isNil(calls.iconPrepareCalls, "the parked picker demands no list icon pages")
+
+    local browsing = {
+      app = "mailbox",
+      phase = "list",
+      rows = {},
+      visibleSlots = {},
+      icons = { { iconKey = "CHIKORITA/f0" } },
+    }
+    ready, failure = resources:preparePcApplication(browsing, { monCatalog = {} })
+    Assert.isTrue(ready, "the resumed list is ready")
+    Assert.isNil(failure, "the resumed list reports no failure")
+    Assert.equal(calls.iconPrepareCalls, 1, "the list demands its own icon pages again")
+    Assert.deepEqual(calls.iconKeys, { "CHIKORITA/f0" }, "the list demands exactly the icons it draws")
+    resources:dispose()
+  end)
+end
+
 function T.script_party_draw_reuses_the_pokemon_presenter_without_stepping()
   local sink, calls = {}, {}
   local savedLove = rawget(_G, "love")
@@ -696,29 +777,29 @@ function T.mon_naming_renderer_is_prepared_lazily_and_borrows_shared_mon_icons()
       Assert.isNil(calls.iconQuadCount, "ordinary field construction does not acquire naming quads")
 
       calls.iconPageReady = false
-      local ready, failure = resources:prepareMonNamingSubject({ iconKey = "species:1:form:0" })
+      local ready, failure = resources:prepareMonNamingSubject({ kind = "pokemon", iconKey = "species:1:form:0" })
       Assert.isFalse(ready, "pending mon icon pages keep naming preparation pending")
       Assert.isNil(failure, "pending mon icon pages have no failure")
       Assert.isNil(calls.namingConstructed, "pending preparation creates no naming renderer")
       Assert.isNil(calls.iconQuadCount, "pending preparation creates no icon quads")
 
       calls.iconPageFailure = "page failed"
-      ready, failure = resources:prepareMonNamingSubject({ iconKey = "species:1:form:0" })
+      ready, failure = resources:prepareMonNamingSubject({ kind = "pokemon", iconKey = "species:1:form:0" })
       Assert.isFalse(ready, "failed mon icon pages do not prepare naming")
       Assert.equal(failure, "page failed", "provider failure is returned unchanged")
       Assert.isNil(calls.namingConstructed, "failed preparation creates no naming renderer")
       Assert.isNil(calls.iconQuadCount, "failed preparation creates no icon quads")
 
       calls.iconPageReady = true
-      ready, failure = resources:prepareMonNamingSubject({ iconKey = "species:1:form:0" })
+      ready, failure = resources:prepareMonNamingSubject({ kind = "pokemon", iconKey = "species:1:form:0" })
       Assert.isTrue(ready, "a ready icon page prepares naming")
       Assert.isNil(failure, "ready preparation has no failure")
       Assert.equal(calls.namingConstructed, 1, "first ready preparation creates naming renderer once")
       Assert.equal(calls.iconDimensions, "species:1:form:0", "the naming subject resolves through shared mon icons")
       resources:monNamingRenderer()
       Assert.equal(calls.namingConstructed, 1, "the renderer accessor is a pure read")
-      resources:prepareMonNamingSubject({ iconKey = "species:1:form:0" })
-      resources:prepareMonNamingSubject({ iconKey = "species:2:form:0" })
+      resources:prepareMonNamingSubject({ kind = "pokemon", iconKey = "species:1:form:0" })
+      resources:prepareMonNamingSubject({ kind = "pokemon", iconKey = "species:2:form:0" })
       Assert.equal(calls.namingConstructed, 1, "repeated and new icon demands reuse the renderer")
       Assert.equal(calls.iconQuadCount, 2, "each icon key prepares its borrowed semantic quad")
       local drawCalls = {}
@@ -726,11 +807,19 @@ function T.mon_naming_renderer_is_prepared_lazily_and_borrows_shared_mon_icons()
         draw = function(image, quad, x, y, rotation, scaleX, scaleY)
           drawCalls[#drawCalls + 1] = { image, quad, x, y, rotation, scaleX, scaleY }
         end,
-      }, { iconKey = "species:1:form:0" }, { x = 24, y = 8, frameIndex = 1 })
+      }, { kind = "pokemon", iconKey = "species:1:form:0" }, { x = 24, y = 8, frameIndex = 1 })
       Assert.equal(calls.iconImage, 1, "the semantic part draws the shared provider image")
       Assert.equal(#drawCalls, 1, "the naming subject draws one semantic placement")
       Assert.equal(drawCalls[1][1], "borrowed-icon-image", "the icon image comes from the shared provider")
       Assert.isNil(calls.icons, "using the naming renderer never releases the borrowed icon provider")
+
+      local demandCount = assert(calls.iconPrepareCalls)
+      local rivalReady, rivalFailure = resources:prepareMonNamingSubject({ kind = "rival" })
+      Assert.isTrue(rivalReady, "the rival screen prepares without a mon icon")
+      Assert.isNil(rivalFailure, "the rival screen preparation has no failure")
+      Assert.equal(calls.iconPrepareCalls, demandCount, "the rival screen demands no mon icon pages")
+      Assert.equal(calls.namingConstructed, 1, "the rival screen reuses the shared naming renderer")
+      Assert.equal(calls.iconQuadCount, 2, "the rival screen demands no mon icon quads")
 
       resources:dispose()
       Assert.equal(calls.namingDisposed, 1, "field resources dispose their naming renderer once")
@@ -2353,6 +2442,7 @@ local function transitionPreparation(icons, renderer)
     storageRenderer = renderer,
     mailboxRenderer = {},
     photoAlbumRenderer = {},
+    partyScreenRenderer = {},
     textRenderer = {},
     windowRenderer = {},
     bagRenderer = {},

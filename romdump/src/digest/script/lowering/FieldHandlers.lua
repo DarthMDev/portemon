@@ -9,26 +9,10 @@ local Errors = require("libs.errors.src.Errors")
 local HgssObjectMovement = require("romdump.src.digest.field.HgssObjectMovement")
 local FieldMoveSources = require("romdump.src.config.FieldMoveSources")
 
--- Field-only operand normalization follows the pinned field direction table,
--- message-symbol format, and scrcmd.h actor specials.
-local ACTOR_REFERENCES = {
-  directionByCode = { [0] = "north", [1] = "south", [2] = "west", [3] = "east" },
-  stringSpecials = { obj_player = "player", obj_partner_poke = "partner" },
-  numericSpecials = {
-    [255] = "player",
-    [253] = "partner",
-    [241] = "camera_target",
-  },
-}
-
-local function normalizeFacing(value)
-  if type(value) ~= "number" then
-    return value
-  end
-  local direction = ACTOR_REFERENCES.directionByCode[value]
-  assert(direction ~= nil, "unknown direction code " .. tostring(value))
-  return direction
-end
+-- Field-only message-symbol normalization; actor references and directions
+-- come from the shared source-operand leaf.
+local actorRef = Operands.actorRef
+local directionRef = Operands.directionRef
 
 local function messageRef(symbol)
   if type(symbol) ~= "string" then
@@ -39,34 +23,6 @@ local function messageRef(symbol)
     return symbol
   end
   return string.format("msg.hgss.%04d.%05d", tonumber(bank), tonumber(index))
-end
-
-local function actorRef(value)
-  local raw = Operands.operandValue(value)
-  local special
-  if type(raw) == "number" then
-    special = ACTOR_REFERENCES.numericSpecials[raw]
-  elseif type(raw) == "string" then
-    special = ACTOR_REFERENCES.stringSpecials[raw]
-  end
-  if special ~= nil then
-    return { ref = "actor", special = special }
-  end
-  if type(raw) == "string" then
-    if raw == "VAR_SPECIAL_LAST_TALKED" then
-      -- The engine's last-interacted object variable spells the trigger's
-      -- own actor: object commands read it through ScriptGetVar, so the
-      -- decoded variable lowers to the semantic special instead of a
-      -- literal id no live actor carries. (FieldScriptSymbols pins
-      -- VAR_SPECIAL_LAST_TALKED to 0x800D; the decoder emits the name.)
-      return { ref = "actor", special = "last_talked" }
-    end
-    if raw:match("^VAR_") then
-      return { ref = "actor", mapIndex = { id = raw, value = "var" } }
-    end
-    return { ref = "actor", id = raw }
-  end
-  return { ref = "actor", mapIndex = raw }
 end
 
 local function movementFor(movementLabel, memberIr, _)
@@ -229,7 +185,7 @@ local function waitSignpost(ins)
 end
 
 local function requestStartMenu()
-  -- ScrCmd_061 (std_signpost's hide-branch tail): no operands; installs
+  -- ScrCmd_ReopenStartMenuOnEnd (std_signpost's hide-branch tail): no operands; installs
   -- the Start Menu reopen end callback and returns FALSE, ending the
   -- script context. The runtime request_start_menu handler routes the
   -- reopen request through the startMenuReopen service and stops.
@@ -313,10 +269,11 @@ local function genderedMessage(ins)
 end
 
 local function yieldFollowerCheck()
-  -- ScrCmd_609 settles/updates the active follower and yields one scheduler
-  -- tick; the controller settles through the normal fixed-tick update during
-  -- the yield, with or without an installed partner.
-  return { op = "yield_tick" }
+  -- ScrCmd_FollowMonResetMovement resets the follower trail state
+  -- and yields one scheduler tick (the source TRUE return). The runtime
+  -- owns both the reset and the yield so the verifier sees one
+  -- yield-boundary node for the yield-classified instruction.
+  return { op = "follower_reset_movement" }
 end
 
 -- ScrCmd_SetAvatarBits (188): fully supported masks queue one semantic
@@ -360,7 +317,7 @@ end
 -- Opcode 604 selects one of the three persistent follower map-object
 -- movement modes; raw selectors never reach the generated boundary.
 local function followerPartnerState(ins)
-  -- ScrCmd_596 writes the partner-state query into its result variable.
+  -- ScrCmd_FollowMonIsLarge writes the partner-state query into its result variable.
   return { op = "follower_partner_state", result = Operands.varRef(ins.operands[1]) }
 end
 
@@ -434,7 +391,7 @@ local function followerInteract(_)
 end
 
 local function followerIsActive(ins)
-  -- ScrCmd_729 writes the live active-state query into its result variable.
+  -- ScrCmd_FollowMonIsActive writes the live active-state query into its result variable.
   return { op = "follower_is_active", result = Operands.varRef(ins.operands[1]) }
 end
 
@@ -446,7 +403,10 @@ local function followerTransition()
 end
 
 local function followerRecall()
-  -- Retail opcode 599 starts a TaskManager child and blocks until it settles.
+  -- ScrCmd_FollowMonRecall starts the recall task and blocks until
+  -- it settles (the source TRUE return yields while the TaskManager child
+  -- runs; FALSE continues when there is nothing to do). The blocking
+  -- task owns the visible-follower choreography.
   return { op = "follower_recall" }
 end
 
@@ -507,15 +467,16 @@ local function setFriendSprite(ins)
 end
 
 local function warp(ins)
-  -- Warp map, warp, x, z, dir: coordinates and direction may be variable
-  -- operands; numeric directions normalize to the string enum.
+  -- Warp map, warp, x, z, dir: every operand is read through ScriptGetVar, so
+  -- coordinates and direction may be variables and a literal direction code
+  -- normalizes to the cardinal direction it names.
   return {
     op = "warp",
     map = Operands.varRef(ins.operands[1]),
     warp = Operands.varRef(ins.operands[2]),
     fieldX = Operands.varRef(ins.operands[3]),
     fieldZ = Operands.varRef(ins.operands[4]),
-    facing = normalizeFacing(Operands.operandValue(ins.operands[5])),
+    facing = directionRef(ins.operands[5]),
   }
 end
 
@@ -688,13 +649,15 @@ local function kurtApricornBoxSelect(_)
   return { op = "apricorn_box_select" }
 end
 
--- The Apricorn tree script passes SCORE_EVENT_APRICORN_HARVESTED (1) to
--- ScrCmd_AddSpecialGameStat. Score persistence has no runtime owner yet, so
--- preserve this one command position without claiming other stat events.
-local function addApricornHarvestScore(ins)
+-- ScrCmd_AddSpecialGameStat (515) names one score event from the source's
+-- 40-entry sScoreMods table (src/game_stats.c) and credits it in the same
+-- tick (GameStats_AddScore). The weight and the ceiling stay in the live
+-- GameStats owner, so the translator emits the source event index unchanged
+-- and never an amount; an index outside that table is not a source event.
+local function addSpecialGameStat(ins)
   local event = Operands.operandValue(ins.operands[1])
-  if event == 1 then
-    return { op = "noop" }
+  if type(event) == "number" and event >= 0 and event < 40 then
+    return { op = "game_score_event", event = event }
   end
   return {
     op = "unsupported",
@@ -702,7 +665,7 @@ local function addApricornHarvestScore(ins)
     originalName = "ScrCmd_AddSpecialGameStat",
     arguments = { event },
     sourceOffset = ins.offset,
-    reason = "special game-stat event has no runtime owner",
+    reason = "special game-stat event is outside the source score table",
   }
 end
 
@@ -1272,26 +1235,17 @@ local function movePersonFacing(ins)
       {
         op = "set_object_facing",
         actor = actor,
-        direction = normalizeFacing(Operands.operandValue(ins.operands[5])),
+        direction = directionRef(ins.operands[5]),
       },
     },
   }
 end
 
 local function setObjectMovementType(ins)
-  local rawMovement = Operands.operandValue(ins.operands[2])
-  local ok, movementType = pcall(HgssObjectMovement.semanticType, rawMovement)
-  if not ok then
-    Errors.raise(
-      "SCRIPT_UNKNOWN_OBJECT_MOVEMENT",
-      "SetObjectMovementType has an invalid movement selector",
-      { sourceOffset = ins.offset, opcode = ins.opcode, movement = rawMovement }
-    )
-  end
   return {
     op = "set_object_movement_type",
     actor = actorRef(ins.operands[1]),
-    movementType = movementType,
+    movementType = Operands.movementType(ins),
   }
 end
 
@@ -1299,7 +1253,7 @@ local function setObjectFacing(ins)
   return {
     op = "set_object_facing",
     actor = actorRef(ins.operands[1]),
-    direction = normalizeFacing(Operands.operandValue(ins.operands[2])),
+    direction = directionRef(ins.operands[2]),
   }
 end
 
@@ -1339,7 +1293,7 @@ local function pcCapsules()
   return { op = "pc_capsules" }
 end
 
--- Source map-prop animation slot ScrCmd_500 binds to the PC terminal model.
+-- Source map-prop animation slot ScrCmd_PCPropLoadAnimation binds to the PC terminal model.
 -- Wait and release on that slot are the terminal effect; every other slot is
 -- a script-loaded map prop.
 local PC_TERMINAL_SLOT = 90
@@ -1382,16 +1336,16 @@ local function waitInputOrTicks(ins)
   return { op = "wait_input_or_ticks", ticks = Operands.operandValue(ins.operands[1]) }
 end
 
--- The retail draw flag is named for its setter: MakeObjectVisible sets the
--- hidden bit and MakeObjectInvisible clears it.
+-- ScrCmd_MakeObjectVisible clears the object's invisible flag and
+-- ScrCmd_MakeObjectInvisible sets it.
 local ObjectDrawFlag = {}
 
 function ObjectDrawFlag.makeVisible(ins)
-  return { op = "set_object_hidden", actor = actorRef(ins.operands[1]), hidden = true }
+  return { op = "set_object_hidden", actor = actorRef(ins.operands[1]), hidden = false }
 end
 
 function ObjectDrawFlag.makeInvisible(ins)
-  return { op = "set_object_hidden", actor = actorRef(ins.operands[1]), hidden = false }
+  return { op = "set_object_hidden", actor = actorRef(ins.operands[1]), hidden = true }
 end
 
 -- Retail ScrCmd_GetStdMsgNaix (opcode 438): the destination variable receives
@@ -1425,9 +1379,18 @@ local function externalMessageWait(ins)
   }
 end
 
+-- ScrCmd_MenuInitStdGmm/MenuInit (749/750) and ScrCmd_MultichoiceInitStdGmm/
+-- MultichoiceInit (64/65) share Script_CreateMenuFromArgs: four bytes of
+-- window geometry, cursor and cancellability followed by the result
+-- halfword. The multichoice family is the foreground framed window, so it
+-- keeps the source tile position the list family deliberately discards.
 local function standardMenuBegin(ins)
+  local multichoice = ins.opcode == 64
   return {
     op = "menu_begin",
+    kind = multichoice and "multichoice" or nil,
+    tileX = multichoice and Operands.operandValue(ins.operands[1]) or nil,
+    tileY = multichoice and Operands.operandValue(ins.operands[2]) or nil,
     messageSource = "standard",
     initialCursor = Operands.operandValue(ins.operands[3]),
     cancellable = Operands.operandValue(ins.operands[4]) ~= 0,
@@ -1441,8 +1404,12 @@ end
 
 local function scriptMenuBegin(ins, memberIr)
   assert(memberIr.messageBank ~= nil, "script menu requires a current script message bank")
+  local multichoice = ins.opcode == 65
   return {
     op = "menu_begin",
+    kind = multichoice and "multichoice" or nil,
+    tileX = multichoice and Operands.operandValue(ins.operands[1]) or nil,
+    tileY = multichoice and Operands.operandValue(ins.operands[2]) or nil,
     messageSource = { kind = "script", bank = memberIr.messageBank },
     initialCursor = Operands.operandValue(ins.operands[3]),
     cancellable = Operands.operandValue(ins.operands[4]) ~= 0,
@@ -1454,7 +1421,17 @@ local function scriptMenuBegin(ins, memberIr)
   }
 end
 
+-- ScrCmd_MenuItemAdd (751) reads three script-value operands including the
+-- list family's help-metadata selector; ScrCmd_MultichoiceItemAdd (66) reads
+-- the message id and result byte as two immediates and stores them as is.
 local function menuAdd(ins)
+  if ins.opcode == 66 then
+    return {
+      op = "menu_add",
+      messageId = Operands.operandValue(ins.operands[1]),
+      value = Operands.operandValue(ins.operands[2]),
+    }
+  end
   return {
     op = "menu_add",
     messageId = Operands.varRef(ins.operands[1]),
@@ -1483,7 +1460,7 @@ local function contextChoice(ins)
   return { op = "context_choice", result = Operands.varRef(ins.operands[1]) }
 end
 
--- ScrCmd_815 reads an immediate selector and only sets the
+-- ScrCmd_SetSavedBottomScreenApp reads an immediate selector and only sets the
 -- field display-return target. The mart host always restores the default
 -- target, as the retail ROM does for selector zero. Other values
 -- are not equivalent and remain explicitly unsupported.
@@ -1496,7 +1473,7 @@ local function setDefaultFieldReturn(ins)
     command = 815,
     arguments = { Operands.operandValue(ins.operands[1]) },
     sourceOffset = ins.offset,
-    reason = "ScrCmd_815 supports only the immediate default field return selector zero",
+    reason = "ScrCmd_SetSavedBottomScreenApp supports only the immediate default field return selector zero",
   }
 end
 
@@ -1515,7 +1492,7 @@ local function actorOscillate(ins)
         Operands.operandValue(ins.operands[5]),
       },
       sourceOffset = ins.offset,
-      reason = "ScrCmd_523 variable amplitude operands are unsupported",
+      reason = "ScrCmd_SpinObject variable amplitude operands are unsupported",
     }
   end
   return {
@@ -1626,14 +1603,16 @@ end
 
 -- SetPhoneCall stages one evaluated setup request without blocking: the
 -- three operands stay value references (the single real use stages them
--- through script variables) and the runtime maps the evaluated direction
--- and kind codes onto the closed foreground vocabulary.
+-- through script variables). Source operands are the caller number, the
+-- scripted-call marker (ScrCmd_SetPhoneCall's isScriptedCall, 2 for a
+-- map-script call) and the predefined phone-script identity; the launch
+-- itself always opens the call as incoming (PokegearArgs isScriptedLaunch).
 function GearLowering.setPhoneCall(ins)
   return {
     op = "phone_set_call",
     contact = Operands.varRef(ins.operands[1]),
-    direction = Operands.varRef(ins.operands[2]),
-    kind = Operands.varRef(ins.operands[3]),
+    scriptedCall = Operands.varRef(ins.operands[2]),
+    callScriptID = Operands.varRef(ins.operands[3]),
   }
 end
 
@@ -1790,7 +1769,7 @@ local FieldHandlers = {
   [669] = getItemQuantity,
   [623] = apricornTreeAnim,
   [624] = apricornTreeColor,
-  [515] = addApricornHarvestScore,
+  [515] = addSpecialGameStat,
   [735] = kurtApricornQuantity,
   [736] = kurtApricornClear,
   [737] = kurtApricornBall,
@@ -1873,8 +1852,8 @@ local FieldHandlers = {
   [616] = countPcPhotos,
   [617] = openPcPhotoAlbum,
   [706] = pcHallOfFameStatus,
-  [374] = ObjectDrawFlag.makeInvisible,
-  [375] = ObjectDrawFlag.makeVisible,
+  [374] = ObjectDrawFlag.makeVisible,
+  [375] = ObjectDrawFlag.makeInvisible,
   [438] = getStdMsgNaix,
   [439] = externalMessage,
   [440] = externalMessageWait,
@@ -1882,16 +1861,28 @@ local FieldHandlers = {
   [750] = scriptMenuBegin,
   [751] = menuAdd,
   [752] = menuExecute,
+  [64] = standardMenuBegin,
+  [65] = scriptMenuBegin,
+  [66] = menuAdd,
+  [67] = menuExecute,
+  -- The multichoice anchor leaf rides the field-service leaf like the other
+  -- exhausted-budget leaves: this chunk is at LuaJIT's 200-local budget, so it
+  -- declares no further file-scoped local.
+  [841] = FieldServiceHandlers.multichoiceSetAnchorRight,
   [581] = lockLastTalkedActor,
   [582] = setSpecialSpawn,
   [596] = followerPartnerState,
-  [599] = followerRecall,
+  [599] = FieldServiceHandlers.followerHopIntoBall,
+  [600] = followerRecall,
+  [495] = FieldServiceHandlers.gameVersion,
+  [573] = FieldServiceHandlers.setMysteryGiftActive,
   [601] = followerFacePlayer,
   [602] = followerSetPaused,
   [603] = followerWait,
   [604] = followerSetMovementType,
   [605] = followerReposition,
   [606] = FieldServiceHandlers.followerReleaseNextToPlayer,
+  [607] = FieldServiceHandlers.followerMoveToPlayer,
   [755] = FieldServiceHandlers.legendCutsceneBellBegin,
   [756] = FieldServiceHandlers.legendCutsceneBellEnd,
   [757] = FieldServiceHandlers.legendCutsceneBellRise,
@@ -1907,7 +1898,7 @@ local FieldHandlers = {
   [768] = FieldServiceHandlers.legendCutsceneLugiaArrivesEnd,
   [769] = FieldServiceHandlers.legendCutsceneLugiaArrivesCameraPan,
   [773] = FieldServiceHandlers.legendCinematic,
-  [805] = FieldServiceHandlers.followMonResetMovement,
+  [805] = FieldServiceHandlers.loadEventSoundEffects,
   [608] = followerTransition,
   [621] = placeStarterBalls,
   [609] = yieldFollowerCheck,
@@ -1947,7 +1938,7 @@ local FieldHandlers = {
   [733] = FieldServiceHandlers.partyLeadHasType,
   [734] = FieldServiceHandlers.followerJumpOnSpot,
   [851] = FieldServiceHandlers.bufferCapitalize,
-  [600] = FieldServiceHandlers.followerRecallToPlayer,
+  [852] = FieldServiceHandlers.bufferDeptStoreFloorNo,
   [829] = FieldServiceHandlers.followerIsNextToPlayer,
   [753] = FieldServiceHandlers.rockSmashItemCheck,
   [754] = FieldServiceHandlers.tryHeadbuttEncounter,
@@ -1993,6 +1984,7 @@ local FieldHandlers = {
   -- discard_value semantic exactly like opcodes 219/279 share whiteout.
   [490] = FieldServiceHandlers.discardValue,
   [446] = FieldServiceHandlers.currentMapId,
+  [489] = FieldServiceHandlers.mysteryGift,
   [487] = FieldServiceHandlers.pokemonCenterHeal,
   [590] = FieldServiceHandlers.trainerCardStars,
   [771] = FieldServiceHandlers.martAthlete,
@@ -2000,7 +1992,45 @@ local FieldHandlers = {
   [782] = FieldServiceHandlers.martSell,
   [834] = FieldServiceHandlers.martAthleteAvailable,
   [835] = FieldServiceHandlers.martCardPrefix,
+  -- The source money family (110-115, 360, 368) rides the same field-service
+  -- leaf: this chunk sits at LuaJIT's 200-local budget, so the handlers stay
+  -- named there and are registered here by reference.
+  [110] = FieldServiceHandlers.addMoney,
+  [111] = FieldServiceHandlers.subtractMoneyImmediate,
+  [360] = FieldServiceHandlers.subtractMoneyVar,
+  [112] = FieldServiceHandlers.hasEnoughMoneyImmediate,
+  [368] = FieldServiceHandlers.hasEnoughMoneyVar,
+  [113] = FieldServiceHandlers.showMoneyBox,
+  [114] = FieldServiceHandlers.hideMoneyBox,
+  [115] = FieldServiceHandlers.updateMoneyBox,
 }
+
+-- NameRival (143), SetTrainerFlag/ClearTrainerFlag (36/37) and
+-- CheckTrainerFlag (38) lower through the cohesive field-service leaf, which
+-- keeps their names off this chunk's exhausted 200-local budget. They are
+-- single-operand lowerings: 36/37/38 read one ScriptGetVar trainer number into
+-- the numeric trainer event flag and 143 blocks on the shared naming screen.
+FieldHandlers[36] = FieldServiceHandlers.setTrainerFlag
+FieldHandlers[37] = FieldServiceHandlers.clearTrainerFlag
+FieldHandlers[38] = FieldServiceHandlers.checkTrainerFlag
+FieldHandlers[143] = FieldServiceHandlers.nameRival
+
+-- Source object and travel commands whose operand classes differ from their
+-- siblings: ChangeObjectMovement reinitializes the object's own movement with
+-- an immediate selector, SetObjectFacingAndUpdateDraw reads both its operands
+-- from script variables and redraws immediately, and the dynamic-warp, floor
+-- box, elevator and clock commands take ScriptGetVar operands. This chunk sits
+-- at LuaJIT's 200-local budget, so they ride the field-service leaf like the
+-- other source service commands.
+FieldHandlers[109] = FieldServiceHandlers.changeObjectMovement
+FieldHandlers[344] = FieldServiceHandlers.setObjectFacingAndUpdateDraw
+FieldHandlers[240] = FieldServiceHandlers.setDynamicWarp
+FieldHandlers[241] = FieldServiceHandlers.getDynamicWarpFloorNo
+FieldHandlers[342] = FieldServiceHandlers.moveWarp
+FieldHandlers[242] = FieldServiceHandlers.elevatorCurFloorBox
+FieldHandlers[488] = FieldServiceHandlers.elevatorAnim
+FieldHandlers[522] = FieldServiceHandlers.getCurrentHour
+FieldHandlers[784] = FieldServiceHandlers.scriptOverlayCmd
 
 -- The seventeen dex entries ride the cohesive PokedexHandlers leaf. This
 -- chunk sits at LuaJIT's 200-local budget, so the leaf is referenced

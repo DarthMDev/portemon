@@ -244,7 +244,7 @@ local function handleStop(_, _)
   return Runtime.OUTCOME_STOP
 end
 
--- ScrCmd_061 (std_signpost's hide-branch tail): no operands. The source
+-- ScrCmd_ReopenStartMenuOnEnd (std_signpost's hide-branch tail): no operands. The source
 -- installs the Start Menu reopen end callback (sub_0204031C ->
 -- sub_0203BD64) and returns FALSE, ending the script context. The reopen
 -- request routes through the startMenuReopen service, which the Start Menu
@@ -665,6 +665,17 @@ do
     return blockOnTask(run, "pokemon_nickname_input", { slot = evalField(node, run, "slot") }, node.result)
   end
   HANDLERS.pokemon_nickname_input = handleMonNicknameInput
+
+  -- Rival naming blocks on the shared field naming host, which writes an
+  -- accepted name straight to the live player profile; the task result is
+  -- the source no-input code.
+  local function handleRivalNaming(node, run)
+    requireForeground(run, "rival_naming")
+    requireService(run, "player")
+    requireService(run, "monNaming")
+    return blockOnTask(run, "rival_naming", {}, node.result)
+  end
+  HANDLERS.rival_naming = handleRivalNaming
 end
 
 -- Dex count, rating, grant, and alphabet operations. Each handler
@@ -1423,6 +1434,7 @@ end
 ---@field setMovementType fun(self: RuntimeFollowingMon, movementType: string)
 ---@field repositionRelativeToPlayer fun(self: RuntimeFollowingMon, offsetSelector: integer, directionRaw: integer)
 ---@field releaseNextToPlayer fun(self: RuntimeFollowingMon): boolean
+---@field moveToPlayer (fun(self: RuntimeFollowingMon): boolean)|nil
 ---@field swapPositionsWithPlayer fun(self: RuntimeFollowingMon)
 ---@field recallToPlayer fun(self: RuntimeFollowingMon): boolean
 ---@field isNextToPlayer fun(self: RuntimeFollowingMon): boolean
@@ -1506,6 +1518,41 @@ do
 
   local function handleFollowerReleaseNextToPlayer(_, run)
     followingMonFor(run):releaseNextToPlayer()
+    return Runtime.OUTCOME_CONTINUE
+  end
+
+  local function handleFollowerMoveToPlayer(_, run)
+    -- Retail ScrCmd_FollowMonMoveToPlayer (607): with an active permitted
+    -- follower, place it on the player tile in the same tick. No
+    -- release-ball pending flag and no hide-until-step bit ride along.
+    followingMonFor(run):moveToPlayer()
+    return Runtime.OUTCOME_CONTINUE
+  end
+
+  local function handleGameVersion(node, run)
+    -- Retail ScrCmd_GetGameVersion (495): HeartGold 7, SoulSilver 8.
+    -- The composition wires the same version identity under both keys;
+    -- either one answers. A missing or unknown identity is a
+    -- programming invariant, never a silent default.
+    local versionId = run.services.gameVersion
+    if versionId == nil then
+      versionId = run.services.versionId
+    end
+    local number = versionId == "heartgold" and 7 or versionId == "soulsilver" and 8 or nil
+    assert(number == 7 or number == 8, "game version requires a known version identity")
+    semanticsFor(run).writeRef(node.result, number, run)
+    return Runtime.OUTCOME_CONTINUE
+  end
+
+  local function handleSetMysteryGiftActive(_, run)
+    -- Retail ScrCmd_SetMysteryGiftActive (573) latches the durable SysInfo
+    -- flag and continues in the same tick (the source FALSE return).
+    -- There is no clear counterpart: the flag only ever turns on.
+    requireService(run, "sysInfo"):setMysteryGiftActive()
+    return Runtime.OUTCOME_CONTINUE
+  end
+
+  local function handleLoadEventSoundEffects(_, _)
     return Runtime.OUTCOME_CONTINUE
   end
 
@@ -1636,6 +1683,10 @@ do
   HANDLERS.follower_is_event_trigger = handleFollowerIsEventTrigger
   HANDLERS.follower_transition = handleFollowerTransition
   HANDLERS.follower_recall = handleFollowerRecall
+  HANDLERS.follower_move_to_player = handleFollowerMoveToPlayer
+  HANDLERS.game_version = handleGameVersion
+  HANDLERS.set_mystery_gift_active = handleSetMysteryGiftActive
+  HANDLERS.load_event_sound_effects = handleLoadEventSoundEffects
   local function handleFollowerRecallToPlayer(_, run)
     followingMonFor(run):recallToPlayer()
     return Runtime.OUTCOME_CONTINUE
@@ -1780,14 +1831,91 @@ local function handleSetObjectPosition(node, run)
   return Runtime.OUTCOME_CONTINUE
 end
 
+-- Source SetObjectFacing (341) and SetObjectFacingAndUpdateDraw (344) share
+-- this handler: the actor manager's facing is the orientation its draw path
+-- samples every frame, so the facing write already updates the drawn
+-- orientation in the same tick. There is no separate draw request to perform.
 local function handleSetObjectFacing(node, run)
-  local actorId = semanticsFor(run).requireActor(node.actor, run)
-  run.services.actors:setFacing(actorId, node.direction)
+  local semantics = semanticsFor(run)
+  local actorId = semantics.requireActor(node.actor, run)
+  run.services.actors:setFacing(actorId, semantics.decodeDirection(semantics.evaluateValue(node.direction, run), run))
+  return Runtime.OUTCOME_CONTINUE
+end
+
+-- Source ChangeObjectMovement (109) reinitializes the object's own movement
+-- through the same manager call the plain movement-type setter (340) uses, and
+-- an object the current map does not carry is an intentional same-tick no-op.
+-- Source SetDynamicWarp, GetDynamicWarpFloor, MoveWarp, ElevatorCurFloorBox,
+-- ElevatorAnim and GetCurrentHour are the remaining source field operations
+-- over the injected HGSS services; only the elevator animation owns frames.
+function HANDLERS.set_dynamic_warp(node, run)
+  local semantics = semanticsFor(run)
+  requireService(run, "maps"):setDynamicWarp({
+    map = semantics.evaluateValue(node.map, run),
+    warpId = semantics.evaluateValue(node.warpId, run),
+    fieldX = semantics.evaluateValue(node.fieldX, run),
+    fieldZ = semantics.evaluateValue(node.fieldZ, run),
+    direction = semantics.evaluateValue(node.direction, run),
+  })
+  return Runtime.OUTCOME_CONTINUE
+end
+
+function HANDLERS.get_dynamic_warp_floor(node, run)
+  semanticsFor(run).writeRef(node.result, requireService(run, "maps"):dynamicWarpFloor(), run)
+  return Runtime.OUTCOME_CONTINUE
+end
+
+function HANDLERS.move_warp_event(node, run)
+  local semantics = semanticsFor(run)
+  requireService(run, "maps"):moveWarpEvent(
+    semantics.evaluateValue(node.warpId, run),
+    semantics.evaluateValue(node.fieldX, run),
+    semantics.evaluateValue(node.fieldZ, run)
+  )
+  return Runtime.OUTCOME_CONTINUE
+end
+
+-- The source floor box shows a non-modal window and returns in its own tick:
+-- the window observes the result variable and releases itself once the script
+-- writes the closing sentinel, so the command never writes it and never blocks.
+-- Its messages expand through the calling script's buffered text, exactly like
+-- the source MessageFormat the floor label substitution reads.
+function HANDLERS.floor_window_show(node, run)
+  requireService(run, "floorWindow"):show({
+    tileX = node.tileX,
+    tileY = node.tileY,
+    floor = semanticsFor(run).evaluateValue(node.floor, run),
+    textArgs = run.instance.textArgs or {},
+    result = node.result,
+  })
+  return Runtime.OUTCOME_CONTINUE
+end
+
+function HANDLERS.elevator_anim(node, run)
+  local semantics = semanticsFor(run)
+  requireService(run, "propAnimations")
+  return blockOnTask(run, "elevator_anim", {
+    direction = semantics.evaluateValue(node.direction, run),
+    length = semantics.evaluateValue(node.length, run),
+  })
+end
+
+function HANDLERS.field_clock_hour(node, run)
+  semanticsFor(run).writeRef(node.result, requireService(run, "clock"):nowLocal().hour, run)
   return Runtime.OUTCOME_CONTINUE
 end
 
 local function handleSetObjectMovementType(node, run)
-  local actorId = semanticsFor(run).requireActor(node.actor, run)
+  local semantics = semanticsFor(run)
+  if node.changeMovement == true then
+    local actorId = semantics.findActor(node.actor, run)
+    if actorId == nil or not run.services.actors:exists(actorId) then
+      return Runtime.OUTCOME_CONTINUE
+    end
+    run.services.actors:setMovementType(actorId, node.movementType)
+    return Runtime.OUTCOME_CONTINUE
+  end
+  local actorId = semantics.requireActor(node.actor, run)
   run.services.actors:setMovementType(actorId, node.movementType)
   return Runtime.OUTCOME_CONTINUE
 end
@@ -1987,6 +2115,9 @@ local function handleMenuBegin(node, run)
     cancelValue = semanticsFor(run).evaluateValue(node.cancelValue, run)
   end
   run.instance.menuBuilder = requireScriptMenu(run):beginMenu({
+    kind = node.kind,
+    tileX = node.tileX,
+    tileY = node.tileY,
     messageSource = node.messageSource,
     initialCursor = node.initialCursor,
     cancellable = node.cancellable,
@@ -1997,9 +2128,13 @@ local function handleMenuBegin(node, run)
 end
 local function handleMenuAdd(node, run)
   requireForeground(run, "menu_add")
+  local vanillaMetadata = nil
+  if node.vanillaMetadata ~= nil then
+    vanillaMetadata = semanticsFor(run).evaluateValue(node.vanillaMetadata, run)
+  end
   requireScriptMenu(run):addItem(run.instance.menuBuilder, {
     messageId = semanticsFor(run).evaluateValue(node.messageId, run),
-    vanillaMetadata = semanticsFor(run).evaluateValue(node.vanillaMetadata, run),
+    vanillaMetadata = vanillaMetadata,
     value = semanticsFor(run).evaluateValue(node.value, run),
   })
   return Runtime.OUTCOME_CONTINUE
@@ -2417,6 +2552,37 @@ do
     kindCodes = { [0] = "ordinary" },
   }
 
+  -- One evaluated source integer operand inside its native width: the
+  -- staged call markers are an unsigned byte and a phone-script number.
+  ---@param node table<string, unknown>
+  ---@param run table<string, unknown>
+  ---@param name string
+  ---@param op string
+  ---@param limit integer inclusive
+  ---@return integer
+  function GearEval.evalSourceCode(node, run, name, op, limit)
+    local value = semanticsFor(run).evaluateValue(node[name], run)
+    if type(value) ~= "number" or value % 1 ~= 0 or value < 0 or value > limit then
+      Errors.raise(
+        ScriptErrors.SCRIPT_INVALID_REFERENCE,
+        "phone setup names a source " .. name .. " inside its native width",
+        { scriptId = run.instance.scriptId, op = op, field = name, value = value }
+      )
+    end
+    return value --[[@as integer]]
+  end
+
+  -- The field's phone call manager (source GearPhoneRingManager): it holds
+  -- the one pending caller request a script setup writes and the launch
+  -- consumes.
+  ---@param run table<string, unknown>
+  ---@return table<string, unknown>
+  function GearEval.calls(run)
+    local calls = requireService(run, "phoneCalls")
+    assert(calls ~= nil, "phone call manager is available after the missing-service error")
+    return calls
+  end
+
   ---@param value unknown
   ---@param run table<string, unknown>
   ---@param op string
@@ -2537,52 +2703,43 @@ do
 
   local function handlePhoneSetCall(node, run)
     requireForeground(run, "phone_set_call")
-    local host = phoneService(run)
+    local calls = GearEval.calls(run)
     local contact = GearEval.evalContact(node, run, "contact", "phone_set_call")
-    local direction = GearEval.evalDirection(node, run, "direction", "phone_set_call")
-    local kind = GearEval.evalKind(node, run, "kind", "phone_set_call")
-    local staged = { contact = contact, direction = direction, kind = kind }
-    -- Scripted field calls (ScrCmd_SetPhoneCall operand 2/3) thread the
-    -- source scripted flag and script identity when the node carries
-    -- them; menu and synthetic requests omit both and stay unscripted.
-    for _, name in ipairs({ "isScriptedCall", "scriptedCall", "callScriptID", "scriptId" }) do
-      if node[name] ~= nil then
-        local value = semanticsFor(run).evaluateValue(node[name], run)
-        if type(value) == "number" and value % 1 == 0 then
-          if name == "isScriptedCall" or name == "scriptedCall" then
-            staged.isScriptedCall = value
-          else
-            staged.callScriptID = value
-          end
-        end
-      end
-    end
-    host:stageCall(run.instance.instanceId, staged)
+    local scriptedCall = GearEval.evalSourceCode(node, run, "scriptedCall", "phone_set_call", 0xFF)
+    local callScriptID = GearEval.evalSourceCode(node, run, "callScriptID", "phone_set_call", 0xFFFF)
+    -- The source setup stores the caller parameters on the ring manager,
+    -- which the launch reads back as an incoming call whose selector sees
+    -- the scripted marker and predefined script identity. Staging keeps
+    -- those source facts intact instead of collapsing them into a
+    -- direction and kind.
+    calls:stageCall({ contact = contact, isScriptedCall = scriptedCall, callScriptID = callScriptID })
     return Runtime.OUTCOME_CONTINUE
   end
 
   local function handlePhoneRunCall(_, run)
     requireForeground(run, "phone_run_call")
-    local host = phoneService(run)
-    local pending = host:takeStagedCall(run.instance.instanceId)
+    local calls = GearEval.calls(run)
+    local pending = calls:takePendingCall()
     if pending == nil then
       Errors.raise(
         ScriptErrors.FEATURE_UNAVAILABLE,
-        "phone run has no staged pending request",
+        "phone run has no pending call request",
         { scriptId = run.instance.scriptId, op = "phone_run_call" }
       )
     end
-    assert(type(pending) == "table", "staged phone requests stay records")
-    local staged = pending --[[@as table<string, string>]]
+    assert(type(pending) == "table", "pending phone requests stay records")
+    local manager = pending --[[@as table<string, unknown>]]
     local scriptId = run.instance.scriptId
-    assert(type(scriptId) == "string", "staged phone runs carry their script context")
+    assert(type(scriptId) == "string", "phone runs carry their script context")
+    -- Every launch is an incoming call, and the conversation selector reads
+    -- the source scripted marker and predefined script identity.
     local request = {
       id = "phone:" .. tostring(run.instance.instanceId) .. ":" .. tostring(run.tick),
-      contact = staged.contact,
-      direction = staged.direction,
-      kind = staged.kind,
-      isScriptedCall = staged.isScriptedCall,
-      callScriptID = staged.callScriptID,
+      contact = manager.contactKey,
+      direction = "incoming",
+      kind = "incoming",
+      isScriptedCall = manager.isScriptedCall,
+      callScriptID = manager.callScriptID,
     }
     return blockOnTask(run, "pokegear_application", {
       kind = "call",
@@ -2804,6 +2961,13 @@ do
     semanticsFor(run).writeRef(node.result, gifts:momGift(), run)
     return Runtime.OUTCOME_CONTINUE
   end
+  -- The Mystery Gift queue check answers through the source FALSE convention:
+  -- this product runs no distribution system, so no gift can be queued and
+  -- there is no gift data to consult.
+  function GearEval.handleMysteryGiftHasGift(node, run)
+    semanticsFor(run).writeRef(node.result, 0, run)
+    return Runtime.OUTCOME_CONTINUE
+  end
   function GearEval.handleMomGiftHead(node, run)
     local gifts = requireService(run, "phoneGifts")
     assert(gifts ~= nil, "companion service is available after the missing-service error")
@@ -2844,6 +3008,7 @@ do
   HANDLERS.phone_contact_gift = GearEval.handlePhoneContactGift
   HANDLERS.radio_music_query = GearEval.handleRadioMusicQuery
   HANDLERS.mom_gift_check = GearEval.handleMomGiftCheck
+  HANDLERS.mystery_gift_has_gift = GearEval.handleMysteryGiftHasGift
   HANDLERS.mom_gift_head = GearEval.handleMomGiftHead
   HANDLERS.mom_gift_take = GearEval.handleMomGiftTake
   HANDLERS.buena_password = GearEval.handleBuenaPassword
@@ -3011,6 +3176,17 @@ HANDLERS.ask_yes_no = handleAskYesNo
 HANDLERS.choose = handleChoose
 HANDLERS.menu_begin = handleMenuBegin
 HANDLERS.menu_add = handleMenuAdd
+-- ScrCmd_MultichoiceSetAnchorRight mutates the pending foreground builder and
+-- returns TRUE, so the operation yields one source phase. The main chunk is at
+-- LuaJIT's local budget, so the handler lives in a block.
+do
+  local function handleMenuAnchorRight(node, run)
+    requireForeground(run, "menu_anchor_right")
+    requireScriptMenu(run):setAnchorRight(run.instance.menuBuilder, node.enabled)
+    return Runtime.OUTCOME_YIELD_TICK
+  end
+  HANDLERS.menu_anchor_right = handleMenuAnchorRight
+end
 HANDLERS.menu_exec = handleMenuExec
 HANDLERS.wait_movement = handleWaitMovement
 HANDLERS.move = handleMove
@@ -3073,7 +3249,7 @@ HANDLERS.legend_cutscene_lugia_arrives_camera_pan = handleLegendCutscene
 HANDLERS.legend_cinematic = handleLegendCutscene
 function HANDLERS.follower_reset_movement(_, run)
   requireService(run, "followingMon"):resetMovement()
-  return Runtime.OUTCOME_CONTINUE
+  return Runtime.OUTCOME_YIELD_TICK
 end
 function HANDLERS.give_spiky_ear_pichu(_, run)
   requireService(run, "specialMonGifts"):giveSpikyEarPichu()
@@ -3207,6 +3383,68 @@ HANDLERS.process_soundplate = handleProcessSoundplate
 HANDLERS.shake_camera = handleShakeCamera
 HANDLERS.set_spawn = handleSetSpawn
 HANDLERS.set_special_spawn = handleSetSpecialSpawn
+-- AddSpecialGameStat (515): the source command names one score event and
+-- returns in the same tick; the live game-stats owner resolves the event's
+-- weight and caps the total, so the node never carries an amount. The main
+-- chunk is at LuaJIT's local budget, so the handler lives in a block.
+do
+  local function handleGameScoreEvent(node, run)
+    requireService(run, "gameStats"):awardScriptScoreEvent(node.event)
+    return Runtime.OUTCOME_CONTINUE
+  end
+  HANDLERS.game_score_event = handleGameScoreEvent
+end
+-- The wallet capability the source money commands borrow from the composed
+-- field platform: the generic runtime knows only these operations, while the
+-- live wallet and its source arithmetic stay with the injected owner.
+---@class ScriptMoneyService
+---@field add fun(self: ScriptMoneyService, amount: integer)
+---@field subtract fun(self: ScriptMoneyService, amount: integer)
+---@field hasEnough fun(self: ScriptMoneyService, amount: integer): boolean
+---@field showBox fun(self: ScriptMoneyService, tileX: integer, tileY: integer)
+---@field updateBox fun(self: ScriptMoneyService)
+---@field hideBox fun(self: ScriptMoneyService)
+-- Source money commands (scrcmd_money.c): every amount and tile operand is
+-- evaluated before the injected wallet owner is called, a money check writes
+-- its 0/1 answer instead of moving the balance, and all three commands return
+-- in the same tick. A missing wallet owner is an attributed fault, never a
+-- silent no-op. The main chunk is at LuaJIT's local budget, so the handlers
+-- live in a block.
+do
+  local function handleMoneyChange(node, run)
+    local amount = semanticsFor(run).evaluateValue(node.amount, run)
+    local money = requireService(run, "money") --[[@as ScriptMoneyService]]
+    if node.action == "add" then
+      money:add(amount)
+    else
+      money:subtract(amount)
+    end
+    return Runtime.OUTCOME_CONTINUE
+  end
+  local function handleMoneyCheck(node, run)
+    local amount = semanticsFor(run).evaluateValue(node.amount, run)
+    local money = requireService(run, "money") --[[@as ScriptMoneyService]]
+    local affordable = money:hasEnough(amount)
+    semanticsFor(run).writeRef(node.result, affordable and 1 or 0, run)
+    return Runtime.OUTCOME_CONTINUE
+  end
+  local function handleMoneyBox(node, run)
+    local money = requireService(run, "money") --[[@as ScriptMoneyService]]
+    if node.action == "show" then
+      local tileX = semanticsFor(run).evaluateValue(node.tileX, run)
+      local tileY = semanticsFor(run).evaluateValue(node.tileY, run)
+      money:showBox(tileX, tileY)
+    elseif node.action == "update" then
+      money:updateBox()
+    else
+      money:hideBox()
+    end
+    return Runtime.OUTCOME_CONTINUE
+  end
+  HANDLERS.money_change = handleMoneyChange
+  HANDLERS.money_check = handleMoneyCheck
+  HANDLERS.money_box = handleMoneyBox
+end
 HANDLERS.open_message = handleOpenMessage
 HANDLERS.signpost_direction = handleSignpostDirection
 HANDLERS.signpost_set = handleSignpostSet

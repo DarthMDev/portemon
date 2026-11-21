@@ -5,6 +5,7 @@
 -- generated trainer records only; no dump capability is required.
 
 local Assert = require("tests.support.Assert")
+local CompositionFrameDrain = require("tests.support.CompositionFrameDrain")
 local StubLease = require("tests.support.StubLease")
 local CatalogFixture = require("libs.mons.tests.catalog_fixture")
 local HgssBagService = require("libs.hgss.src.items.HgssBagService")
@@ -14,7 +15,40 @@ local MonsSave = require("libs.mons.src.MonsSave")
 local Party = require("libs.mons.src.Party")
 local ScreenTopology = require("libs.ui.src.ScreenTopology")
 local BattlePresentationManifestFixture = require("tests.support.BattlePresentationManifestFixture")
-local BattleMenuPresenter = require("game.hgss.src.battle.BattleMenuPresenter")
+local PartyPresentationFixture = require("tests.support.PartyPresentationFixture")
+-- Headless composition runs without GPU targets: the seeded pass drains
+-- plane and OBJ content through the recording boundary and records each
+-- typed frame, so content assertions observe the same draws production
+-- composes. Real pixels stay in the graphics layer.
+---@param rig table live screen rig under test driving
+local function seedHeadlessPass(rig)
+  local screen = assert(rig.screen, "the rig carries its battle screen")
+  rig.frames = {}
+  screen._assets._picturePass = {
+    render = function(_, graphics, frame)
+      rig.frames[#rig.frames + 1] = frame
+      CompositionFrameDrain.drain(graphics, frame)
+      for _, primitive in ipairs(frame.primitives or {}) do
+        local handle = primitive.image or primitive.material
+        local image = type(handle) == "table" and (handle.image or handle) or handle
+        local minX, minY = nil, nil
+        for _, vertex in ipairs(primitive.vertices or {}) do
+          local x = math.floor((vertex.clipX / 4096 + 1) * 128 * 2 ^ 20 + 0.5) / 2 ^ 20
+          local y = math.floor((1 - vertex.clipY / 4096) * 96 * 2 ^ 20 + 0.5) / 2 ^ 20
+          if minX == nil or x < minX then
+            minX = x
+          end
+          if minY == nil or y < minY then
+            minY = y
+          end
+        end
+        graphics.draw(image, minX or 0, minY or 0)
+      end
+      return { handle = "rig-picture-pass" }
+    end,
+    release = function() end,
+  }
+end
 
 local T = {}
 
@@ -27,7 +61,7 @@ local function stubPortrait(key)
   end
   return StubLease.new(key)
 end
-local TICK = 1 / 60
+local TICK = require("libs.hgss.src.field.SourceTick").DT
 
 local RUNTIME_MODULE = "game.hgss.src.battle.BattleRuntime"
 local STATE_MODULE = "game.hgss.tests.support.BattleScreenFixture"
@@ -160,6 +194,13 @@ local function openDoubleRig(opts)
   function rig.assets.release(key)
     rig.assets.released[key] = (rig.assets.released[key] or 0) + 1
   end
+  function rig.assets.state()
+    return "ready"
+  end
+  rig.partyRenderer = { draws = {} }
+  function rig.partyRenderer:draw(native, layout, icons)
+    self.draws[#self.draws + 1] = { native = native, layout = layout, icons = icons }
+  end
   local HgssMonService = require("libs.hgss.src.mons.HgssMonService")
   local catalog = CatalogFixture.makeCatalog()
   local wounded = opts.wounded == true
@@ -256,6 +297,7 @@ local function openDoubleRig(opts)
     manifest.hud.doubles = {}
   end
   local screen = BattleScreenState.new({
+    splRandomState = { state = 0 },
     launchId = launchId,
     manifest = manifest,
     model = Model,
@@ -267,12 +309,14 @@ local function openDoubleRig(opts)
       return rig.measurement
     end,
     itemCatalog = ItemFixture.makeCatalog(),
+    battleMenus = { party = { manifest = PartyPresentationFixture.manifest(), renderer = rig.partyRenderer, icons = {} } },
     assets = rig.assets,
     text = rig.text,
     windows = rig.windows,
     audio = rig.audio,
   })
   rig.screen = screen
+  seedHeadlessPass(rig)
   rig.port = screen:presentationPort()
   holder.battle = BattleRuntime.new({
     request = { id = launchId, kind = "trainer", payload = { trainer = trainerId } },
@@ -522,6 +566,7 @@ end
 ---@param rig table live screen rig under test driving, resting on the open bag child
 local function walkToMedicineFirstCell(rig)
   press(rig, { type = "confirm" })
+  press(rig, { type = "confirm" })
   rig.pump(2)
 end
 
@@ -531,7 +576,25 @@ end
 local function childRow(rig, id)
   local snapshot = rig.screen:_snapshot()
   local child = snapshot.childView
-  if type(child) ~= "table" or type(child.rows) ~= "table" then
+  if type(child) ~= "table" then
+    return nil
+  end
+  -- Party and target rows project through the native roster status:
+  -- slot occupancy and kernel eligibility read the staged facts
+  -- without an invented row table.
+  if child.kind == "party" or child.kind == "target" then
+    local slot = tonumber(id:match("^party:(%d+)$") or "")
+    local native = child.native --[[@as table<string, unknown>?]]
+    local view = type(native) == "table" and native.view or nil
+    local record = type(view) == "table" and type(slot) == "number" and type(view.slots) == "table"
+      and view.slots[slot + 1]
+      or nil
+    if type(record) == "table" and record.occupied == true then
+      return { id = id, enabled = record.eligible == true, occupied = true }
+    end
+    return nil
+  end
+  if type(child.rows) ~= "table" then
     return nil
   end
   for _, row in ipairs(child.rows) do
@@ -542,9 +605,31 @@ local function childRow(rig, id)
   return nil
 end
 
+-- Resolves one focused native party/target slot through the staged
+-- roster facts, mirroring the enabled row lookup above.
+---@param child table<string, unknown> detached child view under inspection
+---@param focus string focused control identity under inspection
+---@return table? the focused slot facts, nil for foreign identities
+local function focusedNativeSlot(child, focus)
+  if child.kind ~= "party" and child.kind ~= "target" then
+    return nil
+  end
+  local slot = tonumber(focus:match("^party:(%d+)$") or "")
+  local native = child.native --[[@as table<string, unknown>?]]
+  local view = type(native) == "table" and native.view or nil
+  local record = type(view) == "table" and type(slot) == "number" and type(view.slots) == "table"
+    and view.slots[slot + 1]
+    or nil
+  if type(record) ~= "table" or record.occupied ~= true then
+    return nil
+  end
+  return { id = focus, enabled = record.eligible == true, occupied = true }
+end
+
 -- Picks focused enabled child rows until the child closes: focus moves
 -- across ineligible rows, Back steps away from the dismiss control, and
--- every confirmation seals at most one staged fragment.
+-- every confirmation seals at most one staged fragment. Party and
+-- target slots resolve through the native roster facts.
 ---@param rig table live screen rig under test driving
 local function chooseEnabledChildRow(rig)
   for _ = 1, 16 do
@@ -555,18 +640,25 @@ local function chooseEnabledChildRow(rig)
     local child = snapshot.childView
     Assert.notNil(child, "the child stays observable")
     local focus = child.focusId
-    local focused = nil
-    for _, row in ipairs(child.rows or {}) do
-      if type(row) == "table" and row.id == focus then
-        focused = row
+    local focused = focusedNativeSlot(child, type(focus) == "string" and focus or "")
+    if focused == nil then
+      for _, row in ipairs(child.rows or {}) do
+        if type(row) == "table" and row.id == focus then
+          focused = row
+        end
       end
     end
     if focused ~= nil and focused.enabled == true then
       press(rig, { type = "confirm" })
     elseif focus == "back" then
       press(rig, { type = "navigate", direction = "up" })
-    else
+    elseif type(focus) == "string" and focus:match("^party:") then
       press(rig, { type = "navigate", direction = "down" })
+    else
+      -- The native mon menu owns its entries without barrier rows:
+      -- confirming answers the focused menu entry (Switch seals, a
+      -- refusal message acknowledges).
+      press(rig, { type = "confirm" })
     end
   end
 end
@@ -641,7 +733,7 @@ function T.one_serving_and_one_exchange_share_a_single_reply()
   Assert.notNil(servingRow, "the stocked serving stays selectable")
   local servingId = servingRow.id --[[@as string]]
   chooseEnabledChildRow(rig)
-  Assert.equal(rig.screen:status().mode, "command", "staging the serving returns for the second lead")
+Assert.equal(rig.screen:status().mode, "command", "staging the serving returns for the second lead")
   Assert.equal(#rig.submits, 0, "the staged serving submits nothing")
   Assert.equal(rig.bag:quantity("POTION"), 1, "staging the serving spends no stock")
   local staged = rig.screen:view().staged
@@ -724,18 +816,22 @@ local function stageOneChildChoice(rig)
     local child = snapshot.childView
     Assert.notNil(child, "the child stays observable")
     local focus = child.focusId
-    local focused = nil
-    for _, row in ipairs(child.rows or {}) do
-      if type(row) == "table" and row.id == focus then
-        focused = row
+    local focused = focusedNativeSlot(child, type(focus) == "string" and focus or "")
+    if focused == nil then
+      for _, row in ipairs(child.rows or {}) do
+        if type(row) == "table" and row.id == focus then
+          focused = row
+        end
       end
     end
     if focused ~= nil and focused.enabled == true then
       press(rig, { type = "confirm" })
     elseif focus == "back" then
       press(rig, { type = "navigate", direction = "up" })
-    else
+    elseif type(focus) == "string" and focus:match("^party:") then
       press(rig, { type = "navigate", direction = "down" })
+    else
+      press(rig, { type = "confirm" })
     end
   end
   error("the child never staged its choice", 0)
@@ -794,7 +890,15 @@ function T.two_fainted_leads_are_replaced_without_partial_submit()
   function rig.assets.release(key)
     rig.assets.released[key] = (rig.assets.released[key] or 0) + 1
   end
+  function rig.assets.state()
+    return "ready"
+  end
+  rig.partyRenderer = { draws = {} }
+  function rig.partyRenderer:draw(native, layout, icons)
+    self.draws[#self.draws + 1] = { native = native, layout = layout, icons = icons }
+  end
   local screen = BattleScreenState.new({
+    splRandomState = { state = 0 },
     launchId = launchId,
     manifest = battleManifest(),
     model = Model,
@@ -808,12 +912,14 @@ function T.two_fainted_leads_are_replaced_without_partial_submit()
       return rig.measurement
     end,
     itemCatalog = ItemFixture.makeCatalog(),
+    battleMenus = { party = { manifest = PartyPresentationFixture.manifest(), renderer = rig.partyRenderer, icons = {} } },
     assets = rig.assets,
     text = rig.text,
     windows = rig.windows,
     audio = rig.audio,
   })
   rig.screen = screen
+  seedHeadlessPass(rig)
   rig.port = screen:presentationPort()
   function rig.pump(ticks)
     for _ = 1, ticks or 1 do
@@ -1101,8 +1207,10 @@ function T.exhausted_doubled_lead_reaches_struggle_targets_and_batches_atomicall
     end
     Assert.isTrue(touch.screen:view().menuInputEnabled ~= false, "source menu entry completes before tap")
     touch.screen:input({ { type = "pointer_down", pointerId = id, x = x, y = y } })
+
     touch.screen:input({ { type = "pointer_up", pointerId = id, x = x, y = y } })
     touch.pump(6)
+
     for _ = 1, 12 do
       if touch.screen:view().menuInputEnabled ~= false then
         break
@@ -1194,7 +1302,15 @@ local function openTargetLabelRig(layout, launchId, requestId)
   function rig.assets.release(key)
     rig.assets.released[key] = (rig.assets.released[key] or 0) + 1
   end
+  function rig.assets.state()
+    return "ready"
+  end
+  rig.partyRenderer = { draws = {} }
+  function rig.partyRenderer:draw(native, layout, icons)
+    self.draws[#self.draws + 1] = { native = native, layout = layout, icons = icons }
+  end
   local screen = BattleScreenState.new({
+    splRandomState = { state = 0 },
     launchId = launchId,
     manifest = battleManifest(),
     model = Model,
@@ -1207,12 +1323,14 @@ local function openTargetLabelRig(layout, launchId, requestId)
     measureDisplay = function()
       return rig.measurement
     end,
+    battleMenus = { party = { manifest = PartyPresentationFixture.manifest(), renderer = rig.partyRenderer, icons = {} } },
     assets = rig.assets,
     text = rig.text,
     windows = rig.windows,
     audio = rig.audio,
   })
   rig.screen = screen
+  seedHeadlessPass(rig)
   rig.port = screen:presentationPort()
   function rig.pump(ticks)
     for _ = 1, ticks or 1 do
@@ -1722,17 +1840,26 @@ function T.both_sides_field_two_battlers_with_their_own_pictures_and_health()
             end,
           }
         end,
-        renderPictures = function(_, drawGraphics, pictures)
-          for _, picture in ipairs(pictures) do
-            drawGraphics.draw(picture.image, picture.centerX - picture.width / 2, picture.centerY - picture.height / 2)
+        renderPictures = function(_, drawGraphics, frame)
+          local CompositionFrameDrain = require("tests.support.CompositionFrameDrain")
+          CompositionFrameDrain.drain(drawGraphics, frame)
+          for _, primitive in ipairs(assert(frame.primitives, "production renders its typed frame")) do
+            local handle = primitive.image or primitive.material
+            local image = type(handle) == "table" and (handle.image or handle) or handle
+            local minX, minY = nil, nil
+            for _, vertex in ipairs(primitive.vertices or {}) do
+              local x = math.floor((vertex.clipX / 4096 + 1) * 128 * 2 ^ 20 + 0.5) / 2 ^ 20
+              local y = math.floor((1 - vertex.clipY / 4096) * 96 * 2 ^ 20 + 0.5) / 2 ^ 20
+              if minX == nil or x < minX then
+                minX = x
+              end
+              if minY == nil or y < minY then
+                minY = y
+              end
+            end
+            drawGraphics.draw(image, minX or 0, minY or 0)
           end
           return { handle = "test-picture-pass" }
-        end,
-        menuBlendTargets = function(self, blendGraphics)
-          if self.menuBlend == nil then
-            self.menuBlend = BattleMenuPresenter.newBlendTargets(blendGraphics)
-          end
-          return self.menuBlend
         end,
       },
       frameKey = "four-pictures-frame",

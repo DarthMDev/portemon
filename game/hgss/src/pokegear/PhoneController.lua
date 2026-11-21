@@ -230,6 +230,22 @@ local function renderPhoneInformation(resources, snapshot, plan)
   PokegearPhoneRenderer.drawInformation(resources, view --[[@as table<string, unknown>]], plan.content)
 end
 
+-- The field call entry: the live caller plates and message with the owed
+-- choice menu, drawn over whatever the host already painted. The field
+-- presents scripted and accepted calls with this instead of the card, so
+-- the live field stays visible around the call.
+---@param resources table<string, unknown> borrowed host collaborators
+---@param snapshot table<string, unknown> the card status carrying the detached view
+---@param plan table<string, unknown> the published plan carrying the payload
+local function renderPhoneCallWindow(resources, snapshot, plan)
+  local PokegearPhoneRenderer = require("libs.hgss.src.presentation.PokegearPhoneRenderer")
+  local view = assert(
+    (snapshot --[[@as table<string, unknown>]]).view,
+    "the phone call window render reads the published child view"
+  )
+  PokegearPhoneRenderer.drawCallWindow(resources, view --[[@as table<string, unknown>]], plan.content)
+end
+
 ---@class PhoneController.Options
 ---@field state table<string, unknown> the durable companion owner
 ---@field catalog table<string, unknown> the borrowed contact catalog
@@ -1463,17 +1479,16 @@ function PhoneController:_callView()
   detached.className = self._classes[
     shown.contact --[[@as string]]
   ]
-  -- The live call publishes the source dim state with the caller-name
-  -- content for windows[1] in colors (1,2,0): the host boundary owns
-  -- the palette blend, the view owns the state and content. Exiting
-  -- the call clears the whole projection, dim and name with it.
+  -- The live call publishes the source dim state with the caller name the
+  -- renderer paints into windows[1]: the host boundary owns the palette
+  -- blend, the view owns the state and content. Exiting the call clears
+  -- the whole projection, dim and name with it.
   -- The fast-forward hitbox stays registered for the whole call in
   -- the source and unsets on exit; the view carries its geometry.
   -- No choiceCursor publication: the internal cursor still drives
   -- view.callMenu.cursor, and the choice rows answer through the
   -- shared menu projection.
   detached.dim = true
-  detached.nameWindow = { text = detached.name, colors = { 1, 2, 0 } }
   detached.fastForward = {
     x = FAST_FORWARD_HITBOX.x,
     y = FAST_FORWARD_HITBOX.y,
@@ -1617,10 +1632,12 @@ function PhoneController:status()
     content = content,
     render = renderPhonePresentation,
     renderInformation = renderPhoneInformation,
+    renderCallWindow = renderPhoneCallWindow,
   }
   return {
     open = true,
     tab = "phone",
+    focus = "phone",
     busy = inCall,
     dismissible = not inCall,
     nestedCancel = inMenu or inCall,

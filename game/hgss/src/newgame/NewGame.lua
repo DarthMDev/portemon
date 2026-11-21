@@ -11,6 +11,8 @@ local PlayTime = require("libs.hgss.src.save.PlayTime")
 local PlayerData = require("libs.hgss.src.save.PlayerData")
 local FieldTravelState = require("libs.hgss.src.field.FieldTravelState")
 local FashionCaseState = require("libs.hgss.src.save.FashionCaseState")
+local FieldPoisonSave = require("libs.hgss.src.save.FieldPoisonSave")
+local SysInfoState = require("libs.hgss.src.save.SysInfoState")
 local MonsSave = require("libs.mons.src.MonsSave")
 local U32 = require("libs.codec.src.U32")
 
@@ -195,8 +197,10 @@ function NewGame.createCandidate(options)
     surfaceId = nil,
     playerData = nil,
     mons = mons,
+    fieldPoison = FieldPoisonSave.initial(),
     bag = BagSave.empty(),
     fashionCase = FashionCaseState.empty(),
+    sysInfo = SysInfoState.empty(),
     mart = MartSave.empty(),
     mailbox = Mailbox.new():capture(),
     photoAlbum = PhotoAlbum.new():capture(),

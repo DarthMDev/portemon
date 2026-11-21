@@ -21,6 +21,7 @@ local Registry = require("libs.script.src.Registry")
 local Composition = require("libs.script.src.Composition")
 local TaskRegistry = require("libs.script.src.TaskRegistry")
 local Scheduler = require("libs.script.src.Scheduler")
+local MovementBarrierTask = require("libs.hgss.src.script.tasks.MovementBarrierTask")
 local MovementTask = require("libs.hgss.src.script.tasks.MovementTask")
 local WaitTicksTask = require("libs.script.src.tasks.WaitTicksTask")
 local ScriptActorWorld = require("libs.hgss.src.script.ScriptActorWorld")
@@ -282,6 +283,9 @@ local function baseOptions(overrides)
   end
   local scheduler = options.scriptScheduler
   options.actors.beginFixedStep = options.actors.beginFixedStep or function() end
+  options.actors.takeCommittedSteps = options.actors.takeCommittedSteps or function()
+    return nil
+  end
   scheduler.autonomousActorsLocked = scheduler.autonomousActorsLocked or function()
     return false
   end
@@ -325,6 +329,9 @@ local function baseOptions(overrides)
       out.gestureOffsetY = 0
       return out
     end
+  player.takeCommittedTerrainSteps = player.takeCommittedTerrainSteps or function()
+    return nil
+  end
   return options
 end
 
@@ -348,8 +355,12 @@ end
 
 -- This fixture keeps the complete actor-step seam intact: a real manager owns
 -- the ordinary actor, a real scheduler owns the lock query, and the session
--- composes the callback that joins them for one fixed tick.
-local function realActorStepSession()
+-- composes the callback that joins them for one fixed tick. `options.behaviors`
+-- keys tile behaviors by "fieldX:fieldZ"; `options.terrainEffects` receives the
+-- session's published responses.
+local function realActorStepSession(options)
+  options = options or {}
+  local behaviors = options.behaviors or {}
   local map = {
     mapId = 61,
     coordinateOrigin = { x = 0, z = 0 },
@@ -370,6 +381,9 @@ local function realActorStepSession()
     collision = {
       containsLocal = function(_, fieldX, fieldZ)
         return fieldX >= 0 and fieldX < 32 and fieldZ >= 0 and fieldZ < 32
+      end,
+      getLocal = function(_, fieldX, fieldZ)
+        return { behavior = behaviors[fieldX .. ":" .. fieldZ] or 0 }
       end,
     },
     fieldData = {
@@ -435,6 +449,7 @@ local function realActorStepSession()
     currentMap = map,
     actors = manager,
     scriptScheduler = scheduler,
+    terrainEffects = options.terrainEffects,
   }))
   return session, manager, lockQueries
 end
@@ -471,6 +486,72 @@ function T.field_session_captures_actor_baselines_before_scheduler_mutation()
   Assert.equal(previous.x, start.x, "FieldSession captures the actor baseline before scheduler motion")
   Assert.equal(midpoint.x, (start.x + current.x) / 2, "the composed field tick exposes a scripted midpoint")
   Assert.equal(midpoint.z, (start.z + current.z) / 2, "the composed field tick keeps the other axis stable")
+  manager:dispose()
+end
+
+-- Every map object's committed step publishes that object's own source terrain
+-- response at its own tile, exactly once, so an object walking into grass
+-- rustles it. An invisible object spawns no presentation response (the source
+-- hides its billboard), and an in-flight step never publishes early.
+function T.committed_actor_steps_publish_their_own_terrain_response()
+  local MetatileBehavior = require("libs.hgss.src.world.MetatileBehavior")
+  local emitted = {}
+  local terrainEffects = {
+    updateFixed = function() end,
+    emitAll = function(_, responses)
+      for _, response in ipairs(responses) do
+        emitted[#emitted + 1] = response
+      end
+    end,
+  }
+  local session, manager = realActorStepSession({
+    behaviors = {
+      ["2:3"] = MetatileBehavior.BEHAVIOR.TALL_GRASS,
+      ["3:3"] = MetatileBehavior.BEHAVIOR.TALL_GRASS,
+    },
+    terrainEffects = terrainEffects,
+  })
+  local actorId = "map:61:object:0"
+  local scheduler = session.scriptScheduler
+  local schedulerStep = scheduler.step
+  local pending, progress = nil, 0
+  scheduler.step = function(self, tick, input)
+    if pending ~= nil then
+      progress = progress + 1
+      manager:advanceScriptedAction(actorId, progress, FieldPlayerModule.WALK_STEP_TICKS)
+      if progress == FieldPlayerModule.WALK_STEP_TICKS then
+        manager:commitScriptedAction(actorId)
+        pending = nil
+      end
+    end
+    return schedulerStep(self, tick, input)
+  end
+  local function walk(direction)
+    manager:beginScriptedAction(actorId, { action = "walk", direction = direction, speed = "normal" })
+    pending, progress = direction, 0
+  end
+  local function runTicks(count)
+    for _ = 1, count do
+      session:updateFixed({})
+    end
+  end
+
+  walk("east")
+  runTicks(FieldPlayerModule.WALK_STEP_TICKS - 1)
+  Assert.equal(#emitted, 0, "an in-flight step publishes no response")
+  runTicks(1)
+  Assert.equal(#emitted, 1, "the committed step publishes its own grass response")
+  Assert.equal(emitted[1].kind, "tall_grass")
+  Assert.equal(emitted[1].fieldX, 3, "the response anchors the object's committed tile")
+  Assert.equal(emitted[1].fieldZ, 3)
+  Assert.equal(emitted[1].ownerKey, actorId, "the stepping object owns its response")
+  runTicks(2)
+  Assert.equal(#emitted, 1, "the published step is never repeated")
+
+  manager:hide(actorId)
+  walk("west")
+  runTicks(FieldPlayerModule.WALK_STEP_TICKS)
+  Assert.equal(#emitted, 1, "an invisible object spawns no presentation response")
   manager:dispose()
 end
 
@@ -3999,6 +4080,7 @@ local function movementSession(options)
     scriptScheduler = options.scriptScheduler,
     scriptClient = options.scriptClient,
     eventResolver = options.eventResolver,
+    interactions = options.interactions,
   }))
   return session, player, map
 end
@@ -4052,6 +4134,378 @@ function T.session_passes_committed_step_speed_to_the_player_visual()
   Assert.equal(player.fieldX, 3, "the auto-run lock applies to the following step")
   Assert.equal(visual.pose, "run", "the locked run keeps the run clip")
   Assert.equal(visual.poseTick, 16, "the locked run keeps the source gait cadence")
+end
+
+-- The source samples field-locking edges only on a settled avatar
+-- (FieldInput_Update admits PLAYER_MOVE_STATE_END/NONE), so a Start Menu or
+-- interaction edge read while the player's own step is in flight dies with
+-- its tick instead of taking the field later at the settle boundary.
+function T.field_locking_edges_read_mid_step_die_with_their_tick()
+  local interactionsResolved = 0
+  local session, player = movementSession({
+    interactions = {
+      resolve = function()
+        interactionsResolved = interactionsResolved + 1
+        return nil
+      end,
+    },
+  })
+  local host = session.applicationHost
+  session:updateFixed({ pressedDirection = "east" })
+  session:updateFixed({ heldDirection = "east" })
+  Assert.isTrue(player.motion ~= "idle", "setup starts an ordinary step")
+  local startX = player.fieldX
+
+  session:updateFixed({ heldDirection = "east", menuPressed = true, actionPressed = true })
+  Assert.isFalse(host:isActive(), "a mid-step menu edge does not take the field")
+  Assert.equal(interactionsResolved, 0, "a mid-step interaction edge does not resolve")
+
+  for _ = 1, 16 do
+    session:updateFixed({ heldDirection = "east" })
+    if player.motion == "idle" then
+      break
+    end
+  end
+  Assert.equal(player.motion, "idle", "the in-flight step commits its whole tile")
+  Assert.equal(player.fieldX, startX + 1, "the step reaches its own destination tile")
+
+  -- The first settled arbitration tick is where a retained edge would fire.
+  session:updateFixed({ heldDirection = "east" })
+  Assert.equal(player.motion, "walking", "the held direction keeps walking through the settle tick")
+  Assert.isFalse(host:isActive(), "the mid-step menu edge never opens the field")
+  Assert.equal(interactionsResolved, 0, "the mid-step interaction edge never resolves")
+
+  -- A fresh edge on a settled tick opens: the player presses again.
+  for _ = 1, 16 do
+    session:updateFixed({ heldDirection = "east" })
+    if player.motion == "idle" then
+      break
+    end
+  end
+  Assert.equal(player.motion, "idle", "the next step commits")
+  session:updateFixed({ menuPressed = true })
+  Assert.isTrue(host:isActive(), "a fresh edge on the settled boundary opens the menu")
+end
+
+-- A script's Start Menu reopen request arrives at the post-scheduler
+-- arbitration point, which is also reachable while a step is in flight: the
+-- request stays queued instead of freezing the unfinished step.
+function T.script_reopen_mid_step_waits_for_the_step_to_commit()
+  local session, player = movementSession()
+  local host = session.applicationHost
+  session:updateFixed({ pressedDirection = "east" })
+  session:updateFixed({ heldDirection = "east" })
+  Assert.isTrue(player.motion ~= "idle", "setup starts an ordinary step")
+  local startX = player.fieldX
+
+  host:requestReopen()
+  session:updateFixed({ heldDirection = "east" })
+  Assert.isFalse(host:isActive(), "the mid-step reopen request does not take the field")
+  Assert.equal(host.reopenRequests, 1, "the request stays queued until the step settles")
+
+  for _ = 1, 12 do
+    if host:isActive() then
+      break
+    end
+    session:updateFixed({ heldDirection = "east" })
+  end
+  Assert.equal(player.fieldX, startX + 1, "the in-progress step commits its whole tile first")
+  Assert.isTrue(host:isActive(), "the queued request opens the menu on the settled boundary")
+end
+
+-- One foreground field script driving the real player through the real
+-- Scheduler + MovementTask stack. The player facade forwards the scripted
+-- action owners directly to the live FieldPlayer, so the session tick sees
+-- exactly the production split between the script phase and the field update.
+---@param map RuntimeFieldMap
+---@param player FieldPlayer
+---@param steps table[]
+---@param visual FieldPlayerVisual?
+---@param terrainEffects table?
+---@return FieldSession session, table scheduler, FakeServices services, string instanceId
+local function scriptedPlayerSession(map, player, steps, visual, terrainEffects)
+  local manager = {
+    getActor = function()
+      return nil
+    end,
+    show = function() end,
+    hide = function() end,
+    setPosition = function() end,
+    setFacing = function() end,
+    setMovementType = function() end,
+    setAnimationPaused = function() end,
+    getPosition = function()
+      error("unexpected manager getPosition")
+    end,
+    getFacing = function()
+      error("unexpected manager getFacing")
+    end,
+    numericId = function()
+      return nil
+    end,
+    actorIdForMapIndex = function()
+      return nil
+    end,
+    cameraTargetId = function()
+      return nil
+    end,
+    partnerId = function()
+      return nil
+    end,
+    isVisible = function()
+      return true
+    end,
+    setPresentationOffset = function() end,
+    clearPresentationOffset = function() end,
+    removePresence = function() end,
+    materializeObject = function() end,
+  }
+  local facade = {
+    position = function()
+      return { fieldX = player.fieldX, fieldZ = player.fieldZ, worldY = player.worldY }
+    end,
+    facing = function()
+      return player.facing
+    end,
+    turn = function(_, direction)
+      player:turn(direction)
+    end,
+    setPosition = function(_, position)
+      player:setScriptPosition(position)
+    end,
+    beginScriptedAction = function(_, action)
+      player:beginScriptedAction(action)
+    end,
+    advanceScriptedAction = function(_, progress, duration)
+      player:advanceScriptedAction(progress, duration)
+    end,
+    commitScriptedAction = function()
+      player:commitScriptedAction()
+    end,
+    cancelScriptedMovement = function()
+      player:cancelScriptedMovement()
+    end,
+    isScriptedMoving = function()
+      return player:isScriptedMoving()
+    end,
+    gender = function()
+      return 0
+    end,
+    name = function()
+      return "Gold"
+    end,
+  }
+  local world = ScriptActorWorld.new(manager --[[@as ScriptActorManager]], facade)
+  local services = FakeServices.new()
+  services.actors = world --[[@as unknown as ScriptActorManager]]
+  services.player = facade --[[@as unknown as FieldPlayer]]
+  local registry = Registry.new()
+  local composition = Composition.new(registry)
+  local taskRegistry = TaskRegistry.new()
+  taskRegistry:register("wait_ticks", 1, WaitTicksTask --[[@as unknown as TaskImplementation]])
+  taskRegistry:register("movement", 1, MovementTask --[[@as unknown as TaskImplementation]])
+  taskRegistry:register("movement_barrier", 1, MovementBarrierTask --[[@as unknown as TaskImplementation]])
+  local scheduler = Scheduler.new({
+    services = services,
+    taskRegistry = taskRegistry,
+    semantics = require("libs.hgss.src.script.RuntimeValues"),
+    resolveComposition = function(id)
+      return composition:effective(id)
+    end,
+  })
+  local resource = S.script({ api = 1, id = "test.scripted_player_walk", steps = steps })
+  registry:installBase(resource.id, resource, "generated")
+  local composed = assert(composition:effective(resource.id))
+  local instanceId = assert(scheduler:createForeground(composed, nil, 0))
+  local session = FieldSession.new(baseOptions({
+    currentMap = map,
+    player = player,
+    playerVisual = visual,
+    scriptScheduler = scheduler,
+    terrainEffects = terrainEffects,
+  }))
+  return session, scheduler, services, instanceId
+end
+
+-- A foreground script that walks the player without an explicit input lock is
+-- a legal source script (ApplyMovement itself never locks). The movement task
+-- owns that step: it must take exactly the calibrated number of field ticks,
+-- the script must complete without faulting on a motion the ordinary update
+-- advanced out from under it, and the player must land on the committed tile.
+-- A scripted walk is also a real map-object step, so each entered grass tile
+-- spawns that step's own source response, owned by the player.
+function T.unlocked_scripted_player_walk_keeps_its_owner_and_cadence()
+  local map = movementMap({
+    ["1:4"] = { behavior = MetatileBehavior.BEHAVIOR.TALL_GRASS },
+    ["2:4"] = { behavior = MetatileBehavior.BEHAVIOR.TALL_GRASS },
+  })
+  local player = FieldPlayer.new({ currentMap = map, fieldX = 0, fieldZ = 4, surfaceId = 0, facing = "south" })
+  local visual = FieldPlayerVisual.new({ player = player, spriteId = 0 })
+  local emitted = {}
+  local terrainEffects = {
+    updateFixed = function() end,
+    emitAll = function(_, responses)
+      for _, response in ipairs(responses) do
+        emitted[#emitted + 1] = response
+      end
+    end,
+  }
+  local session, scheduler, services, instanceId = scriptedPlayerSession(map, player, {
+    S.applyMovement({ actor = "player", movement = { S.m.walk({ direction = "east", speed = "normal", tiles = 2 }) } }),
+    S.waitMovement(),
+    S.stop(),
+  }, visual, terrainEffects)
+
+  local poses = {}
+  local posesAtCommit = {}
+  for _ = 1, 60 do
+    session:updateFixed({})
+    if visual.pose == "walk" then
+      poses[#poses + 1] = visual.poseTick
+    end
+    if player.fieldX > 0 and posesAtCommit[player.fieldX] == nil then
+      posesAtCommit[player.fieldX] = #poses
+    end
+    if player.fieldX == 2 and player.motion == "idle" and visual.pose == "idle" then
+      break
+    end
+  end
+
+  local expected = {}
+  for index = 1, 16 do
+    expected[index] = index
+  end
+  Assert.deepEqual(poses, expected, "two normal scripted tiles advance one pose frame per field tick")
+  Assert.equal(posesAtCommit[1], 8, "the first scripted tile commits on its own eight-tick calibration")
+  Assert.equal(posesAtCommit[2], 16, "the second scripted tile commits on its own eight-tick calibration")
+  Assert.equal(player.fieldX, 2, "the scripted walk reaches its destination")
+  Assert.equal(visual.pose, "idle", "the finished scripted walk releases the pose clock")
+  for _ = 1, 8 do
+    session:updateFixed({})
+  end
+  Assert.isNil(services.events:eventFor("script.error", instanceId), "an unlocked scripted walk must not fault")
+  Assert.isNil(scheduler:foregroundEnvironmentId(), "the walking script reaches its own stop command")
+
+  Assert.equal(#emitted, 2, "each committed scripted step spawns exactly one grass response")
+  Assert.equal(emitted[1].kind, "tall_grass", "the scripted step names the entered tile's grass")
+  Assert.equal(emitted[1].fieldX, 1, "the responses anchor the entered tiles")
+  Assert.equal(emitted[1].fieldZ, 4)
+  Assert.equal(emitted[2].fieldX, 2, "the responses anchor the entered tiles")
+  Assert.equal(emitted[1].ownerKey, "player", "the player owns the scripted step's response")
+end
+
+-- The terrain-effect clock advances with every live owner: the player plus
+-- every object published on the actor world's current map, keyed by its actor
+-- identity so each held effect releases on the object that stepped into it.
+function T.session_publishes_every_live_actor_as_a_terrain_effect_owner()
+  local captured = {}
+  local terrainEffects = {
+    updateFixed = function(_, owners)
+      local first = owners["map:61:object:0"]
+      local second = owners["map:61:object:1"]
+      captured[#captured + 1] = {
+        playerX = owners.player.fieldX,
+        playerZ = owners.player.fieldZ,
+        playerFacing = owners.player.facing,
+        firstX = first and first.fieldX or nil,
+        firstZ = first and first.fieldZ or nil,
+        firstFacing = first and first.facing or nil,
+        secondX = second and second.fieldX or nil,
+        secondFacing = second and second.facing or nil,
+      }
+    end,
+    emitAll = function() end,
+    emit = function() end,
+  }
+  local objects = {
+    { id = "map:61:object:0", fieldX = 4, fieldZ = 6, facing = "north" },
+    { id = "map:61:object:1", fieldX = 9, fieldZ = 2, facing = "west" },
+  }
+  local actors = {
+    currentMapId = 61,
+    beginFixedStep = function() end,
+    step = function() end,
+    cameraTargetId = function()
+      return nil
+    end,
+    actorsOf = function(_, mapId)
+      Assert.equal(mapId, 61, "only the current actor map supplies owners")
+      local view = {}
+      for index, object in ipairs(objects) do
+        view[index] = {
+          actorId = object.id,
+          facing = object.facing,
+          getFieldPosition = function()
+            return { fieldX = object.fieldX, fieldZ = object.fieldZ }
+          end,
+        }
+      end
+      return view
+    end,
+  }
+  local player = defaultPlayer()
+  local session = FieldSession.new(baseOptions({
+    player = player,
+    actors = actors,
+    terrainEffects = terrainEffects,
+  }))
+
+  session:updateFixed({})
+  Assert.equal(#captured, 1)
+  Assert.equal(captured[1].playerX, player.fieldX)
+  Assert.equal(captured[1].playerFacing, player.facing)
+  Assert.equal(captured[1].firstX, 4, "every live object joins the owner set at its tile")
+  Assert.equal(captured[1].firstZ, 6)
+  Assert.equal(captured[1].firstFacing, "north", "each owner carries its own facing")
+  Assert.equal(captured[1].secondX, 9, "all live objects own their effects, not only the partner")
+  Assert.equal(captured[1].secondFacing, "west")
+
+  objects[1].fieldX, objects[1].fieldZ, objects[1].facing = 5, 6, "east"
+  session:updateFixed({})
+  Assert.equal(captured[2].firstX, 5, "an owner record follows the live actor tile")
+  Assert.equal(captured[2].firstFacing, "east")
+end
+
+-- On-frame map scripts are only evaluated on a settled player boundary. A
+-- script that started while the player was mid-step froze that step (and its
+-- follower trail) and then refused the player movement it issued, because the
+-- player was still physically walking.
+function T.on_frame_map_scripts_start_only_on_a_settled_player_boundary()
+  local map = movementMap()
+  local player = FieldPlayer.new({ currentMap = map, fieldX = 0, fieldZ = 4, surfaceId = 0, facing = "east" })
+  local calls = {}
+  local started = false
+  local controller = {
+    hasLifecycle = function()
+      return false
+    end,
+    startLifecycle = function()
+      return false
+    end,
+    evaluateFrame = function(_, tick)
+      calls[#calls + 1] = tick
+      if started then
+        return false
+      end
+      started = true
+      return true
+    end,
+  }
+  local session = FieldSession.new(baseOptions({ currentMap = map, player = player, initController = controller }))
+
+  Assert.isTrue(player:tryStep("east"), "the fixture step must start")
+  for _ = 1, 12 do
+    session:updateFixed({})
+    if player.motion == "idle" then
+      break
+    end
+  end
+  Assert.equal(player.fieldX, 1, "the ordinary step commits before any frame rule runs")
+  Assert.deepEqual(calls, {}, "no on-frame rule is evaluated while the player is mid-step")
+
+  session:updateFixed({})
+  Assert.equal(#calls, 1, "the settled step boundary offers the frame rule")
+  Assert.equal(calls[1], session.tick, "the rule sees the settled tick")
 end
 
 local function ledgeSession(options)
@@ -6000,6 +6454,65 @@ function T.half_fractional_pair_is_rejected_not_projected()
     end)
     Assert.isFalse(ok, "half a fractional world pair must fault, never silently project")
   end
+end
+
+-- A save that loads standing on tall grass must look like standing in it:
+-- completing map entry emits the standing tile's terrain response once,
+-- so the grass overlay covers the player exactly as a walked-in step
+-- would. Idle ticks afterwards never re-emit.
+function T.standing_grass_emits_its_overlay_once_map_entry_completes()
+  local MetatileBehavior = require("libs.hgss.src.world.MetatileBehavior")
+  local emitted = {}
+  local standX, standZ = 4, 13
+  local player = defaultPlayer()
+  player.fieldX, player.fieldZ = standX, standZ
+  local session = FieldSession.new(baseOptions({
+    player = player,
+    currentMap = {
+      mapId = 61,
+      coordinateOrigin = { x = 0, z = 0 },
+      collision = {
+        containsLocal = function()
+          return true
+        end,
+        getLocal = function()
+          return { behavior = MetatileBehavior.BEHAVIOR.TALL_GRASS }
+        end,
+      },
+      fieldData = { events = { warps = {} } },
+      updateAnimated = function() end,
+    },
+    terrainEffects = {
+      updateFixed = function() end,
+      emitAll = function(_, responses)
+        emitted[#emitted + 1] = responses
+      end,
+    },
+    initController = {
+      hasLifecycle = function()
+        return false
+      end,
+      startLifecycle = function()
+        return false
+      end,
+    },
+    autoAcknowledgePresentation = true,
+  }))
+  session:beginMapEntry()
+  local guard = 0
+  while session.mapEntryController:isActive() and guard < 20 do
+    session:updateFixed({})
+    guard = guard + 1
+  end
+  Assert.isFalse(session.mapEntryController:isActive(), "map entry completes")
+  Assert.equal(#emitted, 1, "the standing tile emits its grass response exactly once")
+  Assert.equal(#emitted[1], 1, "the standing tile resolves to one grass response")
+  Assert.equal(emitted[1][1].kind, "tall_grass", "the standing tile response names its grass")
+  Assert.equal(emitted[1][1].fieldX, standX, "the standing response anchors the player tile")
+  Assert.equal(emitted[1][1].fieldZ, standZ, "the standing response anchors the player tile")
+  session:updateFixed({})
+  session:updateFixed({})
+  Assert.equal(#emitted, 1, "idle ticks never re-emit the standing overlay")
 end
 
 return { tests = T }

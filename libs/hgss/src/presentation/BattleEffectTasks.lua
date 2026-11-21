@@ -22,7 +22,9 @@
 -- BattleEffectTasks.supportsKind is the narrow admission view over this
 -- same dispatch.
 
+local BattleConfiguredSpriteEffects = require("libs.hgss.src.presentation.BattleConfiguredSpriteEffects")
 local BattleParticleSystems = require("libs.hgss.src.presentation.BattleParticleSystems")
+local BattleSourceTimedEffects = require("libs.hgss.src.presentation.BattleSourceTimedEffects")
 
 ---@class BattleEffectTasks
 local BattleEffectTasks = {}
@@ -45,6 +47,10 @@ BattleEffectTasks.PARTICLE_CONTINUATION_KIND = BattleParticleSystems.EMITTER_KIN
 BattleEffectTasks.EMITTER_BATTLER_PATH_KIND = BattleParticleSystems.PATH_KIND
 BattleEffectTasks.EMITTER_CURVED_PATH_KIND = BattleParticleSystems.CURVED_PATH_KIND
 BattleEffectTasks.PICTURE_ANIMATION_KIND = "pokemon-picture-animation"
+-- BattleAnimFunc_AnimateSprites' shared battler-sprite frame loop: it
+-- draws the sprite manager for its frame count and owns no
+-- interpolation, so copies stay visible exactly while the loop runs.
+local MANAGED_SPRITE_DRAW_KIND = "managed-sprite-draw-loop"
 
 local VALID_TASK_STATES = {
   pending = true,
@@ -58,17 +64,12 @@ local VALID_TASK_STATES = {
 -- the occurrence past the native sound-wait horizon.
 local SOUND_ESCAPE_TICKS = 90
 
--- Particle emitter centers in explicit scene coordinates, one per native
--- effect slot. Ally emissions stage over the player side and enemy
--- emissions over the foe side instead of collapsing into one rectangle.
-local EMITTER_CENTERS = {
-  ["solo-player"] = { x = 64, y = 80 },
-  ["solo-enemy"] = { x = 192, y = 80 },
-  ["player-side-slot-1"] = { x = 48, y = 96 },
-  ["enemy-side-slot-1"] = { x = 208, y = 96 },
-  ["player-side-slot-2"] = { x = 80, y = 64 },
-  ["enemy-side-slot-2"] = { x = 176, y = 64 },
-}
+-- Battler picture centers in explicit scene coordinates, one per native
+-- effect slot. They match the settled battlefield slot geometry the
+-- renderer draws mons through (not the 3D emitter volumes): 2D sprite
+-- anchors, dashes, and magnifier legs all ride the mon's picture center
+-- so effects stay centered on the displayed battler.
+local EMITTER_CENTERS = require("libs.hgss.src.presentation.BattleSlotCenters").centers
 
 ---@class BattleVoiceMonitor
 ---@field _voice string awaited voice key staged by one occurrence
@@ -299,9 +300,21 @@ end
 -- verified synchronous-marker set, and fails every other kind closed.
 -- Completion times come only from the source parameters the producer
 -- emitted, never from a fixed budget.
+-- Fixed source lifetimes behind operand-free native bodies, keyed by
+-- task kind: WobbleDefenderOnBg (pokemon-picture-target-background-slide)
+-- runs three phases of one setup tick plus seventeen wobble ticks and
+-- one teardown tick (battle_anim_effects.c BattleAnimTask_WobbleDefenderOnBg),
+-- 3 * (1 + 17) + 1. The timed body below owns only that source lifetime;
+-- the scanline wobble pixels themselves are not reproduced.
+local WOBBLE_DEFENDER_ON_BG_TICKS = 55
+
 ---@param parameters table<string, unknown> compiled task parameters
+---@param kind string normalized task kind behind fixed source lifetimes
 ---@return integer? source ticks behind completion, absent for timing-less spawns
-local function visualDuration(parameters)
+local function visualDuration(parameters, kind)
+  if kind == "pokemon-picture-target-background-slide" then
+    return WOBBLE_DEFENDER_ON_BG_TICKS
+  end
   if isPositiveInt(parameters.durationTicks) then
     return parameters.durationTicks
   end
@@ -859,11 +872,6 @@ local SYNCHRONOUS_MARKER_KINDS = {
   ["battle-palette-fade"] = true,
   ["battle-presentation-state-reset"] = true,
   ["battle-background-position-transition"] = true,
-  -- Sprite-effect spawns carry a mode and selector values, never timing
-  -- operands: the managed draw loop stages its sprite behind the
-  -- manager preset, so the typed task owns no interpolation lifetime
-  -- and retires on its first tick instead of failing closed.
-  ["managed-sprite-draw-loop"] = true,
   -- Sprite scale-settle presets carry their target behind the resolved
   -- callback without a compiled boundary: the settle owns no
   -- interpolation lifetime, so it retires on its first tick instead of
@@ -907,6 +915,8 @@ end
 ---@field _sweep table<string, integer>? compiled scroll totals behind per-tick writes
 ---@field _scrollSaved table<string, number> viewport snapshot behind owned-only restoration
 ---@field _lastScroll table<string, number>? last applied viewport behind owned-only restoration
+---@field _shake BattleShakeState? picture shake behind per-tick writes
+---@field _picturePatched boolean picture patch is staged
 ---@field _ticks integer source ticks advanced
 ---@field _duration integer? source ticks behind completion, absent for synchronous markers
 ---@field _state string pending, running, complete, or cancelled
@@ -915,12 +925,178 @@ end
 local BattleBlendTransition = {}
 BattleBlendTransition.__index = BattleBlendTransition
 
+-- Resolves the battler pictures one background transition owns from the
+-- compiled picture sets and the frozen occurrence topology. The
+-- all-positions set names every live battler; every other set keeps the
+-- producer's attacker/target partition. Unknown sets fail instead of
+-- guessing a picture from an unaddressed slot.
+---@param pictureSets table<integer, string> compiled picture sets behind the transition
+---@param context table<string, unknown> occurrence-bound playback context
+---@param kind string task kind under construction
+---@return table<integer, table<string, unknown>> owned combatant and activation pairs
+local function backgroundActivations(pictureSets, context, kind)
+  local topology = type(context) == "table" and context.topology or nil
+  local attacker = type(topology) == "table" and topology.attacker or nil
+  local targets = type(topology) == "table" and topology.targets or nil
+  local wantAttacker, wantTargets = false, false
+  for _, set in ipairs(pictureSets) do
+    if set == "all-battler-positions" then
+      wantAttacker, wantTargets = true, true
+    elseif ATTACKER_PICTURE_NAMES[set] == true then
+      wantAttacker = true
+    elseif TARGET_PICTURE_NAMES[set] == true then
+      wantTargets = true
+    else
+      error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " pictures a known battler set, not " .. tostring(set), 0)
+    end
+  end
+  local activations = {}
+  if wantAttacker then
+    if type(attacker) ~= "table" or type(attacker.combatant) ~= "number" then
+      error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " pictures its occurrence attacker", 0)
+    end
+    activations[#activations + 1] = { combatant = attacker.combatant, activation = attacker.activation }
+  end
+  if wantTargets then
+    if type(targets) ~= "table" or #targets < 1 then
+      error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " pictures its occurrence targets", 0)
+    end
+    for _, target in ipairs(targets) do
+      if type(target) == "table" and type(target.combatant) == "number" and #activations < 4 then
+        activations[#activations + 1] = { combatant = target.combatant, activation = target.activation }
+      end
+    end
+  end
+  if #activations < 1 then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " pictures at least one occurrence battler", 0)
+  end
+  return activations
+end
+
+-- Reads the currently displayed picture offset behind one activation:
+-- signed geometry fields read directly, and the merged crop byte unwraps
+-- to its signed displacement; an absent patch reads as base. Native
+-- chains from the absolute pic position, so the return leg must start
+-- where the out-leg persisted.
+---@param scene table<string, unknown> scene behind the owned picture overlay
+---@param activation table<string, unknown> combatant and activation pair behind the moved picture
+---@return integer currentX displayed X offset in native pixels
+---@return integer currentY displayed Y offset in native pixels
+local function currentPictureOffset(scene, activation)
+  local present = scene:pictureState(activation)
+  if type(present) ~= "table" then
+    return 0, 0
+  end
+  local currentX, currentY = 0, 0
+  if type(present.pictureXOffset) == "number" then
+    currentX = math.floor(present.pictureXOffset)
+  end
+  if type(present.pictureYOffset) == "number" then
+    currentY = math.floor(present.pictureYOffset)
+  end
+  local rawX = present.pictureXOffset2
+  if type(rawX) == "number" then
+    local unwrapped = math.floor(rawX)
+    if unwrapped > 127 then
+      unwrapped = unwrapped - 256
+    end
+    currentX = currentX + unwrapped
+  end
+  return clampPictureOffset(currentX), clampPictureOffset(currentY)
+end
+
+-- Selector-36 ShakeTargets picture state behind one blend task: the
+-- resolved activations shake ±amp around their construction-time base
+-- with the native interval/count phase machine
+-- (BattleAnimUtil_InitShake/UpdateShake in battle_anim_util.c). Ticks is
+-- the exact native write count; a motionless count degrades to no shake
+-- instead of inventing motion or failing a valid program.
+---@class BattleShakeState
+---@field activations table<integer, table<string, unknown>> owned combatant and activation pairs
+---@field baseX table<integer, integer> construction-time displayed X offsets in native pixels
+---@field baseY table<integer, integer> construction-time displayed Y offsets in native pixels
+---@field ampX integer shake amplitude X in native pixels
+---@field ampY integer shake amplitude Y in native pixels
+---@field interval integer source ticks between phase toggles
+---@field count integer remaining four-phase cycles behind completion
+---@field timer integer ticks since the last phase toggle
+---@field phase integer toggles inside the current cycle, 0..3
+---@field x integer current shake X in native pixels
+---@field y integer current shake Y in native pixels
+---@field prevX integer previous shake X behind the alternation
+---@field prevY integer previous shake Y behind the alternation
+
+-- Builds the picture shake behind one ShakeTargets spawn, or nil when
+-- the compiled count carries no motion. Unknown picture sets and
+-- unaddressed battlers fail closed; the task owns no leases either way.
+---@param parameters table<string, unknown> compiled transition operands
+---@param scene table<string, unknown> scene behind the owned picture overlay
+---@param context table<string, unknown> occurrence-bound playback context carrying the visual topology
+---@param kind string task kind under diagnosis
+---@return BattleShakeState? picture shake behind per-tick writes
+---@return integer shake write ticks behind the task boundary
+local function shakePlan(parameters, scene, context, kind)
+  local failure = "BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " shakes its named pictures"
+  if
+    type(scene.applyTaskPicturePatch) ~= "function"
+    or type(scene.removeTaskPicturePatch) ~= "function"
+    or type(scene.pictureState) ~= "function"
+  then
+    error(failure .. " through the scene overlay seam", 0)
+  end
+  local count = parameters.steps
+  local interval = parameters.ticksPerStep
+  if type(count) ~= "number" or count % 1 ~= 0 or type(interval) ~= "number" or interval % 1 ~= 0 then
+    error(failure, 0)
+  end
+  if count < 1 or interval < 0 then
+    return nil, 0
+  end
+  local ampX = parameters.offsetX
+  local ampY = parameters.offsetY
+  if type(ampX) ~= "number" or type(ampY) ~= "number" then
+    error(failure, 0)
+  end
+  ampX, ampY = clampPictureOffset(ampX), clampPictureOffset(ampY)
+  local sets = parameters.pictureSets
+  if type(sets) ~= "table" then
+    error(failure, 0)
+  end
+  if #sets < 1 then
+    -- No named pictures: the native task still runs its states with no
+    -- writes, so the spawn degrades to its sweep/marker timing instead
+    -- of failing a valid program.
+    return nil, 0
+  end
+  local activations = backgroundActivations(sets, context, kind)
+  local baseX, baseY = {}, {}
+  for index, activation in ipairs(activations) do
+    local currentX, currentY = currentPictureOffset(scene, activation)
+    baseX[index], baseY[index] = currentX, currentY
+  end
+  return {
+    activations = activations,
+    baseX = baseX,
+    baseY = baseY,
+    ampX = ampX,
+    ampY = ampY,
+    interval = interval,
+    count = count,
+    timer = interval,
+    phase = 0,
+    x = 0,
+    y = 0,
+    prevX = -ampX,
+    prevY = -ampY,
+  },
+    4 * count * math.max(interval, 1)
+end
+
 ---@param args table<string, unknown> instruction-derived construction arguments
 ---@param context table<string, unknown> occurrence-bound playback context
 ---@param services table<string, unknown> scene, audio, and resource collaborators
 ---@return BattleBlendTransition runnable blend task
 local function newBlendTransition(args, context, services)
-  local _ = context
   if args.values ~= nil and type(args.values) ~= "table" then
     error(
       "BATTLE_EFFECT_TASK_MALFORMED: kind "
@@ -946,7 +1122,20 @@ local function newBlendTransition(args, context, services)
       0
     )
   end
+  local parameters = args.parameters
+  if parameters == nil then
+    parameters = {}
+  end
   local duration = blendDuration(args)
+  -- Selector-36 ShakeTargets shakes the named pictures with the native
+  -- phase machine; the task boundary stretches to the shake writes.
+  local shake, shakeTicks = nil, 0
+  if parameters.pictureAttributeOffset == true then
+    shake, shakeTicks = shakePlan(parameters, scene, context, BattleEffectTasks.BLEND_TRANSITION_KIND)
+    if shake ~= nil and (duration == nil or shakeTicks > duration) then
+      duration = shakeTicks
+    end
+  end
   if duration == nil and SYNCHRONOUS_MARKER_KINDS[BattleEffectTasks.BLEND_TRANSITION_KIND] ~= true then
     error(
       "BATTLE_EFFECT_TASK_MALFORMED: kind "
@@ -955,15 +1144,16 @@ local function newBlendTransition(args, context, services)
       0
     )
   end
-  local parameters = args.parameters
-  if parameters == nil then
-    parameters = {}
-  end
   -- Timing-less spawns retire synchronously only for verified marker
-  -- kinds; this body fails them closed above. Timed spawns always take
-  -- the sweep below.
+  -- kinds; this body fails them closed above. Timed spawns sweep the
+  -- viewport only while the compiled background flag stays set: a
+  -- picture-attribute shake (selector-36 flag 0x100 without 0x400,
+  -- battle_anim effects ShakeTargets/Wobble family) moves its named
+  -- pictures and parks the viewport, while a background-enabled run
+  -- carries both. An absent flag keeps the legacy sweep so older
+  -- synthetic programs without lowered flags still scroll.
   local sweep = nil
-  if duration ~= nil then
+  if duration ~= nil and parameters.backgroundPositionEnabled ~= false then
     sweep = scrollSweepFor(parameters, duration)
   end
   local saved = scene.scroll(scene)
@@ -972,6 +1162,8 @@ local function newBlendTransition(args, context, services)
     _sweep = sweep,
     _scrollSaved = { x = saved.x, y = saved.y },
     _lastScroll = nil,
+    _shake = shake,
+    _picturePatched = false,
     _ticks = 0,
     _duration = duration,
     _state = "pending",
@@ -980,12 +1172,67 @@ local function newBlendTransition(args, context, services)
   }, BattleBlendTransition)
 end
 
+-- Advances one ShakeTargets phase toggle behind a source tick, exactly
+-- like BattleAnimUtil_UpdateShake: the timer fires every interval ticks,
+-- the displacement alternates around zero, and every fourth toggle
+-- retires one count cycle.
+---@param shake BattleShakeState mutable shake behind advancement
+local function stepShake(shake)
+  shake.timer = shake.timer + 1
+  if shake.timer >= shake.interval then
+    shake.timer = 0
+    local prevX, prevY = shake.prevX, shake.prevY
+    shake.prevX, shake.prevY = shake.x, shake.y
+    if prevX == 0 then
+      shake.x = 0
+    else
+      shake.x = -prevX
+    end
+    if prevY == 0 then
+      shake.y = 0
+    else
+      shake.y = -prevY
+    end
+    shake.phase = shake.phase + 1
+    if shake.phase >= 4 then
+      shake.phase = 0
+      shake.count = shake.count - 1
+    end
+  end
+end
+
+-- Writes one shake frame over every owned activation: the absolute
+-- displacement rides the construction-time base, matching the native
+-- absolute pokepic writes. Mid-task scene failures restore the task's
+-- own partial visuals before the failure reaches the player.
+---@param self BattleBlendTransition blend task behind the owned shake
+local function writeShakeFrame(self)
+  local shake = self._shake
+  assert(shake ~= nil, "blend shake writes require owned shake")
+  local scene = self._scene
+  for index, activation in ipairs(shake.activations) do
+    scene.applyTaskPicturePatch(scene, self, activation, {
+      pictureXOffset = clampPictureOffset(shake.baseX[index] + shake.x),
+      pictureYOffset = clampPictureOffset(shake.baseY[index] + shake.y),
+    })
+  end
+  self._picturePatched = true
+end
+
 -- Restores the viewport only while no newer sweep has moved it since:
 -- the task owns its scroll interpolation for its whole lifetime, so a
 -- finished blend never strands the viewport over the next effect. The
 -- task stages no leases and publishes no drawable picture.
 ---@param self BattleBlendTransition
 local function teardownBlend(self)
+  if self._picturePatched then
+    self._picturePatched = false
+    if self._shake ~= nil then
+      for _, activation in ipairs(self._shake.activations) do
+        self._scene.removeTaskPicturePatch(self._scene, self, activation)
+      end
+    end
+  end
   if self._lastScroll ~= nil then
     local current = self._scene.scroll(self._scene)
     if current.x == self._lastScroll.x and current.y == self._lastScroll.y then
@@ -1023,6 +1270,14 @@ function BattleBlendTransition:stepSourceTick(tick)
     local y = self._scrollSaved.y + self._sweep.y * progress
     self._scene.applyScrollPatch(self._scene, x, y)
     self._lastScroll = { x = x, y = y }
+  end
+  if self._shake ~= nil and self._shake.count > 0 then
+    stepShake(self._shake)
+    local ok, err = pcall(writeShakeFrame, self)
+    if not ok then
+      teardownBlend(self)
+      error(err, 0)
+    end
   end
   if self._ticks >= self._duration then
     self._state = "complete"
@@ -1474,7 +1729,6 @@ local NATIVE_VISUAL_KINDS = {
   ["battle-background-alpha-scroll-transition"] = true,
   ["battle-background-alternating-scroll-transition"] = true,
   ["battle-background-four-picture-move-power-transition"] = true,
-  ["battle-background-picture-coordinate-sweep"] = true,
   ["battle-background-picture-palette-scroll"] = true,
   ["battle-background-picture-scroll-oscillation"] = true,
   ["battle-background-picture-wipe-transition"] = true,
@@ -1493,22 +1747,12 @@ local NATIVE_VISUAL_KINDS = {
   ["battle-sprite-panel-slide"] = true,
   ["battle-sprite-priority-appearance-transition"] = true,
   ["battle-sprite-sinusoidal-position-animation"] = true,
-  ["managed-sprite-draw-loop"] = true,
-  ["multi-sprite-battler-animation"] = true,
-  ["multi-sprite-picture-animation"] = true,
-  ["multi-sprite-position-tick"] = true,
-  ["multi-sprite-position-transition"] = true,
   ["pokemon-picture-affine-blend-palette-transition"] = true,
   ["pokemon-picture-affine-sprite-entry-transition"] = true,
-  ["pokemon-picture-affine-transition"] = true,
   ["pokemon-picture-and-battle-palette-fade"] = true,
-  ["pokemon-picture-and-battle-palette-fade-cycle"] = true,
-  ["pokemon-picture-animation-palette-fade"] = true,
-  ["pokemon-picture-animation-position-transition"] = true,
-  ["pokemon-picture-animation-speed-transition"] = true,
   ["pokemon-picture-attacker-dash-afterimages"] = true,
-  ["pokemon-picture-battle-palette-fade-cycle"] = true,
   ["pokemon-picture-battler-pair-scale-transition"] = true,
+  ["pokemon-picture-blend-sprite-palette"] = true,
   ["pokemon-picture-cyclic-two-phase-position-transition"] = true,
   ["pokemon-picture-defender-knockback"] = true,
   ["pokemon-picture-double-sprite-scale-settle"] = true,
@@ -1519,8 +1763,6 @@ local NATIVE_VISUAL_KINDS = {
   ["pokemon-picture-linear-offscreen-transition"] = true,
   ["pokemon-picture-managed-sprite-affine-pair-transition"] = true,
   ["pokemon-picture-managed-sprite-scale-pulse"] = true,
-  ["pokemon-picture-multi-sprite-animation"] = true,
-  ["pokemon-picture-oam-animation-transition"] = true,
   ["pokemon-picture-oscillating-axis-motion"] = true,
   ["pokemon-picture-paired-position-interpolation"] = true,
   ["pokemon-picture-palette-fade"] = true,
@@ -1528,10 +1770,8 @@ local NATIVE_VISUAL_KINDS = {
   ["pokemon-picture-palette-pulse-position-transition"] = true,
   ["pokemon-picture-position-offset-transition"] = true,
   ["pokemon-picture-position-path-transition"] = true,
-  ["pokemon-picture-priority-motion"] = true,
   ["pokemon-picture-randomized-position-motion"] = true,
   ["pokemon-picture-reciprocal-position-palette-transition"] = true,
-  ["pokemon-picture-relative-sprite-path-transition"] = true,
   ["pokemon-picture-repeated-palette-fade"] = true,
   ["pokemon-picture-repeated-scale-position-transition"] = true,
   ["pokemon-picture-repeated-vanish-transition"] = true,
@@ -1542,7 +1782,6 @@ local NATIVE_VISUAL_KINDS = {
   ["pokemon-picture-selected-position-offset-transition"] = true,
   ["pokemon-picture-selected-position-transition"] = true,
   ["pokemon-picture-sinusoidal-position-motion"] = true,
-  ["pokemon-picture-sprite-position-transition"] = true,
   ["pokemon-picture-table-driven-position-transition"] = true,
   ["pokemon-picture-target-background-slide"] = true,
   ["pokemon-picture-target-priority-transition"] = true,
@@ -1555,24 +1794,7 @@ local NATIVE_VISUAL_KINDS = {
   ["pokemon-picture-vanish-and-restore-transition"] = true,
   ["pokemon-picture-vertical-offset-visibility-transition"] = true,
   ["pokemon-picture-z-rotation-transition"] = true,
-  ["sprite-affine-animation"] = true,
-  ["sprite-affine-animation-lifecycle"] = true,
-  ["sprite-affine-rotation-motion"] = true,
-  ["sprite-affine-rotation-transition"] = true,
   ["sprite-affine-scale-and-blend-transition"] = true,
-  ["sprite-affine-scale-draw-transition"] = true,
-  ["sprite-affine-transform-motion"] = true,
-  ["sprite-alpha-transition"] = true,
-  ["sprite-animation-affine-scale-transition"] = true,
-  ["sprite-animation-completion"] = true,
-  ["sprite-animation-lifecycle"] = true,
-  ["sprite-animation-palette-offset"] = true,
-  ["sprite-animation-position-transition"] = true,
-  ["sprite-brightness-transition"] = true,
-  ["sprite-flip-and-offset-transition"] = true,
-  ["sprite-flip-animation-transition"] = true,
-  ["sprite-position-offset"] = true,
-  ["sprite-randomized-affine-motion"] = true,
 }
 
 -- Sound task kinds with real voice bodies in this lane.
@@ -1630,16 +1852,6 @@ local OWN_SIDE_SIGNS = {
   [5] = 1,
 }
 
--- Picture/sprite task kinds owning both selected activations at once.
--- Every other family owns the single planned activation, or nothing
--- when the spawn resolves none.
-local PAIR_TASK_KINDS = {
-  ["pokemon-picture-battler-pair-scale-transition"] = true,
-  ["pokemon-picture-two-battler-crossing-motion"] = true,
-  ["pokemon-picture-selected-pair-transition"] = true,
-  ["pokemon-picture-managed-sprite-affine-pair-transition"] = true,
-}
-
 -- Selects the source control law behind a picture/sprite kind. The timed
 -- holds below keep their compiled boundary with no patch, each pinned to
 -- its producer shape (romdump/src/config/BattleAnimationSources.lua,
@@ -1655,9 +1867,6 @@ local PAIR_TASK_KINDS = {
 local function familyFor(kind)
   if kind == "pokemon-picture-attacker-dash-afterimages" then
     return "dash"
-  end
-  if PAIR_TASK_KINDS[kind] == true then
-    return "pair"
   end
   if kind == "pokemon-picture-cyclic-two-phase-position-transition" then
     return "cyclic"
@@ -1687,20 +1896,10 @@ local function familyFor(kind)
     or string.find(kind, "three-sprite", 1, true) ~= nil
     or string.find(kind, "double-sprite", 1, true) ~= nil
     or string.find(kind, "oam-animation", 1, true) ~= nil
-    or string.find(kind, "sprite-animation-lifecycle", 1, true) ~= nil
-    or string.find(kind, "relative-sprite-path", 1, true) ~= nil
   then
     return "multi"
   end
   return "motion"
-end
-
----@param kind string task kind under classification
----@return boolean affine true for pair kinds driven by affine operands
-local function pairUsesAffine(kind)
-  return string.find(kind, "affine", 1, true) ~= nil
-    or string.find(kind, "rotation", 1, true) ~= nil
-    or string.find(kind, "scale", 1, true) ~= nil
 end
 
 -- Converts a compiled scale operand to the scene affine factor:
@@ -2043,54 +2242,6 @@ end
 -- scene writes, stages no leases, and restores its writes on completion
 -- and cancellation.
 
--- Resolves the battler pictures one background transition owns from the
--- compiled picture sets and the frozen occurrence topology. The
--- all-positions set names every live battler; every other set keeps the
--- producer's attacker/target partition. Unknown sets fail instead of
--- guessing a picture from an unaddressed slot.
----@param pictureSets table<integer, string> compiled picture sets behind the transition
----@param context table<string, unknown> occurrence-bound playback context
----@param kind string task kind under construction
----@return table<integer, table<string, unknown>> owned combatant and activation pairs
-local function backgroundActivations(pictureSets, context, kind)
-  local topology = type(context) == "table" and context.topology or nil
-  local attacker = type(topology) == "table" and topology.attacker or nil
-  local targets = type(topology) == "table" and topology.targets or nil
-  local wantAttacker, wantTargets = false, false
-  for _, set in ipairs(pictureSets) do
-    if set == "all-battler-positions" then
-      wantAttacker, wantTargets = true, true
-    elseif ATTACKER_PICTURE_NAMES[set] == true then
-      wantAttacker = true
-    elseif TARGET_PICTURE_NAMES[set] == true then
-      wantTargets = true
-    else
-      error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " pictures a known battler set, not " .. tostring(set), 0)
-    end
-  end
-  local activations = {}
-  if wantAttacker then
-    if type(attacker) ~= "table" or type(attacker.combatant) ~= "number" then
-      error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " pictures its occurrence attacker", 0)
-    end
-    activations[#activations + 1] = { combatant = attacker.combatant, activation = attacker.activation }
-  end
-  if wantTargets then
-    if type(targets) ~= "table" or #targets < 1 then
-      error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " pictures its occurrence targets", 0)
-    end
-    for _, target in ipairs(targets) do
-      if type(target) == "table" and type(target.combatant) == "number" and #activations < 4 then
-        activations[#activations + 1] = { combatant = target.combatant, activation = target.activation }
-      end
-    end
-  end
-  if #activations < 1 then
-    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " pictures at least one occurrence battler", 0)
-  end
-  return activations
-end
-
 -- Selects the source power profile behind the four-picture transition:
 -- an exact ladder match wins, otherwise the compiled default covers
 -- present-but-unmatched powers. A missing runtime power or an
@@ -2426,31 +2577,6 @@ local function newAlternatingScrollTask(kind, args, _, services)
   return newViewportSweepTask(kind, changes * cycle, sweep, scene)
 end
 
--- Owns one scanline sine-wave sweep: the viewport rides a full sine
--- cycle over the compiled duration at the minimal one-pixel native
--- amplitude the wave law can express, since the normalized program
--- carries no amplitude operand. Completion restores the saved viewport.
----@param kind string task kind under construction
----@param args table<string, unknown> instruction-derived construction arguments
----@param services table<string, unknown> scene, audio, and resource collaborators
----@return table<string, unknown> runnable sweep task
-local function newSineScrollTask(kind, args, _, services)
-  checkVisualArgs(args, kind)
-  local scene = checkScene(services, kind)
-  if type(scene.scroll) ~= "function" or type(scene.applyScrollPatch) ~= "function" then
-    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " sweeps through the scene scroll seam", 0)
-  end
-  local parameters = args.parameters
-  if type(parameters) ~= "table" or not isPositiveInt(parameters.durationTicks) then
-    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " rides its compiled duration", 0)
-  end
-  local duration = parameters.durationTicks
-  local function sweep(tick)
-    return { x = 0, y = math.floor(math.sin(2 * math.pi * tick / duration) + 0.5) }
-  end
-  return newViewportSweepTask(kind, duration, sweep, scene)
-end
-
 ---@class BattleBlendCoefficientTask
 ---@field _scene table<string, unknown> scene behind the owned register overlay
 ---@field _kind string task kind behind the run
@@ -2584,6 +2710,443 @@ function BattleBlendCoefficientTask:dispose()
   end
   self._disposed = true
   teardownCoefficientBlend(self)
+end
+
+-- Owns one battle-background palette fade: the compiled start/end
+-- coefficients interpolate linearly over the compiled boundary and land
+-- in the task-owned compositor fade the scene carries for the
+-- battlefield plane, mirroring the native FadeBgPalette register hold
+-- (battle_anim_funcs.c PaletteData_BeginPaletteFade over MAIN_BG).
+-- Completion holds the final amount exactly like hardware holds the
+-- faded palette until the next fade overwrites it; cancel/dispose
+-- restores the journaled compositor instead of stranding a darkened
+-- battlefield. Despite the composite task-kind name, the retail
+-- selector-33 operation fades only the background palette: it carries
+-- no battler target, so this body owns no picture patch.
+---@class BattleBackgroundFadeTask
+---@field _scene table<string, unknown> scene behind the owned compositor fade
+---@field _kind string task kind behind the run
+---@field _from integer compiled start coefficient in 0..16
+---@field _to integer compiled end coefficient in 0..16
+---@field _colorR integer fade target red in 0..31
+---@field _colorG integer fade target green in 0..31
+---@field _colorB integer fade target blue in 0..31
+---@field _duration integer source ticks behind completion
+---@field _ticks integer source ticks advanced
+---@field _state string pending, running, complete, or cancelled
+---@field _disposed boolean release has run
+local BattleBackgroundFadeTask = {}
+BattleBackgroundFadeTask.__index = BattleBackgroundFadeTask
+
+---@param value unknown compiled fade channel under validation
+---@return integer channel in 0..31
+local function clampFadeChannel(value)
+  if type(value) ~= "number" or value ~= value then
+    return 0
+  end
+  local channel = math.floor(value)
+  if channel < 0 then
+    return 0
+  elseif channel > 31 then
+    return 31
+  end
+  return channel
+end
+
+---@param kind string task kind behind construction
+---@param args table<string, unknown> instruction-derived construction arguments
+---@param context table<string, unknown> occurrence-bound playback context
+---@param services table<string, unknown> scene, audio, and resource collaborators
+---@return table<string, unknown> runnable fade task
+local function newBackgroundFadeTask(kind, args, context, services)
+  checkVisualArgs(args, kind)
+  local _ = context
+  local scene = checkScene(services, kind)
+  if type(scene.writeAnimationCompositor) ~= "function" or type(scene.restoreAnimationCompositor) ~= "function" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " fades through the scene compositor seam", 0)
+  end
+  local parameters = args.parameters
+  if type(parameters) ~= "table" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " carries its parameters as a record", 0)
+  end
+  local duration = visualDuration(parameters, kind)
+  if duration == nil then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " retires only on compiled timing operands", 0)
+  end
+  local startCoefficient = parameters.startCoefficient
+  local endCoefficient = parameters.endCoefficient
+  if type(startCoefficient) ~= "number" or type(endCoefficient) ~= "number" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " interpolates its compiled coefficients", 0)
+  end
+  local color = parameters.nextColor
+  if type(color) ~= "number" or color % 1 ~= 0 then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " carries its compiled target color", 0)
+  end
+  local word = math.floor(color) % 65536
+  return setmetatable({
+    _scene = scene,
+    _kind = kind,
+    _from = clipBlendCoefficient(startCoefficient),
+    _to = clipBlendCoefficient(endCoefficient),
+    _colorR = clampFadeChannel(word % 32),
+    _colorG = clampFadeChannel(math.floor(word / 32) % 32),
+    _colorB = clampFadeChannel(math.floor(word / 1024) % 32),
+    _duration = duration,
+    _ticks = 0,
+    _state = "pending",
+    _disposed = false,
+  }, BattleBackgroundFadeTask)
+end
+
+-- Drops the owned compositor fade, restoring whatever the journal held
+-- before this task wrote it.
+---@param self BattleBackgroundFadeTask fade task under teardown
+local function teardownBackgroundFade(self)
+  self._scene.restoreAnimationCompositor(self._scene, self, "main")
+end
+
+---@param self BattleBackgroundFadeTask fade task under advancement
+---@param tick table<string, unknown>? source tick under advancement
+function BattleBackgroundFadeTask:stepSourceTick(tick)
+  local _ = tick
+  if self._disposed or self._state == "complete" or self._state == "cancelled" then
+    return
+  end
+  self._state = "running"
+  self._ticks = self._ticks + 1
+  local progress = self._ticks / self._duration
+  if progress > 1 then
+    progress = 1
+  end
+  local amount = math.floor(self._from + (self._to - self._from) * progress + 0.5)
+  local ok, err = pcall(self._scene.writeAnimationCompositor, self._scene, self, "main", {
+    battlefieldFade = {
+      color = { r = self._colorR, g = self._colorG, b = self._colorB },
+      amount = amount,
+    },
+  })
+  if not ok then
+    teardownBackgroundFade(self)
+    error(err, 0)
+  end
+  if self._ticks >= self._duration then
+    self._state = "complete"
+  end
+end
+
+---@param self BattleBackgroundFadeTask
+---@return string
+function BattleBackgroundFadeTask:status()
+  assert(VALID_TASK_STATES[self._state] == true, "background fade tasks report a known run state")
+  return self._state
+end
+
+---@param self BattleBackgroundFadeTask
+---@param reason string cancellation cause under diagnosis
+function BattleBackgroundFadeTask:cancel(reason)
+  local _ = reason
+  if self._state == "complete" then
+    return
+  end
+  self._state = "cancelled"
+  teardownBackgroundFade(self)
+end
+
+---@param self BattleBackgroundFadeTask
+function BattleBackgroundFadeTask:dispose()
+  if self._disposed then
+    return
+  end
+  self._disposed = true
+  if self._state ~= "complete" then
+    teardownBackgroundFade(self)
+  end
+end
+
+-- Owns one object-window panel slide: the scrolled stripe backdrop the
+-- object window reveals through the affected battler's silhouette
+-- (retail BattleAnimTask_ObjWindowBgScroll with
+-- BattleAnimObjWindowBg_Start over GF_BG_LYR_MAIN_2). The compiled
+-- first-panel offsets are the scroll velocity, the second-panel offsets
+-- are the held blend pair, and the runtime graphic/target args select
+-- the stripe files and the silhouetted side (Arg0 graphic, Arg1 target
+-- with 0 naming the attacker). The 37-tick boundary runs one setup
+-- tick, one blend-setup tick, twenty-two scroll ticks, twelve blend-out
+-- ticks, and the destroy tick; the scroll applies on every tick but the
+-- destroy tick, and the fade steps the held pair to 0/16 over the last
+-- twelve. Completion runs the destroy tick (stripe, window, blend, and
+-- silhouette all go); cancel/dispose restores the journaled compositor
+-- and drops the stripe instead of stranding it.
+---@class BattlePanelSlideTask
+---@field _scene table<string, unknown> scene behind the owned stripe, scroll, blend, window, and silhouette
+---@field _kind string task kind behind the run
+---@field _staged table<integer, BattleEffectLeaseRecord> staged stripe leases behind exactly-once release
+---@field _bySlot table<string, BattleEffectLeaseRecord> staged leases by stripe slot
+---@field _graphic integer runtime stripe graphic selection in 0..3
+---@field _activation table<string, unknown> silhouetted combatant and activation pair
+---@field _velocityX integer horizontal stripe velocity in native pixels per tick
+---@field _velocityY integer vertical stripe velocity in native pixels per tick
+---@field _blendA integer held blend A coefficient
+---@field _blendB integer held blend B coefficient
+---@field _duration integer source ticks behind completion
+---@field _ticks integer source ticks advanced
+---@field _installed boolean the stripe layer is live in the scene
+---@field _state string pending, running, complete, or cancelled
+---@field _disposed boolean release has run
+local BattlePanelSlideTask = {}
+BattlePanelSlideTask.__index = BattlePanelSlideTask
+
+local PANEL_SLIDE_BLEND_OUT_TICKS = 12
+local PANEL_SLIDE_FADE_OUT_A = 0
+local PANEL_SLIDE_FADE_OUT_B = 16
+
+---@param lease unknown staged lease under validation
+---@param kind string task kind under diagnosis
+---@return table<string, unknown> decoded stripe payload behind the lease
+local function stripePayload(lease, kind)
+  if type(lease) ~= "table" or type(lease.data) ~= "table" then
+    error("BATTLE_EFFECT_TASK_RESOURCE: kind " .. kind .. " stages decoded stripe records", 0)
+  end
+  return lease.data --[[@as table<string, unknown>]]
+end
+
+---@param _ table<integer, BattleEffectLeaseRecord> staged occurrence leases under counting
+---@param bySlot table<string, BattleEffectLeaseRecord> staged leases by stripe slot
+---@param slot string owned stripe slot behind lookup
+---@param kind string task kind under diagnosis
+---@return table<string, unknown> staged lease behind the slot
+local function stripeLease(_, bySlot, slot, kind)
+  local record = bySlot[slot]
+  if type(record) ~= "table" then
+    error("BATTLE_EFFECT_TASK_RESOURCE: kind " .. kind .. " stages a stripe lease for " .. slot, 0)
+  end
+  local lease = record.lease
+  if type(lease) ~= "table" then
+    error("BATTLE_EFFECT_TASK_RESOURCE: kind " .. kind .. " stages a stripe lease for " .. slot, 0)
+  end
+  return lease --[[@as table<string, unknown>]]
+end
+
+---@param kind string task kind behind construction
+---@param args table<string, unknown> instruction-derived construction arguments
+---@param context table<string, unknown> occurrence-bound playback context
+---@param services table<string, unknown> scene, audio, and resource collaborators
+---@return table<string, unknown> runnable panel-slide task
+local function newPanelSlideTask(kind, args, context, services)
+  checkVisualArgs(args, kind)
+  local scene = checkScene(services, kind)
+  assert(type(scene.installStripeLayer) == "function", "panel slides install their stripe layer")
+  assert(type(scene.setStripeScroll) == "function", "panel slides scroll their stripe layer")
+  assert(type(scene.removeStripeLayer) == "function", "panel slides remove their stripe layer")
+  assert(type(scene.setObjWindowSilhouette) == "function", "panel slides silhouette their battler")
+  assert(type(scene.writeAnimationCompositor) == "function", "panel slides write their compositor")
+  assert(type(scene.restoreAnimationCompositor) == "function", "panel slides restore their compositor")
+  local parameters = args.parameters
+  if type(parameters) ~= "table" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " carries its parameters as a record", 0)
+  end
+  local duration = visualDuration(parameters, kind)
+  if duration == nil then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " retires only on compiled timing operands", 0)
+  end
+  local velocityX = parameters.firstPanelOffsetX
+  local velocityY = parameters.firstPanelOffsetY
+  local blendA = parameters.secondPanelOffsetX
+  local blendB = parameters.secondPanelOffsetY
+  for _, field in ipairs({ velocityX, velocityY, blendA, blendB }) do
+    if type(field) ~= "number" then
+      error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " carries numeric panel offsets", 0)
+    end
+  end
+  local resourceKeys = args.resourceKeys
+  if type(resourceKeys) ~= "table" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " stages its stripe resources", 0)
+  end
+  local graphic = args.graphic
+  if graphic == nil then
+    graphic = 0
+  end
+  if type(graphic) ~= "number" or graphic % 1 ~= 0 or graphic < 0 or graphic > 3 then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " selects a stripe graphic in 0..3", 0)
+  end
+  local target = args.target
+  if target == nil then
+    target = 0
+  end
+  if type(target) ~= "number" or target % 1 ~= 0 then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " selects its silhouette target numerically", 0)
+  end
+  local topology = type(context) == "table" and context.topology or nil
+  local attacker = type(topology) == "table" and topology.attacker or nil
+  local targets = type(topology) == "table" and topology.targets or nil
+  local firstTarget = type(targets) == "table" and targets[1] or nil
+  local selected = nil ---@type table<string, unknown>?
+  if target == 0 then
+    selected = attacker
+  else
+    selected = (type(firstTarget) == "table" and type(firstTarget.combatant) == "number") and firstTarget or attacker
+  end
+  if type(selected) ~= "table" or type(selected.combatant) ~= "number" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " silhouettes a resolved occurrence battler", 0)
+  end
+  local staged = {}
+  local bySlot = {}
+  for row = 0, 3 do
+    for _, slot in ipairs({ "Char", "Palette", "Screen" }) do
+      local slotName = "stripeGraphic" .. row .. slot
+      local resourceKey = resourceKeys[slotName]
+      if type(resourceKey) ~= "string" or resourceKey == "" then
+        releaseStaged(staged)
+        error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " stages its stripe resource " .. slotName, 0)
+      end
+      stageLease(kind, resourceKey, services, staged)
+      bySlot[slotName] = staged[#staged]
+    end
+  end
+  return setmetatable({
+    _scene = scene,
+    _kind = kind,
+    _staged = staged,
+    _bySlot = bySlot,
+    _graphic = graphic,
+    _activation = { combatant = selected.combatant, activation = selected.activation },
+    _velocityX = math.floor(velocityX),
+    _velocityY = math.floor(velocityY),
+    _blendA = clipBlendCoefficient(blendA),
+    _blendB = clipBlendCoefficient(blendB),
+    _duration = duration,
+    _ticks = 0,
+    _installed = false,
+    _state = "pending",
+    _disposed = false,
+  }, BattlePanelSlideTask)
+end
+
+-- Installs the runtime stripe graphic and stages the window, blend, and
+-- silhouette behind the scroll run. The graphic payload rides the three
+-- staged slots of the runtime graphic row.
+---@param self BattlePanelSlideTask panel-slide task under installation
+local function installPanelSlide(self)
+  local prefix = "stripeGraphic" .. self._graphic
+  local bySlot = self._bySlot
+  local character = stripePayload(stripeLease(self._staged, bySlot, prefix .. "Char", self._kind), self._kind)
+  local palette = stripePayload(stripeLease(self._staged, bySlot, prefix .. "Palette", self._kind), self._kind)
+  local screen = stripePayload(stripeLease(self._staged, bySlot, prefix .. "Screen", self._kind), self._kind)
+  if type(character.tiles) ~= "string" or type(character.depth) ~= "number" then
+    error("BATTLE_EFFECT_TASK_RESOURCE: kind " .. self._kind .. " installs 4bpp stripe characters", 0)
+  end
+  if type(palette.colors) ~= "table" then
+    error("BATTLE_EFFECT_TASK_RESOURCE: kind " .. self._kind .. " installs its stripe palette", 0)
+  end
+  if type(screen.width) ~= "number" or type(screen.height) ~= "number" or type(screen.entries) ~= "table" then
+    error("BATTLE_EFFECT_TASK_RESOURCE: kind " .. self._kind .. " installs its stripe tilemap", 0)
+  end
+  self._scene.installStripeLayer(self._scene, {
+    characters = character.tiles,
+    colorMode = "4bpp",
+    map = screen,
+    palette = palette,
+  })
+  self._installed = true
+end
+
+-- Restores everything the run owns: the stripe layer drops, the
+-- journaled compositor returns, and the silhouette clears. Silent when
+-- nothing is installed so repeated teardown stays quiet.
+---@param self BattlePanelSlideTask panel-slide task under teardown
+local function teardownPanelSlide(self)
+  if self._installed then
+    self._installed = false
+    self._scene.removeStripeLayer(self._scene)
+  end
+  self._scene.setObjWindowSilhouette(self._scene, nil)
+  self._scene.restoreAnimationCompositor(self._scene, self, "main")
+end
+
+---@param self BattlePanelSlideTask panel-slide task under advancement
+---@param tick table<string, unknown>? source tick under advancement
+function BattlePanelSlideTask:stepSourceTick(tick)
+  local _ = tick
+  if self._disposed or self._state == "complete" or self._state == "cancelled" then
+    return
+  end
+  self._state = "running"
+  self._ticks = self._ticks + 1
+  if self._ticks >= self._duration then
+    self._state = "complete"
+    teardownPanelSlide(self)
+    return
+  end
+  if not self._installed then
+    installPanelSlide(self)
+    self._scene.setObjWindowSilhouette(self._scene, self._activation)
+  end
+  self._scene.setStripeScroll(self._scene, self._velocityX * self._ticks, self._velocityY * self._ticks)
+  local eva, evb = self._blendA, self._blendB
+  local fadeStart = self._duration - PANEL_SLIDE_BLEND_OUT_TICKS
+  if self._ticks > fadeStart then
+    local step = self._ticks - fadeStart
+    eva = math.max(PANEL_SLIDE_FADE_OUT_A, self._blendA - step)
+    evb = math.min(PANEL_SLIDE_FADE_OUT_B, self._blendB + step)
+  end
+  -- Retail blend: G2_SetBlendAlpha(BG2, BG0|BG3|OBJ|BD, eva, evb)
+  -- (battle_anim_effects.c). The stripe stays the first target while
+  -- the mon picture behind it is a second target, so the 12/4 hold
+  -- reads as a translucent wash instead of a solid slab. Native
+  -- priorities put the stripe (base 1) above the battler sprites
+  -- (2); the world plane carries our mon pictures, so it rides at 2
+  -- under the transition at 1. The inside mask keeps world3d visible
+  -- for the same reason the attacker-window task does: hiding it
+  -- would punch a mon-shaped hole with no blend partner behind the
+  -- stripe.
+  local ok, err = pcall(self._scene.writeAnimationCompositor, self._scene, self, "main", {
+    blend = { mode = "alpha", eva = eva, evb = evb, evy = 0 },
+    firstTarget = { transition = true },
+    secondTarget = { world3d = true, battlefield = true },
+    priority = { world3d = 2, transition = 1 },
+    windows = {
+      objWindow = {
+        mask = { world3d = true, window = true, transition = true, battlefield = false },
+      },
+      outside = {
+        mask = { world3d = true, window = true, transition = false, battlefield = true },
+      },
+    },
+  })
+  if not ok then
+    teardownPanelSlide(self)
+    error(err, 0)
+  end
+end
+
+---@param self BattlePanelSlideTask
+---@return string
+function BattlePanelSlideTask:status()
+  assert(VALID_TASK_STATES[self._state] == true, "panel slides report a known run state")
+  return self._state
+end
+
+---@param self BattlePanelSlideTask
+---@param reason string cancellation cause under diagnosis
+function BattlePanelSlideTask:cancel(reason)
+  local _ = reason
+  if self._state == "complete" then
+    return
+  end
+  self._state = "cancelled"
+  teardownPanelSlide(self)
+end
+
+---@param self BattlePanelSlideTask
+function BattlePanelSlideTask:dispose()
+  if self._disposed then
+    return
+  end
+  self._disposed = true
+  if self._state ~= "complete" then
+    teardownPanelSlide(self)
+  end
+  releaseStaged(self._staged)
 end
 
 -- Effect backdrop plane behind battle-background-resource-load and its
@@ -2904,17 +3467,87 @@ function BattleEffectBackgroundCleanup:dispose()
   self._disposed = true
 end
 
--- Dedicated background bodies by emitted kind. Every other admitted
--- kind keeps its established picture/sprite body below; the generic native
--- visual task never sees these six spellings again.
-local BACKGROUND_TASK_CONSTRUCTORS = {
-  ["battle-background-four-picture-move-power-transition"] = newMovePowerProfileTask,
-  ["battle-background-alternating-scroll-transition"] = newAlternatingScrollTask,
-  ["battle-background-scanline-sine-wave-transition"] = newSineScrollTask,
-  ["battle-sprite-blend-alpha-transition"] = newBlendCoefficientTask,
-  ["battle-background-resource-load"] = newBackgroundResourceLoadTask,
-  ["battle-presentation-resource-cleanup"] = newBackgroundResourceCleanupTask,
-}
+-- Selector-57 MoveBattlerBy port: the native func captures the absolute
+-- pic position and writes absolute motion every tick, so the displaced
+-- endpoint persists between tasks (the out-leg holds through the impact
+-- wait and the return leg starts from the displaced position;
+-- battle_anim_funcs.c BattleAnimFunc_MoveBattlerBy). Deltas mirror on
+-- both axes when the moved battler is enemy-side. Only this kind
+-- persists: every other offset task keeps transient overlay semantics.
+local MOVE_BATTLER_BY_KIND = "pokemon-picture-position-offset-transition"
+
+-- Resolves the side sign behind one moved battler: player-side
+-- (even source side types) keeps the compiled delta, enemy-side (odd)
+-- negates both axes, matching BattleAnimFunc_MoveBattlerBy's side-sign
+-- branch. An unaddressed battler fails closed instead of lunging blind.
+---@param context table<string, unknown> occurrence-bound playback context carrying the visual topology
+---@param activation table<string, unknown> combatant and activation pair behind the moved picture
+---@param kind string task kind under diagnosis
+---@return integer sign +1 player-side, -1 enemy-side
+local function movedBattlerSideSign(context, activation, kind)
+  local failure = "BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " mirrors its moved battler side"
+  if type(activation) ~= "table" or type(activation.combatant) ~= "number" then
+    error(failure, 0)
+  end
+  local topology = type(context) == "table" and context.topology or nil
+  local candidates = {}
+  if type(topology) == "table" then
+    if type(topology.attacker) == "table" then
+      candidates[#candidates + 1] = topology.attacker
+    end
+    if type(topology.targets) == "table" then
+      for _, target in ipairs(topology.targets) do
+        candidates[#candidates + 1] = target
+      end
+    end
+  end
+  local sourceBattlers = type(context) == "table" and context.sourceBattlers or nil
+  if type(sourceBattlers) == "table" then
+    for _, candidate in ipairs(sourceBattlers) do
+      candidates[#candidates + 1] = candidate
+    end
+  end
+  for _, candidate in ipairs(candidates) do
+    if type(candidate) == "table" and candidate.combatant == activation.combatant then
+      local sideType = candidate.sideType
+      if type(sideType) == "number" and sideType % 1 == 0 and sideType >= 0 and sideType <= 5 then
+        return sideType % 2 == 0 and 1 or -1
+      end
+      error(failure, 0)
+    end
+  end
+  error(failure, 0)
+end
+
+-- Rebases one compiled MoveBattlerBy offset plan onto the displayed
+-- position with the moved side mirrored: the out-leg runs 0 to delta
+-- and the return leg runs delta back to base, exactly like the native
+-- absolute repositionings. The rebased plan carries the lunge kind so
+-- the per-tick write uses the signed geometry fields (rigid sprite
+-- translation) instead of the crop-byte overlay. A plan-less spawn
+-- stays plan-less.
+---@param plan table<string, unknown>? compiled picture overlay plan
+---@param scene table<string, unknown> scene behind the owned picture overlay
+---@param activation table<string, unknown> combatant and activation pair behind the moved picture
+---@param context table<string, unknown> occurrence-bound playback context carrying the visual topology
+---@param kind string task kind under diagnosis
+---@return table<string, unknown>? rebased offset plan behind per-tick writes
+local function rebaseLungePlan(plan, scene, activation, context, kind)
+  if plan == nil or type(plan) ~= "table" or plan.kind ~= "offset" then
+    return plan
+  end
+  local sign = movedBattlerSideSign(context, activation, kind)
+  local fromX, fromY = currentPictureOffset(scene, activation)
+  local deltaX = (plan.toX or 0) - (plan.fromX or 0)
+  local deltaY = (plan.toY or 0) - (plan.fromY or 0)
+  return {
+    kind = "lunge",
+    fromX = fromX,
+    toX = clampPictureOffset(fromX + sign * deltaX),
+    fromY = fromY,
+    toY = clampPictureOffset(fromY + sign * deltaY),
+  }
+end
 
 ---@param kind string task kind under construction
 ---@param args table<string, unknown> instruction-derived construction arguments
@@ -2928,7 +3561,7 @@ local function newNativeVisualTask(kind, args, context, services)
   if parameters == nil then
     parameters = {}
   end
-  local duration = visualDuration(parameters)
+  local duration = visualDuration(parameters, kind)
   local activation = plannedActivation(args, context or {})
   if parameters.exitOwnSide == true then
     parameters = directedOffscreenParameters(parameters, activation, context or {}, kind)
@@ -2937,20 +3570,6 @@ local function newNativeVisualTask(kind, args, context, services)
   local activations = {}
   if activation ~= nil then
     activations[#activations + 1] = activation
-  end
-  if family == "pair" then
-    local topology = context.topology
-    local targets = type(topology) == "table" and topology.targets or nil
-    local first = type(targets) == "table" and targets[1] or nil
-    if type(first) ~= "table" or type(first.combatant) ~= "number" then
-      error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " pairs two selected activations", 0)
-    end
-    local partner = { combatant = first.combatant, activation = first.activation }
-    if activation == nil then
-      activations[#activations + 1] = partner
-    elseif activation.combatant ~= partner.combatant or activation.activation ~= partner.activation then
-      activations[#activations + 1] = partner
-    end
   end
   local canPatch = type(scene.applyTaskPicturePatch) == "function" and type(scene.removeTaskPicturePatch) == "function"
   local picturePlan = nil
@@ -2965,8 +3584,11 @@ local function newNativeVisualTask(kind, args, context, services)
     error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " retires only on compiled timing operands", 0)
   end
   if duration ~= nil then
-    if #activations > 0 and canPatch and (family == "motion" or (family == "pair" and not pairUsesAffine(kind))) then
+    if #activations > 0 and canPatch and family == "motion" then
       picturePlan = picturePlanFor(parameters)
+      if kind == MOVE_BATTLER_BY_KIND then
+        picturePlan = rebaseLungePlan(picturePlan, scene, activations[1], context, kind)
+      end
     end
     if picturePlan == nil and canScroll then
       scrollSweep = scrollSweepFor(parameters, duration)
@@ -3133,7 +3755,7 @@ local function writeVisualTick(self, progress)
     return
   end
   local patch = nil
-  if self._family == "affine" or (self._family == "pair" and pairUsesAffine(self._kind)) then
+  if self._family == "affine" then
     patch = affinePatchFor(self, progress)
   elseif self._family == "cyclic" then
     patch = cyclicPatchFor(self)
@@ -3158,25 +3780,44 @@ local function writeVisualTick(self, progress)
   local plan = self._picturePlan
   if plan ~= nil and self._canPatch then
     if plan.kind == "palette" then
-      if not self._paletteApplied then
-        self._paletteApplied = true
-        for _, activation in ipairs(self._activations) do
-          scene.applyTaskPicturePatch(scene, self, activation, {
-            paletteFade = {
-              start = plan.start,
-              finish = plan.finish,
-              framesPer = plan.framesPer,
-              targetColor = plan.targetColor,
-            },
-          })
-        end
-        self._patchActive = true
+      -- The working fade visibly progresses toward its requested
+      -- strength every tick instead of idling on a timer.
+      local current = math.floor(plan.start + (plan.finish - plan.start) * progress + 0.5)
+      if current < 0 then
+        current = 0
+      elseif current > 16 then
+        current = 16
       end
+      for _, activation in ipairs(self._activations) do
+        scene.applyTaskPicturePatch(scene, self, activation, {
+          paletteFade = {
+            start = current,
+            finish = plan.finish,
+            framesPer = plan.framesPer,
+            targetColor = plan.targetColor,
+          },
+        })
+      end
+      self._patchActive = true
+      self._paletteApplied = true
     elseif plan.kind == "rotation" then
       for _, activation in ipairs(self._activations) do
         scene.applyTaskPicturePatch(scene, self, activation, {
           rotationZ = clampRotationAngle(plan.from + (plan.to - plan.from) * progress),
         })
+      end
+      self._patchActive = true
+    elseif plan.kind == "lunge" then
+      -- MoveBattlerBy displaces the sprite rigidly through the signed
+      -- geometry fields, exactly like the native absolute pokepic write:
+      -- the crop byte stays out so the sampled texels never slide and
+      -- negative displacements never wrap into the crop range.
+      local lungePatch = {
+        pictureXOffset = clampPictureOffset(plan.fromX + (plan.toX - plan.fromX) * progress),
+        pictureYOffset = clampPictureOffset(plan.fromY + (plan.toY - plan.fromY) * progress),
+      }
+      for _, activation in ipairs(self._activations) do
+        scene.applyTaskPicturePatch(scene, self, activation, lungePatch)
       end
       self._patchActive = true
     else
@@ -3199,15 +3840,27 @@ end
 
 -- Restores only still-owned visual state: the picture overlay drops
 -- exactly when this task still owns its slot, and the viewport restores
--- only while no newer sweep has moved it since. The run stages no leases
--- and publishes no drawable picture, so teardown owns patches only.
+-- only while no newer sweep has moved it since. A completed palette
+-- fade keeps its explicit terminal record instead of bare removal. The
+-- run stages no leases and publishes no drawable picture, so teardown
+-- owns patches only.
 ---@param self BattleNativeVisualTask
 local function teardownNativeVisual(self)
   if self._patchActive then
     self._patchActive = false
     if self._canPatch then
-      for _, activation in ipairs(self._activations) do
-        self._scene.removeTaskPicturePatch(self._scene, self, activation)
+      local persistFade = self._state == "complete" and self._picturePlan ~= nil and self._picturePlan.kind == "palette"
+      -- A completed MoveBattlerBy keeps its terminal offset exactly
+      -- like the native absolute repositioning: the return leg chains
+      -- from it and cancellation still drops owned state.
+      local persistLunge = self._state == "complete"
+        and self._kind == MOVE_BATTLER_BY_KIND
+        and self._picturePlan ~= nil
+        and self._picturePlan.kind == "lunge"
+      if not persistFade and not persistLunge then
+        for _, activation in ipairs(self._activations) do
+          self._scene.removeTaskPicturePatch(self._scene, self, activation)
+        end
       end
     end
   end
@@ -3294,43 +3947,6 @@ end
 -- opcodes, so this lane stages exactly the four roles it draws from.
 local CONFIGURED_SPRITE_REQUIRED_ROLES = { "character", "palette", "cell", "animation" }
 
----@param args table<string, unknown> instruction-derived construction arguments
----@return boolean configured true when the spawn carries the full sprite role map
-local function isConfiguredSpriteSpawn(args)
-  if type(args) ~= "table" then
-    return false
-  end
-  local resourceKeys = args.resourceKeys
-  if type(resourceKeys) ~= "table" then
-    return false
-  end
-  for _, role in ipairs(CONFIGURED_SPRITE_REQUIRED_ROLES) do
-    if type(resourceKeys[role]) ~= "string" or resourceKeys[role] == "" then
-      return false
-    end
-  end
-  return true
-end
-
----@class BattleConfiguredSpriteTask
----@field _scene table<string, unknown> scene behind owned transient records
----@field _kind string configured sprite kind behind the run
----@field _staged table<integer, BattleEffectLeaseRecord> staged occurrence leases
----@field _characterKey string staged texture role behind picture submissions
----@field _stripWidth integer staged strip width in pixels behind tile crops
----@field _anchor table<string, integer> native slot center behind object placement
----@field _frames table<integer, { cell: integer, duration: integer }> authored display frames
----@field _total integer authored source ticks behind completion
----@field _cells table<integer, table<string, unknown>> normalized NCER cells
----@field _effectIds table<integer, integer> live transient identities behind the shown frame
----@field _shown integer last published display frame, 0 before the first tick
----@field _ticks integer source ticks advanced
----@field _state string pending, running, complete, or cancelled
----@field _cancelReason string? last cancellation cause under diagnosis
----@field _disposed boolean release has run
-local BattleConfiguredSpriteTask = {}
-BattleConfiguredSpriteTask.__index = BattleConfiguredSpriteTask
-
 -- Names the staged lease behind one owned role: leases are occurrence
 -- journals in acquisition order, so the role key selects deterministically.
 ---@param staged table<integer, BattleEffectLeaseRecord> staged occurrence leases
@@ -3374,18 +3990,19 @@ local function checkSpriteObject(obj, kind, key)
 end
 
 -- Selects the sprite anchor from the frozen occurrence topology: the
--- attacker slot center, shared with the emitter slot anchors so
+-- defender screen position, shared with the emitter slot anchors so
 -- attacker and target sides resolve without inventing coordinates.
 ---@param context table<string, unknown> occurrence-bound playback context
 ---@param kind string task kind under diagnosis
 ---@return table<string, integer> native slot center behind object placement
 local function configuredAnchor(context, kind)
   local topology = type(context) == "table" and context.topology or nil
-  local attacker = type(topology) == "table" and topology.attacker or nil
-  local slot = type(attacker) == "table" and attacker.slot or nil
+  local targets = type(topology) == "table" and topology.targets or nil
+  local defender = type(targets) == "table" and targets[1] or nil
+  local slot = type(defender) == "table" and defender.slot or nil
   local center = type(slot) == "string" and EMITTER_CENTERS[slot] or nil
   if type(center) ~= "table" then
-    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " anchors its sprite on the occurrence attacker slot", 0)
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " anchors its sprite on the occurrence defender slot", 0)
   end
   return { x = center.x, y = center.y }
 end
@@ -3417,24 +4034,47 @@ local function displayFrames(frames, kind, key)
   return walk
 end
 
--- Owns one source-cell sprite occurrence over its decoded leases: the
--- task stages each role once, walks authored NANR frames over NCER
--- objects, and publishes transient strip-band pictures through the
--- existing scene/renderer path.
+-- Stages the four configured-sprite roles behind one sprite spawn. The
+-- resolve rollback inside stageLease already unwinds a failed resolve;
+-- an absent role map fails closed before anything stages.
 ---@param kind string configured sprite kind under construction
 ---@param args table<string, unknown> instruction-derived construction arguments
----@param context table<string, unknown> occurrence-bound playback context
 ---@param services table<string, unknown> scene, audio, and resource collaborators
----@return table<string, unknown> runnable sprite task
-local function newConfiguredSpriteTask(kind, args, context, services)
+---@return table<string, unknown> scene behind owned transient records
+---@return table<integer, BattleEffectLeaseRecord> staged occurrence leases
+---@return table<string, string> decoded resource roles behind the sprite
+local function stageConfiguredSpriteLeases(kind, args, services)
   checkVisualArgs(args, kind)
   local scene = checkScene(services, kind)
   checkEffectScene(scene, kind)
-  local resourceKeys = args.resourceKeys --[[@as table<string, string>]]
+  local resourceKeys = args.resourceKeys
+  if type(resourceKeys) ~= "table" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " configures its four sprite roles", 0)
+  end
   local staged = {}
   for _, role in ipairs(CONFIGURED_SPRITE_REQUIRED_ROLES) do
     stageLease(kind, resourceKeys[role], services, staged)
   end
+  return scene, staged, resourceKeys --[[@as table<string, string>]]
+end
+
+-- Decoded sprite bank behind one configured sprite: the texture strip,
+-- the validated NCER cells over the authored NANR walk, and the
+-- defender anchor. Any refusal releases everything staged first.
+---@class BattleConfiguredSpriteBank
+---@field characterKey string staged texture role behind strip-band pictures
+---@field stripWidth integer staged texture width in pixels behind tile crops
+---@field anchor table<string, integer> native slot center behind object placement
+---@field walk table<integer, { cell: integer, duration: integer }> authored display frames in order
+---@field total integer authored source ticks behind the display walk
+---@field cells table<integer, table<string, unknown>> normalized NCER cells
+
+---@param kind string configured sprite kind under construction
+---@param resourceKeys table<string, string> decoded resource roles behind the sprite
+---@param staged table<integer, BattleEffectLeaseRecord> staged occurrence leases under release on refusal
+---@param context table<string, unknown> occurrence-bound playback context
+---@return BattleConfiguredSpriteBank decoded sprite bank behind ticks
+local function decodeConfiguredSpriteBank(kind, resourceKeys, staged, context)
   local characterKey = resourceKeys.character
   local failurePrefix = "BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind
   local texture = configuredLease(staged, characterKey, kind)
@@ -3508,78 +4148,37 @@ local function newConfiguredSpriteTask(kind, args, context, services)
     error(anchor, 0)
   end
   assert(type(anchor) == "table", "the sprite anchor resolves before the first tick")
-  return setmetatable({
-    _scene = scene,
-    _kind = kind,
-    _staged = staged,
-    _characterKey = characterKey,
-    _stripWidth = texture.width,
-    _anchor = anchor,
-    _frames = walk,
-    _total = total,
-    _cells = cells,
-    _effectIds = {},
-    _shown = 0,
-    _ticks = 0,
-    _state = "pending",
-    _cancelReason = nil,
-    _disposed = false,
-  }, BattleConfiguredSpriteTask)
-end
-
--- Releases owned transient identities without touching the persistent
--- battler scene: unknown or repeated identities stay silent.
----@param self BattleConfiguredSpriteTask
-local function teardownConfiguredSprite(self)
-  if #self._effectIds > 0 then
-    local scene = self._scene
-    for _, id in ipairs(self._effectIds) do
-      scene.releaseEffect(scene, id)
-    end
-    self._effectIds = {}
-  end
-  self._shown = 0
-end
-
--- Releases owned transient records and staged leases exactly once:
--- teardown clears scene state while the staged journal guards the
--- double release, so complete, cancel, and dispose share this path.
----@param self BattleConfiguredSpriteTask
-local function retireConfiguredSprite(self)
-  teardownConfiguredSprite(self)
-  releaseStaged(self._staged)
-end
-
--- Selects the display frame behind a source tick count over the
--- authored cumulative durations.
----@param self BattleConfiguredSpriteTask
----@param tick integer source ticks advanced
----@return integer display frame behind the tick
-local function frameAt(self, tick)
-  local elapsed = 0
-  for index, frame in ipairs(self._frames) do
-    elapsed = elapsed + frame.duration
-    if tick <= elapsed then
-      return index
-    end
-  end
-  return #self._frames
+  return {
+    characterKey = characterKey,
+    stripWidth = texture.width,
+    anchor = anchor,
+    walk = walk,
+    total = total,
+    cells = cells,
+  }
 end
 
 -- Publishes one authored cell as transient strip-band pictures: each
 -- 8-pixel object row crops its staged tile band through the existing
 -- scene record, ordered by NCER object order with native offsets,
--- flips, and priority depth.
----@param self BattleConfiguredSpriteTask
+-- flips, and priority depth, displaced by the caller-owned motion and
+-- faded by the caller-owned blend coefficient. Published identities
+-- append to the caller-owned list, so a mid-cell crop refusal still
+-- leaves every allocated band tracked for the caller teardown.
+---@param scene table<string, unknown> scene behind owned transient records
+---@param kind string configured sprite kind under diagnosis
+---@param bank BattleConfiguredSpriteBank decoded sprite bank behind the cell
 ---@param cellIndex integer zero-based authored cell behind publishing
-local function publishConfiguredCell(self, cellIndex)
-  teardownConfiguredSprite(self)
-  local scene = self._scene
-  local cell = self._cells[cellIndex + 1]
+---@param dx integer caller-owned horizontal displacement in native pixels
+---@param dy integer caller-owned vertical displacement in native pixels
+---@param alpha number caller-owned normalized polygon alpha
+---@param effectIds table<integer, integer> caller-owned identities behind the shown frame
+local function publishConfiguredCellBands(scene, kind, bank, cellIndex, dx, dy, alpha, effectIds)
+  local cell = bank.cells[cellIndex + 1]
   assert(type(cell) == "table", "published cells stay in the staged range")
   local objs = cell.objs --[[@as table<integer, table<string, unknown>>]]
   assert(type(objs) == "table", "published cells carry their staged objects")
-  local anchor = self._anchor --[[@as table<string, integer>]]
+  local anchor = bank.anchor --[[@as table<string, integer>]]
   for _, obj in ipairs(objs) do
     if type(obj) == "table" and obj.disabled ~= true then
       local width = obj.width --[[@as integer]]
@@ -3588,95 +4187,1336 @@ local function publishConfiguredCell(self, cellIndex)
       local rows = math.floor(height / 8)
       for band = 0, rows - 1 do
         local origin = (obj.tile + band * tilesPerRow) * 8
-        if origin < 0 or origin + width > self._stripWidth then
-          teardownConfiguredSprite(self)
+        if origin < 0 or origin + width > bank.stripWidth then
           error(
-            "BATTLE_EFFECT_TASK_RESOURCE: kind "
-              .. self._kind
-              .. " crops staged sprite tiles from "
-              .. self._characterKey,
+            "BATTLE_EFFECT_TASK_RESOURCE: kind " .. kind .. " crops staged sprite tiles from " .. bank.characterKey,
             0
           )
         end
         local record = scene.allocEffect(scene, "configured-sprite")
         local id = record.id --[[@as integer]]
         scene.setEffectPicture(scene, id, {
-          assetKey = self._characterKey,
-          selector = self._kind .. "/cell-" .. cellIndex .. "/band-" .. band,
-          centerX = anchor.x + obj.x,
-          centerY = anchor.y + obj.y + band * 8,
+          assetKey = bank.characterKey,
+          selector = kind .. "/cell-" .. cellIndex .. "/band-" .. band,
+          centerX = anchor.x + obj.x + math.floor(width / 2) + dx,
+          centerY = anchor.y + obj.y + band * 8 + 4 + dy,
           zCenter = -obj.priority,
           width = width,
           height = 8,
-          alpha = 1,
+          alpha = alpha,
           xOffset2 = origin,
           yOffset2 = 0,
           flipH = obj.flipH == true,
           flipV = obj.flipV == true,
         })
-        self._effectIds[#self._effectIds + 1] = id
+        effectIds[#effectIds + 1] = id
       end
     end
   end
 end
 
--- Advances one source tick toward the authored animation boundary.
--- Mid-task scene failures restore the task's own partial visuals
--- before the failure reaches the player.
----@param self BattleConfiguredSpriteTask
+-- Pinned zigzag legs behind opcode-78 selector 8
+-- (BattleAnimSpriteFunc_ZigzagSlash in battle_anim_effects.c): five-tick
+-- pauses separate 8-tick linear legs from the defender anchor, then a
+-- 16-tick sprite fade over the defender white flash and its restore.
+local ZIGZAG_SLASH_KIND = "pokemon-picture-zigzag-slash"
+local ZIGZAG_SLASH_LEGS = {
+  { dx = 40, dy = 40 },
+  { dx = 0, dy = -80 },
+  { dx = -80, dy = 80 },
+  { dx = 0, dy = -80 },
+  { dx = 80, dy = 80 },
+  { dx = -40, dy = -40 },
+}
+local ZIGZAG_SLASH_PAUSE_TICKS = 5
+local ZIGZAG_SLASH_LEG_TICKS = 8
+local ZIGZAG_SLASH_FADE_TICKS = 16
+local ZIGZAG_SLASH_RESTORE_TICKS = 11
+local ZIGZAG_SLASH_FLASH_TARGET = 10
+local ZIGZAG_SLASH_FLASH_COLOR = 32767
+
+-- Owns one ZigzagSlash sprite occurrence: the staged magnifier walks the
+-- pinned leg table from the defender anchor, fades over the defender
+-- white flash, then restores the defender picture. Frame timing follows
+-- the native NEXT_LEG/MOVE/FADE_OUT/RESTORE/END states tick for tick.
+---@class BattleZigzagSlashTask
+---@field _scene table<string, unknown> scene behind owned transient records
+---@field _kind string zigzag slash kind behind the run
+---@field _staged table<integer, BattleEffectLeaseRecord> staged occurrence leases
+---@field _bank BattleConfiguredSpriteBank decoded sprite bank behind the cell
+---@field _defender table<string, unknown> combatant and activation pair behind the flashed picture
+---@field _cell integer zero-based static authored cell behind publishing
+---@field _leg integer one-based current leg behind motion
+---@field _phase string pause, move, exit, fade, or restore behind advancement
+---@field _phaseTick integer ticks advanced inside the current phase
+---@field _baseX integer accumulated leg base X in native pixels
+---@field _baseY integer accumulated leg base Y in native pixels
+---@field _curFxX integer accumulated leg motion X in 1/4096 pixels
+---@field _curFxY integer accumulated leg motion Y in 1/4096 pixels
+---@field _stepFxX integer fixed-point leg motion step X per tick
+---@field _stepFxY integer fixed-point leg motion step Y per tick
+---@field _effectIds table<integer, integer> live transient identities behind the shown frame
+---@field _flashStaged boolean defender flash patch is owned
+---@field _ticks integer source ticks advanced
+---@field _state string pending, running, complete, or cancelled
+---@field _cancelReason string? last cancellation reason under diagnosis
+---@field _disposed boolean release has run
+local BattleZigzagSlashTask = {}
+BattleZigzagSlashTask.__index = BattleZigzagSlashTask
+
+---@param kind string zigzag slash kind under construction
+---@param args table<string, unknown> instruction-derived construction arguments
+---@param context table<string, unknown> occurrence-bound playback context
+---@param services table<string, unknown> scene, audio, and resource collaborators
+---@return table<string, unknown> runnable sprite task
+local function newZigzagSlashTask(kind, args, context, services)
+  local scene, staged, resourceKeys = stageConfiguredSpriteLeases(kind, args, services)
+  local bankOk, bank = pcall(decodeConfiguredSpriteBank, kind, resourceKeys, staged, context)
+  if not bankOk then
+    error(bank, 0)
+  end
+  assert(type(bank) == "table", "the decoded sprite bank stages before the first tick")
+  local topology = type(context) == "table" and context.topology or nil
+  local targets = type(topology) == "table" and topology.targets or nil
+  local defender = type(targets) == "table" and targets[1] or nil
+  if type(defender) ~= "table" or type(defender.combatant) ~= "number" then
+    releaseStaged(staged)
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " flashes the occurrence defender picture", 0)
+  end
+  return setmetatable({
+    _scene = scene,
+    _kind = kind,
+    _staged = staged,
+    _bank = bank,
+    _defender = { combatant = defender.combatant, activation = defender.activation },
+    _cell = bank.walk[1].cell,
+    _leg = 1,
+    _phase = "pause",
+    _phaseTick = 0,
+    _baseX = 0,
+    _baseY = 0,
+    _curFxX = 0,
+    _curFxY = 0,
+    _stepFxX = 0,
+    _stepFxY = 0,
+    _effectIds = {},
+    _flashStaged = false,
+    _ticks = 0,
+    _state = "pending",
+    _cancelReason = nil,
+    _disposed = false,
+  }, BattleZigzagSlashTask)
+end
+
+-- Releases owned transient sprite identities without touching the
+-- persistent battler scene.
+---@param self BattleZigzagSlashTask
+local function teardownZigzagSprite(self)
+  if #self._effectIds > 0 then
+    local scene = self._scene
+    for _, id in ipairs(self._effectIds) do
+      scene.releaseEffect(scene, id)
+    end
+    self._effectIds = {}
+  end
+end
+
+-- Releases the owned defender flash patch only while this task still
+-- owns the slot, so a newer overlay is never restored away.
+---@param self BattleZigzagSlashTask
+local function teardownZigzagFlash(self)
+  if self._flashStaged then
+    self._flashStaged = false
+    if type(self._scene.removeTaskPicturePatch) == "function" then
+      self._scene.removeTaskPicturePatch(self._scene, self, self._defender)
+    end
+  end
+end
+
+-- Releases owned transient records, the defender flash, and staged
+-- leases exactly once.
+---@param self BattleZigzagSlashTask
+local function retireZigzagSlash(self)
+  teardownZigzagSprite(self)
+  teardownZigzagFlash(self)
+  releaseStaged(self._staged)
+end
+
+-- Publishes the static cell at the accumulated leg position with the
+-- caller-owned blend coefficient behind one motion tick. Mid-task scene
+-- failures retire the task's own partial visuals before the failure
+-- reaches the player.
+---@param self BattleZigzagSlashTask
+---@param alpha number normalized polygon alpha behind the tick
+local function publishZigzagCell(self, alpha)
+  teardownZigzagSprite(self)
+  local dx = self._baseX + math.floor(self._curFxX / 4096)
+  local dy = self._baseY + math.floor(self._curFxY / 4096)
+  publishConfiguredCellBands(self._scene, self._kind, self._bank, self._cell, dx, dy, alpha, self._effectIds)
+end
+
+-- Publishes the static cell behind one motion tick, retiring the task's
+-- own partial visuals when the scene refuses the publish.
+---@param self BattleZigzagSlashTask
+---@param alpha number normalized polygon alpha behind the tick
+local function stepZigzagPublish(self, alpha)
+  local ok, err = pcall(publishZigzagCell, self, alpha)
+  if not ok then
+    retireZigzagSlash(self)
+    error(err, 0)
+  end
+end
+
+-- Stages the defender white flash behind one fade direction: the scene
+-- advances the coefficient toward its finish, so the task writes once
+-- and polls nothing.
+---@param self BattleZigzagSlashTask
+---@param start integer flash coefficient at the phase entry
+---@param finish integer flash coefficient at the phase exit
+local function stageZigzagFlash(self, start, finish)
+  teardownZigzagFlash(self)
+  self._scene.applyTaskPicturePatch(self._scene, self, self._defender, {
+    paletteFade = {
+      start = start,
+      finish = finish,
+      framesPer = 0,
+      targetColor = ZIGZAG_SLASH_FLASH_COLOR,
+    },
+  })
+  self._flashStaged = true
+end
+
+-- Advances one source tick through the native phase machine: pause legs
+-- hold the accumulated base, move legs integrate the fixed-point step,
+-- the exit tick lands on the new base, the fade dims the sprite over
+-- the defender flash, and the restore returns the defender picture.
+---@param self BattleZigzagSlashTask
 ---@param tick table<string, unknown>? source tick under advancement
-function BattleConfiguredSpriteTask:stepSourceTick(tick)
+function BattleZigzagSlashTask:stepSourceTick(tick)
   local _ = tick
   if self._disposed or self._state == "complete" or self._state == "cancelled" then
     return
   end
   self._state = "running"
   self._ticks = self._ticks + 1
-  local index = frameAt(self, self._ticks)
-  if index ~= self._shown then
-    local ok, err = pcall(publishConfiguredCell, self, self._frames[index].cell)
-    if not ok then
-      retireConfiguredSprite(self)
-      error(err, 0)
+  local Fx = require("libs.hgss.src.presentation.PresentationFxMath")
+  if self._phase == "pause" then
+    self._phaseTick = self._phaseTick + 1
+    stepZigzagPublish(self, 1)
+    if self._phaseTick >= ZIGZAG_SLASH_PAUSE_TICKS then
+      local leg = ZIGZAG_SLASH_LEGS[self._leg]
+      self._curFxX = 0
+      self._curFxY = 0
+      self._stepFxX = Fx.fxDiv(leg.dx * 4096, ZIGZAG_SLASH_LEG_TICKS * 4096)
+      self._stepFxY = Fx.fxDiv(leg.dy * 4096, ZIGZAG_SLASH_LEG_TICKS * 4096)
+      self._phase = "move"
+      self._phaseTick = 0
     end
-    self._shown = index
-  end
-  if self._ticks >= self._total then
-    self._state = "complete"
-    retireConfiguredSprite(self)
+  elseif self._phase == "move" then
+    self._phaseTick = self._phaseTick + 1
+    self._curFxX = self._curFxX + self._stepFxX
+    self._curFxY = self._curFxY + self._stepFxY
+    stepZigzagPublish(self, 1)
+    if self._phaseTick >= ZIGZAG_SLASH_LEG_TICKS then
+      self._phase = "exit"
+      self._phaseTick = 0
+    end
+  elseif self._phase == "exit" then
+    local leg = ZIGZAG_SLASH_LEGS[self._leg]
+    self._baseX = self._baseX + leg.dx
+    self._baseY = self._baseY + leg.dy
+    self._curFxX = 0
+    self._curFxY = 0
+    stepZigzagPublish(self, 1)
+    self._leg = self._leg + 1
+    if self._leg > #ZIGZAG_SLASH_LEGS then
+      stageZigzagFlash(self, 0, ZIGZAG_SLASH_FLASH_TARGET)
+      self._phase = "fade"
+    else
+      self._phase = "pause"
+    end
+    self._phaseTick = 0
+  elseif self._phase == "fade" then
+    self._phaseTick = self._phaseTick + 1
+    local remaining = ZIGZAG_SLASH_FADE_TICKS - self._phaseTick
+    if remaining <= 0 then
+      teardownZigzagSprite(self)
+      stageZigzagFlash(self, ZIGZAG_SLASH_FLASH_TARGET, 0)
+      self._phase = "restore"
+      self._phaseTick = 0
+    else
+      stepZigzagPublish(self, remaining / ZIGZAG_SLASH_FADE_TICKS)
+    end
+  elseif self._phase == "restore" then
+    self._phaseTick = self._phaseTick + 1
+    if self._phaseTick >= ZIGZAG_SLASH_RESTORE_TICKS then
+      self._state = "complete"
+      retireZigzagSlash(self)
+    end
+  else
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. self._kind .. " advances a known zigzag phase", 0)
   end
 end
 
 -- Reports the sprite run state for the player's retirement accounting.
----@param self BattleConfiguredSpriteTask
+---@param self BattleZigzagSlashTask
 ---@return string
-function BattleConfiguredSpriteTask:status()
-  assert(VALID_TASK_STATES[self._state] == true, "configured sprite tasks report a known run state")
+function BattleZigzagSlashTask:status()
+  assert(VALID_TASK_STATES[self._state] == true, "zigzag slash tasks report a known run state")
   return self._state
 end
 
 -- Cancels the sprite run; completion and cancellation stay separate, so
 -- a completed run keeps its completion.
----@param self BattleConfiguredSpriteTask
----@param reason string cancellation cause under diagnosis
-function BattleConfiguredSpriteTask:cancel(reason)
+---@param self BattleZigzagSlashTask
+---@param reason string cancellation reason under diagnosis
+function BattleZigzagSlashTask:cancel(reason)
   if self._state == "complete" then
     return
   end
   self._state = "cancelled"
   self._cancelReason = reason
-  retireConfiguredSprite(self)
+  retireZigzagSlash(self)
 end
 
 -- Releases owned transient records and staged leases exactly once.
----@param self BattleConfiguredSpriteTask
-function BattleConfiguredSpriteTask:dispose()
+---@param self BattleZigzagSlashTask
+function BattleZigzagSlashTask:dispose()
   if self._disposed then
     return
   end
   self._disposed = true
-  retireConfiguredSprite(self)
+  retireZigzagSlash(self)
 end
+
+-- Synchronous no-op behind the argument-free empty callback: no counter
+-- change, no lease, no drawable state. One step retires it.
+---@class BattleSyncMarkerTask
+---@field _state string pending, running, complete, or cancelled
+---@field _disposed boolean release has run
+local BattleSyncMarkerTask = {}
+BattleSyncMarkerTask.__index = BattleSyncMarkerTask
+
+---@param kind string task kind under construction
+---@return BattleSyncMarkerTask runnable empty task
+local function newSyncNoopTask(kind)
+  local _ = kind
+  return setmetatable({ _state = "pending", _disposed = false }, BattleSyncMarkerTask)
+end
+
+---@param self BattleSyncMarkerTask
+---@param tick table<string, unknown>? source tick under advancement
+function BattleSyncMarkerTask:stepSourceTick(tick)
+  local _ = tick
+  if self._disposed or self._state == "complete" or self._state == "cancelled" then
+    return
+  end
+  self._state = "complete"
+end
+
+---@param self BattleSyncMarkerTask
+---@return string
+function BattleSyncMarkerTask:status()
+  assert(VALID_TASK_STATES[self._state] == true, "empty tasks report a known run state")
+  return self._state
+end
+
+---@param self BattleSyncMarkerTask
+---@param reason string cancellation cause under diagnosis
+function BattleSyncMarkerTask:cancel(reason)
+  local _ = reason
+  if self._state == "complete" then
+    return
+  end
+  self._state = "cancelled"
+end
+
+---@param self BattleSyncMarkerTask
+function BattleSyncMarkerTask:dispose()
+  self._disposed = true
+end
+
+-- Two-state counted task behind the one-frame callbacks: a wait state
+-- then an end state, retiring on the second tick instead of collapsing
+-- to a synchronous completion.
+---@class BattleTwoStateTask
+---@field _state string pending, running, complete, or cancelled
+---@field _disposed boolean release has run
+local BattleTwoStateTask = {}
+BattleTwoStateTask.__index = BattleTwoStateTask
+
+---@param kind string task kind under construction
+---@return BattleTwoStateTask runnable two-state task
+local function newTwoStateTask(kind)
+  local _ = kind
+  return setmetatable({ _state = "pending", _ticks = 0, _disposed = false }, BattleTwoStateTask)
+end
+
+-- One shared battler-sprite manager draw window. The native frame loop
+-- draws the manager on its creation frame and on each of its remaining
+-- source ticks; the window therefore opens at construction and closes
+-- exactly once when the loop retires, is cancelled, or is disposed.
+---@param kind string normalized task kind under construction
+---@param args table<string, unknown> instruction-derived construction arguments
+---@param services table<string, unknown> scene collaborator
+---@return table<string, unknown> runnable draw-window task
+local function newManagedSpriteDrawTask(kind, args, services)
+  local scene = checkScene(services, kind)
+  if
+    type(scene.openAnimationSpriteDrawWindow) ~= "function"
+    or type(scene.closeAnimationSpriteDrawWindow) ~= "function"
+  then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " requires its scene draw window", 0)
+  end
+  local parameters = args.parameters
+  local frameTicks = type(parameters) == "table" and parameters.frameTicks or nil
+  if type(frameTicks) ~= "number" or frameTicks % 1 ~= 0 or frameTicks < 1 then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " carries a positive frame count", 0)
+  end
+  local owner = {}
+  local state = "pending"
+  local ticks = 0
+  local window = true
+  scene.openAnimationSpriteDrawWindow(scene, owner)
+  local function closeWindow()
+    if window then
+      window = false
+      scene.closeAnimationSpriteDrawWindow(scene, owner)
+    end
+  end
+  local function stepSourceTick()
+    if state == "complete" or state == "cancelled" then
+      return
+    end
+    state = "running"
+    ticks = ticks + 1
+    if ticks >= frameTicks then
+      state = "complete"
+      closeWindow()
+    end
+  end
+  local function status()
+    return state
+  end
+  local function cancel()
+    if state == "complete" then
+      return
+    end
+    state = "cancelled"
+    closeWindow()
+  end
+  local function dispose()
+    closeWindow()
+  end
+  return { stepSourceTick = stepSourceTick, status = status, cancel = cancel, dispose = dispose }
+end
+
+---@param self BattleTwoStateTask
+---@param tick table<string, unknown>? source tick under advancement
+function BattleTwoStateTask:stepSourceTick(tick)
+  local _ = tick
+  if self._disposed or self._state == "complete" or self._state == "cancelled" then
+    return
+  end
+  self._ticks = self._ticks + 1
+  if self._ticks >= 2 then
+    self._state = "complete"
+  else
+    self._state = "running"
+  end
+end
+
+---@param self BattleTwoStateTask
+---@return string
+function BattleTwoStateTask:status()
+  assert(VALID_TASK_STATES[self._state] == true, "one-frame tasks report a known run state")
+  return self._state
+end
+
+---@param self BattleTwoStateTask
+---@param reason string cancellation cause under diagnosis
+function BattleTwoStateTask:cancel(reason)
+  local _ = reason
+  if self._state == "complete" then
+    return
+  end
+  self._state = "cancelled"
+end
+
+---@param self BattleTwoStateTask
+function BattleTwoStateTask:dispose()
+  self._disposed = true
+end
+
+-- Object-window sprite task with native delay/show/hold phasing: an
+-- invisible delay, one show tick publishing the connected window state,
+-- a hold, then exact window cleanup and completion. The published masks
+-- mirror the native register state
+-- (BattleAnimFunc_ShowAttackerObjWindowSprites in
+-- battle_anim_move_effects.c) through the composite plane mapping
+-- (world3d is BG0, window is BG1, transition is BG2, battlefield is
+-- BG3): outside the window every plane stays visible, while inside
+-- only the window (BG1) plane stays visible with the background
+-- transition and battlefield planes cleared. The attacker's picture
+-- rides the world3d plane in this engine (native battlers are OBJ
+-- sprites gated through the object flag instead), so the inside mask
+-- keeps world3d visible rather than punching an attacker-shaped hole
+-- through the mon the window frames.
+---@class BattleObjWindowTask
+---@field _scene table<string, unknown> scene behind the window writes
+---@field _ticks integer source ticks advanced
+---@field _released boolean window cleanup has run
+---@field _state string pending, running, complete, or cancelled
+---@field _disposed boolean release has run
+local BattleObjWindowTask = {}
+BattleObjWindowTask.__index = BattleObjWindowTask
+
+local OBJ_WINDOW_DELAY_TICKS = 10
+local OBJ_WINDOW_HOLD_TICKS = 10
+
+---@param kind string task kind under construction
+---@param services table<string, unknown> scene collaborator
+---@return BattleObjWindowTask runnable window task
+local function newObjWindowTask(kind, services)
+  local scene = checkScene(services, kind)
+  if type(scene.writeAnimationCompositor) ~= "function" or type(scene.restoreAnimationCompositor) ~= "function" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " owns its window through the scene compositor seam", 0)
+  end
+  return setmetatable({
+    _scene = scene,
+    _kind = kind,
+    _ticks = 0,
+    _released = false,
+    _state = "pending",
+    _disposed = false,
+  }, BattleObjWindowTask)
+end
+
+---@param self BattleObjWindowTask window task under window publication
+local function publishObjWindow(self)
+  self._scene:writeAnimationCompositor(self, "main", {
+    windows = {
+      objWindow = {
+        mask = { world3d = true, window = true, transition = false, battlefield = false },
+      },
+      outside = {
+        mask = { world3d = true, window = true, transition = true, battlefield = true },
+      },
+    },
+  })
+end
+
+---@param self BattleObjWindowTask window task under window cleanup
+local function teardownObjWindow(self)
+  if self._released then
+    return
+  end
+  self._released = true
+  self._scene.restoreAnimationCompositor(self._scene, self, "main")
+end
+
+---@param self BattleObjWindowTask
+---@param tick table<string, unknown>? source tick under advancement
+function BattleObjWindowTask:stepSourceTick(tick)
+  local _ = tick
+  if self._disposed or self._state == "complete" or self._state == "cancelled" then
+    return
+  end
+  self._state = "running"
+  self._ticks = self._ticks + 1
+  if self._ticks == OBJ_WINDOW_DELAY_TICKS + 1 then
+    publishObjWindow(self)
+  elseif self._ticks >= OBJ_WINDOW_DELAY_TICKS + 1 + OBJ_WINDOW_HOLD_TICKS then
+    teardownObjWindow(self)
+    self._state = "complete"
+  end
+end
+
+---@param self BattleObjWindowTask
+---@return string
+function BattleObjWindowTask:status()
+  assert(VALID_TASK_STATES[self._state] == true, "object-window tasks report a known run state")
+  return self._state
+end
+
+---@param self BattleObjWindowTask
+---@param reason string cancellation cause under diagnosis
+function BattleObjWindowTask:cancel(reason)
+  local _ = reason
+  if self._state == "complete" then
+    return
+  end
+  self._state = "cancelled"
+  teardownObjWindow(self)
+end
+
+---@param self BattleObjWindowTask
+function BattleObjWindowTask:dispose()
+  if self._disposed then
+    return
+  end
+  self._disposed = true
+  if self._state ~= "complete" then
+    teardownObjWindow(self)
+  end
+end
+
+-- Resolves the picture activation a motion task owns: the explicit
+-- spawning argument first, the semantic battler or picture target
+-- through the detached occurrence topology, and the occurrence
+-- attacker when the probe carries no explicit target.
+---@param args table<string, unknown> instruction-derived construction arguments
+---@param context table<string, unknown> occurrence-bound playback context
+---@param kind string task kind under diagnosis
+---@return table<string, unknown> combatant and activation pair behind the owned picture
+local function motionActivation(args, context, kind)
+  local resolved = plannedActivation(args, context)
+  if resolved ~= nil then
+    return resolved
+  end
+  local topology = type(context) == "table" and context.topology or nil
+  local attacker = type(topology) == "table" and topology.attacker or nil
+  if type(attacker) == "table" and type(attacker.combatant) == "number" then
+    return { combatant = attacker.combatant, activation = attacker.activation }
+  end
+  error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " pictures its occurrence attacker", 0)
+end
+
+-- Sinusoidal picture motion writing the canonical battler center: the
+-- native circle writes POKEPIC_X/Y, never the crop byte. The terminal
+-- center persists after completion; cancellation removes the owned
+-- overlay instead.
+---@class BattleSinusoidalMotionTask
+---@field _scene table<string, unknown> scene behind the owned overlay
+---@field _activation table<string, unknown> combatant and activation pair behind the motion
+---@field _fromX integer motion start in native pixels
+---@field _toX integer motion end in native pixels
+---@field _duration integer source ticks behind completion
+---@field _ticks integer source ticks advanced
+---@field _state string pending, running, complete, or cancelled
+---@field _disposed boolean release has run
+local BattleSinusoidalMotionTask = {}
+BattleSinusoidalMotionTask.__index = BattleSinusoidalMotionTask
+
+---@param kind string task kind under construction
+---@param args table<string, unknown> instruction-derived construction arguments
+---@param context table<string, unknown> occurrence-bound playback context
+---@param services table<string, unknown> scene collaborator
+---@return BattleSinusoidalMotionTask runnable motion task
+local function newSinusoidalMotionTask(kind, args, context, services)
+  checkVisualArgs(args, kind)
+  local scene = checkScene(services, kind)
+  if type(scene.applyTaskPicturePatch) ~= "function" or type(scene.removeTaskPicturePatch) ~= "function" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " motions through the scene overlay seam", 0)
+  end
+  local activation = motionActivation(args, context, kind)
+  local parameters = args.parameters
+  if parameters == nil then
+    parameters = {}
+  end
+  if type(parameters) ~= "table" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " carries its parameters as a record", 0)
+  end
+  local duration = parameters.durationTicks
+  if not isPositiveInt(duration) then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " motions over a compiled duration", 0)
+  end
+  local fromX = parameters.startX or 0
+  local toX = parameters.endX
+  if toX == nil then
+    toX = 16
+  end
+  if type(fromX) ~= "number" or type(toX) ~= "number" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " motions between numeric endpoints", 0)
+  end
+  return setmetatable({
+    _scene = scene,
+    _kind = kind,
+    _activation = activation,
+    _fromX = clampPictureOffset(fromX),
+    _toX = clampPictureOffset(toX),
+    _duration = duration,
+    _ticks = 0,
+    _state = "pending",
+    _disposed = false,
+  }, BattleSinusoidalMotionTask)
+end
+
+---@param self BattleSinusoidalMotionTask motion task under advancement
+---@param tick table<string, unknown>? source tick under advancement
+function BattleSinusoidalMotionTask:stepSourceTick(tick)
+  local _ = tick
+  if self._disposed or self._state == "complete" or self._state == "cancelled" then
+    return
+  end
+  self._state = "running"
+  self._ticks = self._ticks + 1
+  local progress = self._ticks / self._duration
+  if progress > 1 then
+    progress = 1
+  end
+  local centerX = math.floor(self._fromX + (self._toX - self._fromX) * progress + 0.5)
+  local ok, err = pcall(self._scene.applyTaskPicturePatch, self._scene, self, self._activation, {
+    centerX = clampPictureOffset(centerX),
+  })
+  if not ok then
+    pcall(self._scene.removeTaskPicturePatch, self._scene, self, self._activation)
+    error(err, 0)
+  end
+  if self._ticks >= self._duration then
+    -- Normal completion keeps the terminal center: no overlay reset.
+    self._state = "complete"
+  end
+end
+
+---@param self BattleSinusoidalMotionTask
+---@return string
+function BattleSinusoidalMotionTask:status()
+  assert(VALID_TASK_STATES[self._state] == true, "sinusoidal motion tasks report a known run state")
+  return self._state
+end
+
+---@param self BattleSinusoidalMotionTask
+---@param reason string cancellation cause under diagnosis
+function BattleSinusoidalMotionTask:cancel(reason)
+  local _ = reason
+  if self._state == "complete" then
+    return
+  end
+  self._state = "cancelled"
+  pcall(self._scene.removeTaskPicturePatch, self._scene, self, self._activation)
+end
+
+---@param self BattleSinusoidalMotionTask
+function BattleSinusoidalMotionTask:dispose()
+  if self._disposed then
+    return
+  end
+  self._disposed = true
+end
+
+-- Native side sign behind defender knockback: an even native sideType
+-- reads side 3 (+1), an odd sideType reads side 4 (-1).
+---@param context table<string, unknown> occurrence-bound playback context
+---@param kind string task kind under diagnosis
+---@return integer side sign behind the displacement
+local function knockbackSideSign(context, kind)
+  local topology = type(context) == "table" and context.topology or nil
+  local targets = type(topology) == "table" and topology.targets or nil
+  local first = type(targets) == "table" and targets[1] or nil
+  local sideType = type(first) == "table" and first.sideType or nil
+  if type(sideType) ~= "number" or sideType % 1 ~= 0 or sideType < 0 or sideType > 5 then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " knocks back a sided event target", 0)
+  end
+  return sideType % 2 == 0 and 1 or -1
+end
+
+-- Defender knockback with its source start/move/shake/return/end states:
+-- a linear displacement, a shake at the displaced endpoint, a linear
+-- return and an exact reset to the original center. Positions use the
+-- exact fixed-point linear steps; the shake accumulates literally like
+-- the source read of the current attribute each tick.
+---@class BattleKnockbackTask
+---@field _scene table<string, unknown> scene behind the owned overlay
+---@field _kind string task kind behind the run
+---@field _activation table<string, unknown> combatant and activation pair behind the motion
+---@field _baseX number motion start center in native pixels
+---@field _baseY number motion start center in native pixels
+---@field _endX number displaced endpoint in native pixels
+---@field _endY number displaced endpoint in native pixels
+---@field _sign integer side sign behind the displacement
+---@field _phase integer knockback phase behind advancement
+---@field _moveX table<string, number> fixed-point horizontal motion under advancement
+---@field _moveY table<string, number> fixed-point vertical motion under advancement
+---@field _shake table<string, integer> shake state at the displaced endpoint
+---@field _state string pending, running, complete, or cancelled
+---@field _disposed boolean release has run
+local BattleKnockbackTask = {}
+BattleKnockbackTask.__index = BattleKnockbackTask
+
+local KNOCKBACK_PHASES = { start = 1, move = 2, shake = 3, returning = 4, done = 5 }
+
+---@param kind string task kind under construction
+---@param args table<string, unknown> instruction-derived construction arguments
+---@param context table<string, unknown> occurrence-bound playback context
+---@param services table<string, unknown> scene collaborator
+---@return BattleKnockbackTask runnable knockback task
+local function newKnockbackTask(kind, args, context, services)
+  checkVisualArgs(args, kind)
+  local scene = checkScene(services, kind)
+  if type(scene.applyTaskPicturePatch) ~= "function" or type(scene.removeTaskPicturePatch) ~= "function" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " displaces through the scene overlay seam", 0)
+  end
+  local activation = motionActivation(args, context, kind)
+  local present = scene:pictureState(activation)
+  local baseX = 0
+  local baseY = 0
+  if type(present) == "table" then
+    if type(present.centerX) == "number" then
+      baseX = present.centerX
+    end
+    if type(present.centerY) == "number" then
+      baseY = present.centerY
+    end
+  end
+  local sign = knockbackSideSign(context, kind)
+  local Fx = require("libs.hgss.src.presentation.PresentationFxMath")
+  local endX = baseX + sign * -40
+  local endY = baseY + sign * 16
+  local function linearStep(fromValue, toValue, duration)
+    return Fx.fxDiv((toValue - fromValue) * 4096, duration * 4096)
+  end
+  local moveX = { cur = baseX * 4096, step = linearStep(baseX, endX, 4), remaining = 4 }
+  local moveY = { cur = baseY * 4096, step = linearStep(baseY, endY, 4), remaining = 4 }
+  return setmetatable({
+    _scene = scene,
+    _kind = kind,
+    _activation = activation,
+    _baseX = baseX,
+    _baseY = baseY,
+    _endX = endX,
+    _endY = endY,
+    _sign = sign,
+    _phase = KNOCKBACK_PHASES.start,
+    _moveX = moveX,
+    _moveY = moveY,
+    _shake = { timer = 1, interval = 1, count = 4, phase = 0, prevX = -4, x = 0 },
+    _state = "pending",
+    _disposed = false,
+  }, BattleKnockbackTask)
+end
+
+---@param self BattleKnockbackTask knockback task under overlay publication
+---@param centerX number displaced horizontal center
+---@param centerY number displaced vertical center
+local function publishKnockback(self, centerX, centerY)
+  local ok, err = pcall(
+    self._scene.applyTaskPicturePatch,
+    self._scene,
+    self,
+    self._activation,
+    { centerX = clampPictureOffset(centerX), centerY = clampPictureOffset(centerY) }
+  )
+  if not ok then
+    pcall(self._scene.removeTaskPicturePatch, self._scene, self, self._activation)
+    error(err, 0)
+  end
+end
+
+---@param motion table<string, number> fixed-point linear motion under advancement
+---@return boolean advanced true while motion remains
+local function advanceKnockbackLinear(motion)
+  if motion.remaining ~= 0 then
+    motion.cur = motion.cur + motion.step
+    motion.remaining = motion.remaining - 1
+    return true
+  end
+  return false
+end
+
+---@param self BattleKnockbackTask knockback task under advancement
+---@param tick table<string, unknown>? source tick under advancement
+function BattleKnockbackTask:stepSourceTick(tick)
+  local _ = tick
+  if self._disposed or self._state == "complete" or self._state == "cancelled" then
+    return
+  end
+  self._state = "running"
+  if self._phase == KNOCKBACK_PHASES.start then
+    self._phase = KNOCKBACK_PHASES.move
+    return
+  end
+  if self._phase == KNOCKBACK_PHASES.move then
+    if advanceKnockbackLinear(self._moveX) then
+      advanceKnockbackLinear(self._moveY)
+      publishKnockback(self, math.floor(self._moveX.cur / 4096), math.floor(self._moveY.cur / 4096))
+      return
+    end
+    self._phase = KNOCKBACK_PHASES.shake
+    return
+  end
+  if self._phase == KNOCKBACK_PHASES.shake then
+    local shake = self._shake
+    local advanced = false
+    if shake.count ~= 0 then
+      shake.timer = shake.timer + 1
+      if shake.timer >= shake.interval then
+        shake.timer = 0
+        local previous = shake.prevX
+        shake.prevX = shake.x
+        shake.x = previous == 0 and 0 or -previous
+        shake.phase = shake.phase + 1
+        if shake.phase >= 4 then
+          shake.phase = 0
+          shake.count = shake.count - 1
+        end
+      end
+      advanced = true
+    end
+    if advanced then
+      local present = self._scene:pictureState(self._activation)
+      local currentX = self._baseX
+      local currentY = self._baseY
+      if type(present) == "table" then
+        if type(present.centerX) == "number" then
+          currentX = present.centerX
+        end
+        if type(present.centerY) == "number" then
+          currentY = present.centerY
+        end
+      end
+      publishKnockback(self, currentX + shake.x, currentY)
+      return
+    end
+    local Fx = require("libs.hgss.src.presentation.PresentationFxMath")
+    local function linearStep(fromValue, toValue, duration)
+      return Fx.fxDiv((toValue - fromValue) * 4096, duration * 4096)
+    end
+    self._moveX = { cur = self._endX * 4096, step = linearStep(self._endX, self._baseX, 4), remaining = 4 }
+    self._moveY = { cur = self._endY * 4096, step = linearStep(self._endY, self._baseY, 4), remaining = 4 }
+    self._phase = KNOCKBACK_PHASES.returning
+    return
+  end
+  if self._phase == KNOCKBACK_PHASES.returning then
+    if advanceKnockbackLinear(self._moveX) then
+      publishKnockback(self, math.floor(self._moveX.cur / 4096), math.floor(self._moveY.cur / 4096))
+      return
+    end
+    self._phase = KNOCKBACK_PHASES.done
+    return
+  end
+  publishKnockback(self, self._baseX, self._baseY)
+  pcall(self._scene.removeTaskPicturePatch, self._scene, self, self._activation)
+  self._state = "complete"
+end
+
+---@param self BattleKnockbackTask
+---@return string
+function BattleKnockbackTask:status()
+  assert(VALID_TASK_STATES[self._state] == true, "knockback tasks report a known run state")
+  return self._state
+end
+
+---@param self BattleKnockbackTask
+---@param reason string cancellation cause under diagnosis
+function BattleKnockbackTask:cancel(reason)
+  local _ = reason
+  if self._state == "complete" then
+    return
+  end
+  self._state = "cancelled"
+  pcall(self._scene.removeTaskPicturePatch, self._scene, self, self._activation)
+end
+
+---@param self BattleKnockbackTask
+function BattleKnockbackTask:dispose()
+  if self._disposed then
+    return
+  end
+  self._disposed = true
+end
+
+-- Attacker squash and stretch with its five source scale phases: each
+-- phase interpolates XY scales with the source start/end/divisor and
+-- duration, and completion writes the explicit 1.0 terminal reset.
+-- Scale arithmetic uses the exact fixed-point steps.
+---@class BattleFivePhaseTask
+---@field _scene table<string, unknown> scene behind the owned overlay
+---@field _kind string task kind behind the run
+---@field _activation table<string, unknown> combatant and activation pair behind the motion
+---@field _phase integer one-based phase behind initialization
+---@field _scaleX table<string, integer>? fixed-point horizontal scale motion under advancement
+---@field _scaleY table<string, integer>? fixed-point vertical scale motion under advancement
+---@field _state string pending, running, complete, or cancelled
+---@field _disposed boolean release has run
+---@field _fx PresentationFxMath fixed-point arithmetic behind the phase steps
+local BattleFivePhaseTask = {}
+BattleFivePhaseTask.__index = BattleFivePhaseTask
+
+local FIVE_PHASES = {
+  { startX = 100, endX = 150, startY = 100, endY = 50, divisor = 100, duration = 10 },
+  { startX = 150, endX = 50, startY = 50, endY = 150, divisor = 100, duration = 10 },
+  { startX = 50, endX = 100, startY = 150, endY = 100, divisor = 100, duration = 5 },
+  { startX = 100, endX = 150, startY = 100, endY = 150, divisor = 100, duration = 5 },
+  { startX = 150, endX = 100, startY = 150, endY = 100, divisor = 100, duration = 5 },
+}
+
+---@param kind string task kind under construction
+---@param args table<string, unknown> instruction-derived construction arguments
+---@param context table<string, unknown> occurrence-bound playback context
+---@param services table<string, unknown> scene collaborator
+---@return BattleFivePhaseTask runnable squash/stretch task
+local function newFivePhaseTask(kind, args, context, services)
+  checkVisualArgs(args, kind)
+  local scene = checkScene(services, kind)
+  if type(scene.applyTaskPicturePatch) ~= "function" or type(scene.removeTaskPicturePatch) ~= "function" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " scales through the scene overlay seam", 0)
+  end
+  local activation = motionActivation(args, context, kind)
+  local Fx = require("libs.hgss.src.presentation.PresentationFxMath")
+  return setmetatable({
+    _scene = scene,
+    _kind = kind,
+    _activation = activation,
+    _phase = 1,
+    _scaleX = nil,
+    _scaleY = nil,
+    _state = "pending",
+    _disposed = false,
+    _fx = Fx,
+  }, BattleFivePhaseTask)
+end
+
+---@param self BattleFivePhaseTask squash/stretch task under phase initialization
+---@param phase integer one-based phase behind initialization
+local function initFivePhase(self, phase)
+  local spec = FIVE_PHASES[phase]
+  local startScaleX = math.floor(spec.startX * 256 / spec.divisor)
+  local endScaleX = math.floor(spec.endX * 256 / spec.divisor)
+  local startScaleY = math.floor(spec.startY * 256 / spec.divisor)
+  local endScaleY = math.floor(spec.endY * 256 / spec.divisor)
+  self._scaleX = {
+    cur = startScaleX * 4096,
+    step = self._fx.fxDiv((endScaleX - startScaleX) * 4096, spec.duration * 4096),
+    remaining = spec.duration,
+  }
+  self._scaleY = {
+    cur = startScaleY * 4096,
+    step = self._fx.fxDiv((endScaleY - startScaleY) * 4096, spec.duration * 4096),
+    remaining = spec.duration,
+  }
+end
+
+---@param motion table<string, integer> fixed-point scale motion under advancement
+---@return boolean advanced true while motion remains
+local function advanceFivePhaseScale(motion)
+  if motion.remaining ~= 0 then
+    motion.remaining = motion.remaining - 1
+    motion.cur = motion.cur + motion.step
+    return true
+  end
+  return false
+end
+
+---@param self BattleFivePhaseTask squash/stretch task under scale publication
+local function publishFivePhase(self)
+  local scaleX = math.floor(self._scaleX.cur / 4096) / 256
+  local scaleY = math.floor(self._scaleY.cur / 4096) / 256
+  local ok, err =
+    pcall(self._scene.applyTaskPicturePatch, self._scene, self, self._activation, { scaleX = scaleX, scaleY = scaleY })
+  if not ok then
+    pcall(self._scene.removeTaskPicturePatch, self._scene, self, self._activation)
+    error(err, 0)
+  end
+end
+
+---@param self BattleFivePhaseTask
+---@param tick table<string, unknown>? source tick under advancement
+function BattleFivePhaseTask:stepSourceTick(tick)
+  local _ = tick
+  if self._disposed or self._state == "complete" or self._state == "cancelled" then
+    return
+  end
+  self._state = "running"
+  if self._scaleX == nil then
+    initFivePhase(self, 1)
+  end
+  if advanceFivePhaseScale(self._scaleX) then
+    advanceFivePhaseScale(self._scaleY)
+    publishFivePhase(self)
+    return
+  end
+  if self._phase < #FIVE_PHASES then
+    self._phase = self._phase + 1
+    initFivePhase(self, self._phase)
+    return
+  end
+  -- Explicit terminal reset on the final transition tick, not an
+  -- overlay removal: the completed run reports its reset at once.
+  local ok, err =
+    pcall(self._scene.applyTaskPicturePatch, self._scene, self, self._activation, { scaleX = 1.0, scaleY = 1.0 })
+  if not ok then
+    pcall(self._scene.removeTaskPicturePatch, self._scene, self, self._activation)
+    error(err, 0)
+  end
+  self._state = "complete"
+end
+
+---@param self BattleFivePhaseTask
+---@return string
+function BattleFivePhaseTask:status()
+  assert(VALID_TASK_STATES[self._state] == true, "squash/stretch tasks report a known run state")
+  return self._state
+end
+
+---@param self BattleFivePhaseTask
+---@param reason string cancellation cause under diagnosis
+function BattleFivePhaseTask:cancel(reason)
+  local _ = reason
+  if self._state == "complete" then
+    return
+  end
+  self._state = "cancelled"
+  pcall(self._scene.removeTaskPicturePatch, self._scene, self, self._activation)
+end
+
+---@param self BattleFivePhaseTask
+function BattleFivePhaseTask:dispose()
+  if self._disposed then
+    return
+  end
+  self._disposed = true
+end
+
+-- Sprite mosaic task stepping both mosaic dimensions toward the source
+-- target: the sizes persist after retirement until an explicit reset.
+---@class BattleMosaicTask
+---@field _scene table<string, unknown> scene behind the owned compositor overlay
+---@field _kind string task kind behind the run
+---@field _sizeH number current horizontal mosaic dimension
+---@field _sizeV number current vertical mosaic dimension
+---@field _step integer compiled step toward the mosaic target
+---@field _target integer mosaic target dimension behind completion
+---@field _duration integer source ticks behind completion
+---@field _ticks integer source ticks advanced
+---@field _state string pending, running, complete, or cancelled
+---@field _disposed boolean release has run
+local BattleMosaicTask = {}
+BattleMosaicTask.__index = BattleMosaicTask
+
+---@param kind string task kind under construction
+---@param args table<string, unknown> instruction-derived construction arguments
+---@param services table<string, unknown> scene collaborator
+---@return BattleMosaicTask runnable mosaic task
+local function newMosaicTask(kind, args, services)
+  checkVisualArgs(args, kind)
+  local scene = checkScene(services, kind)
+  if type(scene.writeAnimationCompositor) ~= "function" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " mosaics through the scene compositor seam", 0)
+  end
+  local parameters = args.parameters
+  if type(parameters) ~= "table" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " carries its parameters as a record", 0)
+  end
+  local step = parameters.step
+  local sizeH = parameters.initialHorizontal
+  local sizeV = parameters.initialVertical
+  local duration = parameters.durationTicks
+  if type(step) ~= "number" or step % 1 ~= 0 or step == 0 then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " steps toward its mosaic target", 0)
+  end
+  if type(sizeH) ~= "number" or type(sizeV) ~= "number" or not isPositiveInt(duration) then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " mosaics from compiled dimensions", 0)
+  end
+  local target = step < 0 and 0 or 15
+  return setmetatable({
+    _scene = scene,
+    _kind = kind,
+    _sizeH = sizeH,
+    _sizeV = sizeV,
+    _step = step,
+    _target = target,
+    _duration = duration,
+    _ticks = 0,
+    _state = "pending",
+    _disposed = false,
+  }, BattleMosaicTask)
+end
+
+---@param self BattleMosaicTask mosaic task under advancement
+---@param tick table<string, unknown>? source tick under advancement
+function BattleMosaicTask:stepSourceTick(tick)
+  local _ = tick
+  if self._disposed or self._state == "complete" or self._state == "cancelled" then
+    return
+  end
+  self._state = "running"
+  self._ticks = self._ticks + 1
+  if self._sizeH ~= self._target and self._sizeV ~= self._target then
+    local nextH = self._sizeH + self._step
+    local nextV = self._sizeV + self._step
+    if self._step < 0 then
+      if nextH <= self._target then
+        nextH = self._target
+      end
+      if nextV <= self._target then
+        nextV = self._target
+      end
+    else
+      if nextH >= self._target then
+        nextH = self._target
+      end
+      if nextV >= self._target then
+        nextV = self._target
+      end
+    end
+    self._sizeH = nextH
+    self._sizeV = nextV
+  end
+  local ok, err = pcall(self._scene.writeAnimationCompositor, self._scene, self, "main", {
+    mosaic = {
+      horizontal = self._sizeH,
+      vertical = self._sizeV,
+      bgEnabled = true,
+      objEnabled = true,
+    },
+  })
+  if not ok then
+    error(err, 0)
+  end
+  if self._ticks >= self._duration then
+    self._state = "complete"
+  end
+end
+
+---@param self BattleMosaicTask
+---@return string
+function BattleMosaicTask:status()
+  assert(VALID_TASK_STATES[self._state] == true, "mosaic tasks report a known run state")
+  return self._state
+end
+
+---@param self BattleMosaicTask
+---@param reason string cancellation cause under diagnosis
+function BattleMosaicTask:cancel(reason)
+  local _ = reason
+  if self._state == "complete" then
+    return
+  end
+  self._state = "cancelled"
+end
+
+---@param self BattleMosaicTask
+function BattleMosaicTask:dispose()
+  if self._disposed then
+    return
+  end
+  self._disposed = true
+end
+
+-- Source scanline wave writing per-row offsets into the 192-row buffer:
+-- rows carry independent sine offsets every tick instead of shifting
+-- one viewport. Completion frees the wave with an explicit zeroing.
+---@class BattleScanlineWaveTask
+---@field _scene table<string, unknown> scene behind the owned scanline rows
+---@field _kind string task kind behind the run
+---@field _duration integer source ticks behind completion
+---@field _ticks integer source ticks advanced
+---@field _state string pending, running, complete, or cancelled
+---@field _disposed boolean release has run
+local BattleScanlineWaveTask = {}
+BattleScanlineWaveTask.__index = BattleScanlineWaveTask
+
+local SCANLINE_ROWS = 192
+local SCANLINE_WAVE_ROWS = 160
+local SCANLINE_WAVE_STEP = 341
+local SCANLINE_WAVE_AMPLITUDE = 32
+
+---@param kind string task kind under construction
+---@param args table<string, unknown> instruction-derived construction arguments
+---@param services table<string, unknown> scene collaborator
+---@return BattleScanlineWaveTask runnable wave task
+local function newScanlineWaveTask(kind, args, _, services)
+  checkVisualArgs(args, kind)
+  local scene = checkScene(services, kind)
+  if type(scene.writeScanlineRows) ~= "function" then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " waves through the scene scanline seam", 0)
+  end
+  local parameters = args.parameters
+  if type(parameters) ~= "table" or not isPositiveInt(parameters.durationTicks) then
+    error("BATTLE_EFFECT_TASK_MALFORMED: kind " .. kind .. " rides its compiled duration", 0)
+  end
+  return setmetatable({
+    _scene = scene,
+    _kind = kind,
+    _duration = parameters.durationTicks,
+    _ticks = 0,
+    _state = "pending",
+    _disposed = false,
+  }, BattleScanlineWaveTask)
+end
+
+---@param self BattleScanlineWaveTask wave task under row publication
+local function publishScanlineRows(self)
+  local Fx = require("libs.hgss.src.presentation.PresentationFxMath")
+  local rows = {}
+  for row = 0, SCANLINE_ROWS - 1 do
+    if row < SCANLINE_WAVE_ROWS then
+      local angle = (row * SCANLINE_WAVE_STEP + self._ticks * 1024) % 65536
+      local sine = Fx.sinIdx(angle)
+      local offset = sine >= 0 and math.floor(sine * SCANLINE_WAVE_AMPLITUDE / 4096 + 0.5)
+        or math.ceil(sine * SCANLINE_WAVE_AMPLITUDE / 4096 - 0.5)
+      rows[row + 1] = { x = offset, y = 0 }
+    else
+      rows[row + 1] = { x = 0, y = 0 }
+    end
+  end
+  self._scene:writeScanlineRows(rows)
+end
+
+---@param self BattleScanlineWaveTask wave task under wave cleanup
+local function clearScanlineRows(self)
+  local rows = {}
+  for index = 1, SCANLINE_ROWS do
+    rows[index] = { x = 0, y = 0 }
+  end
+  self._scene:writeScanlineRows(rows)
+end
+
+---@param self BattleScanlineWaveTask
+---@param tick table<string, unknown>? source tick under advancement
+function BattleScanlineWaveTask:stepSourceTick(tick)
+  local _ = tick
+  if self._disposed or self._state == "complete" or self._state == "cancelled" then
+    return
+  end
+  self._state = "running"
+  self._ticks = self._ticks + 1
+  if self._ticks >= self._duration then
+    clearScanlineRows(self)
+    self._state = "complete"
+    return
+  end
+  publishScanlineRows(self)
+end
+
+---@param self BattleScanlineWaveTask
+---@return string
+function BattleScanlineWaveTask:status()
+  assert(VALID_TASK_STATES[self._state] == true, "scanline wave tasks report a known run state")
+  return self._state
+end
+
+---@param self BattleScanlineWaveTask
+---@param reason string cancellation cause under diagnosis
+function BattleScanlineWaveTask:cancel(reason)
+  local _ = reason
+  if self._state == "complete" then
+    return
+  end
+  self._state = "cancelled"
+  pcall(clearScanlineRows, self)
+end
+
+---@param self BattleScanlineWaveTask
+function BattleScanlineWaveTask:dispose()
+  if self._disposed then
+    return
+  end
+  self._disposed = true
+end
+
+-- Dedicated background bodies by emitted kind. Every other admitted
+-- kind keeps its established picture/sprite body in the dispatch below;
+-- the generic native visual task never sees these six spellings again.
+local BACKGROUND_TASK_CONSTRUCTORS = {
+  ["battle-background-four-picture-move-power-transition"] = newMovePowerProfileTask,
+  ["battle-background-alternating-scroll-transition"] = newAlternatingScrollTask,
+  ["battle-background-scanline-sine-wave-transition"] = newScanlineWaveTask,
+  ["battle-sprite-blend-alpha-transition"] = newBlendCoefficientTask,
+  ["battle-background-resource-load"] = newBackgroundResourceLoadTask,
+  ["battle-presentation-resource-cleanup"] = newBackgroundResourceCleanupTask,
+}
 
 -- Reports whether the factory constructs a real task for a kind. The
 -- predicate is a direct view of the constructor dispatch below: only
@@ -3708,7 +5548,28 @@ function BattleEffectTasks.supportsKind(kind)
   if kind == "pokemon-battler-sprite-slot" then
     return true
   end
+  if kind == MANAGED_SPRITE_DRAW_KIND then
+    return true
+  end
   if SOUND_TASK_KINDS[kind] == true then
+    return true
+  end
+  if kind == ZIGZAG_SLASH_KIND then
+    return true
+  end
+  if
+    kind == "battle-visual-none"
+    or kind == "battle-visual-one-frame-task"
+    or kind == "battle-visual-one-frame-sound-task"
+    or kind == "battle-visual-one-frame-uncounted-task"
+    or kind == "battle-visual-show-attacker-obj-window-sprites"
+  then
+    return true
+  end
+  if BattleSourceTimedEffects.supportsKind(kind) then
+    return true
+  end
+  if BattleConfiguredSpriteEffects.supportsKind(kind) then
     return true
   end
   return NATIVE_VISUAL_KINDS[kind] == true
@@ -3754,14 +5615,7 @@ function BattleEffectTasks.create(kind, args, context, services)
     return BattleParticleSystems.newPathTask(args or {}, context or {})
   end
   if kind == BattleEffectTasks.EMITTER_CURVED_PATH_KIND then
-    -- The curved emitter path is not reproduced: constructing it fails
-    -- loudly instead of keeping a silently unmoved emitter.
-    error(
-      "BATTLE_EFFECT_TASK_MALFORMED: kind "
-        .. kind
-        .. " reproduces the curved emitter path instead of leaving it unplayed",
-      0
-    )
+    return BattleParticleSystems.newCurveTask(args or {}, context or {})
   end
   if kind == BattleEffectTasks.PICTURE_ANIMATION_KIND then
     assert(type(services) == "table", "picture animations require their services record")
@@ -3771,13 +5625,70 @@ function BattleEffectTasks.create(kind, args, context, services)
     assert(type(services) == "table", "battler sprite slots require their services record")
     return newBattlerSpriteSlotTask(args or {}, context or {}, services)
   end
+  if kind == MANAGED_SPRITE_DRAW_KIND then
+    assert(type(services) == "table", "managed sprite draw loops require their services record")
+    return newManagedSpriteDrawTask(kind, args or {}, services)
+  end
+  if kind == "battle-visual-none" then
+    return newSyncNoopTask(kind)
+  end
+  if
+    kind == "battle-visual-one-frame-task"
+    or kind == "battle-visual-one-frame-sound-task"
+    or kind == "battle-visual-one-frame-uncounted-task"
+  then
+    return newTwoStateTask(kind)
+  end
+  if kind == "battle-visual-show-attacker-obj-window-sprites" then
+    assert(type(services) == "table", "object-window sprites require their services record")
+    return newObjWindowTask(kind, services)
+  end
+  if kind == "battle-sprite-panel-slide" then
+    assert(type(services) == "table", "panel slides require their services record")
+    return newPanelSlideTask(kind, args or {}, context or {}, services)
+  end
+  if kind == "pokemon-picture-sinusoidal-position-motion" then
+    assert(type(services) == "table", "sinusoidal motion requires its services record")
+    return newSinusoidalMotionTask(kind, args or {}, context or {}, services)
+  end
+  if kind == "pokemon-picture-defender-knockback" then
+    assert(type(services) == "table", "defender knockback requires its services record")
+    return newKnockbackTask(kind, args or {}, context or {}, services)
+  end
+  if kind == "pokemon-picture-five-phase-affine-size-transition" then
+    assert(type(services) == "table", "squash/stretch requires its services record")
+    return newFivePhaseTask(kind, args or {}, context or {}, services)
+  end
+  if kind == "battle-sprite-mosaic-transition" then
+    assert(type(services) == "table", "sprite mosaic requires its services record")
+    return newMosaicTask(kind, args or {}, services)
+  end
+  if kind == "pokemon-picture-and-battle-palette-fade" then
+    assert(type(services) == "table", "background palette fades require their services record")
+    return newBackgroundFadeTask(kind, args or {}, context or {}, services)
+  end
   if SOUND_TASK_KINDS[kind] == true then
     assert(type(services) == "table", "sound tasks require their services record")
     return newSoundTask(kind, args or {}, context or {}, services)
   end
-  if isConfiguredSpriteSpawn(args or {}) then
+  if kind == ZIGZAG_SLASH_KIND then
+    assert(type(services) == "table", "zigzag slash tasks require their services record")
+    return newZigzagSlashTask(kind, args or {}, context or {}, services)
+  end
+  if BattleSourceTimedEffects.supportsKind(kind) then
+    assert(type(services) == "table", "source-timed tasks require their services record")
+    return BattleSourceTimedEffects.create(kind, args or {}, context or {}, services)
+  end
+  if BattleConfiguredSpriteEffects.supportsKind(kind) then
     assert(type(services) == "table", "configured sprite tasks require their services record")
-    return newConfiguredSpriteTask(kind, args or {}, context or {}, services)
+    local laneServices = {
+      scene = services.scene,
+      audio = services.audio,
+      resources = services.resources,
+      stageLease = stageLease,
+      releaseStaged = releaseStaged,
+    }
+    return BattleConfiguredSpriteEffects.create(kind, args or {}, context or {}, laneServices)
   end
   local backgroundConstructor = BACKGROUND_TASK_CONSTRUCTORS[kind]
   if backgroundConstructor ~= nil then

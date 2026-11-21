@@ -142,15 +142,49 @@ local function topologyPlayback(key)
   }
   local event = {
     sequence = 1,
+    kind = "struck",
+    cause = { kind = "move", key = key },
     actionId = 1,
     hitIndex = 1,
-    effectKey = key,
     actors = { { combatant = 1, activation = 1 } },
     targets = { { combatant = 3, activation = 3 } },
+    move = { selected = key, executed = key, phase = "direct" },
+    payload = { target = 3, hitIndex = 1, damage = 1, calculated = 1 },
     visualSeed = 4242,
+    -- The probe hit carries its producer execution moment so the
+    -- selector admits it; the request freezes the topology the
+    -- player consumes.
+    presentation = {
+      context = {},
+      execution = {
+        selectedMove = key,
+        executedMove = key,
+        moment = "use",
+        branch = "default",
+        attacker = { combatant = 1, activation = 1 },
+        defender = { combatant = 3, activation = 3 },
+        targets = { { combatant = 3, activation = 3 } },
+        damage = -1,
+        power = 0,
+        friendship = 0,
+        hitOrdinal = 1,
+        hitCount = 1,
+        hitCycle = 1,
+      },
+    },
   }
   local geometry = ManifestFixture.manifest().battlefield.slots
-  return BattlePresentationFlow.animationPlayback(packet, event, geometry)
+  local requests = BattlePresentationFlow.animationPlayback(packet, event, geometry)
+  local request = assert(requests[1], "the selector publishes its frozen request")
+  Assert.equal(request.disposition, "admit", "the connected probe hit admits its request")
+  return {
+    launchId = packet.launchId,
+    packetId = packet.packetId,
+    event = event,
+    visualSeed = event.visualSeed,
+    topology = request.playback.topology,
+    context = request.playback.context,
+  }
 end
 
 local function playerModule()
@@ -322,6 +356,16 @@ function T.effect_runs_over_each_layer_class_restore_the_clean_scene_exactly()
     audio = audio,
     resources = resources,
     tasks = Factory,
+    splRandomState = { state = 0 },
+    services = {
+      onNativeFrame = function(phase, sourceTick)
+        if phase == "draw" then
+          local BattleParticleSystems = require("libs.hgss.src.presentation.BattleParticleSystems")
+          BattleParticleSystems.stepSourceDrawPhase(poisoned, sourceTick)
+          poisoned:stepAnimationPictures(sourceTick)
+        end
+      end,
+    },
   }))
   for _, program in ipairs(programs) do
     local packet = playbackPacket()
@@ -388,6 +432,7 @@ function T.callback_program_mutates_scene_and_completes_at_its_source_boundary()
     audio = audio,
     resources = resources,
     tasks = Factory,
+    services = { onNativeFrame = function() end },
   }))
   local packet = playbackPacket()
   packet.event = { sequence = 1, actionId = 1, hitIndex = 1, effectKey = "layer-callback-run" }
@@ -546,6 +591,7 @@ local function probePaintStaging(launchId)
   local windows = {}
   function windows.drawWindow(_, _, _) end
   local envelope = FieldBattlePresentation.new({
+    splRandomState = { state = 0 },
     cacheFs = cache,
     graphics = graphics,
     windows = windows,
@@ -679,6 +725,7 @@ end
 function T.blend_coefficients_map_to_slot_scoped_battler_alpha()
   local BattleScreenState = require("game.hgss.tests.support.BattleScreenFixture")
   local screen = BattleScreenState.new({
+    splRandomState = { state = 0 },
     launchId = "blend-mapping-probe",
     manifest = ManifestFixture.launchView({ "back:PKMN_TRAINER_ETHAN", "front:YOUNGSTER" }, { "ball:POKE_BALL" }),
     model = BattlePresentationModel,
@@ -721,21 +768,25 @@ function T.blend_coefficients_map_to_slot_scoped_battler_alpha()
     blendCoefficientB = 8,
     spriteSlots = { "sprite-context-slot-1", "sprite-context-slot-2" },
   })
-  local byCombatant = {}
+  -- Task-owned sprite blend weights stay compositor state: the snapshot
+  -- carries the raw coefficients with their compiled slot scope while no
+  -- battler carries a generic alpha multiplier, and removal clears the
+  -- published blend back to base.
+  local blended = assert(screen:_snapshot().spriteBlend, "the active patch publishes its blend state")
+  Assert.equal(blended.blendCoefficientA, 8, "the snapshot carries the staged sprite weight")
+  Assert.equal(blended.blendCoefficientB, 8, "the snapshot carries the staged background weight")
+  Assert.deepEqual(
+    blended.spriteSlots,
+    { "sprite-context-slot-1", "sprite-context-slot-2" },
+    "the snapshot keeps the compiled sprite scope"
+  )
   for _, battler in ipairs(screen:_snapshot().battlers) do
-    byCombatant[battler.combatant] = battler
+    Assert.isNil(battler.alpha, "combatant " .. tostring(battler.combatant) .. " keeps no generic alpha")
   end
-  Assert.equal(byCombatant[2].alpha, 0.5, "the foe in the first patched slot fades to half")
-  Assert.equal(byCombatant[4].alpha, 0.5, "the second ally in the other patched slot fades to half")
-  Assert.isNil(byCombatant[1].alpha, "the unpatched lead ally keeps base alpha")
-  Assert.isNil(byCombatant[3].alpha, "the unpatched second foe keeps base alpha")
   screen._scene:removeTaskScalarPatch(owner)
-  local restored = {}
+  Assert.isNil(screen:_snapshot().spriteBlend, "removal restores the base blend state")
   for _, battler in ipairs(screen:_snapshot().battlers) do
-    restored[battler.combatant] = battler
-  end
-  for combatant, battler in pairs(restored) do
-    Assert.isNil(battler.alpha, "combatant " .. tostring(combatant) .. " restores base alpha without a patch")
+    Assert.isNil(battler.alpha, "combatant " .. tostring(battler.combatant) .. " stays without generic alpha")
   end
   screen:dispose()
 end

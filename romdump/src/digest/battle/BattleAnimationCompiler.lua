@@ -104,6 +104,7 @@ local function checkSourceInputResult(key, offset, result, requiredSlots, option
       and field ~= "op"
       and field ~= "pictureSets"
       and field ~= "vanished"
+      and field ~= "args"
     then
       error(decodeError(key, offset, "source resolver returned an unsupported field " .. tostring(field)), 0)
     end
@@ -414,15 +415,44 @@ local function decodeParticleOperands(key, stream, offset, start, opcode, label,
     -- carry the signed offset block so the runtime can place the
     -- emitter instead of decoding trailer words as opcodes.
     local positionMode = instruction.emitterConfig.positionMode
-    -- Position modes that read battler-type offset blocks (100/101)
-    -- and the script-driven camera mode (2) read more words the
-    -- producer does not stage: fail loudly naming the route instead
-    -- of decoding script words as opcodes.
+    -- Position modes 100/101 read one offset block per battler type
+    -- (BattleAnimEmitter_AddOffsetForBattlerType): consume all six
+    -- [skip, count, offset words] trailers for framing and carry the
+    -- ordered blocks so the runtime selects the battler's entry.
+    -- Word order follows BattleAnimEmitterOffsetArgs (ignoreSide first,
+    -- then the offset triple), as read by BattleAnimSystem_ReadScriptArgs.
     if positionMode == 100 or positionMode == 101 then
-      error(decodeError(key, offset, "configure-from-script battler-type offsets are not staged"), 0)
+      local typeOffsets = {}
+      for typeIndex = 0, 5 do
+        local blockCount = readWord(stream, key, offset + 4)
+        if blockCount ~= 4 then
+          error(decodeError(key, offset, "emitter type offset count disagrees with the source reader"), 0)
+        end
+        typeOffsets[typeIndex + 1] = {
+          ignoreSide = readWord(stream, key, offset + 8),
+          x = signed32(readWord(stream, key, offset + 12)),
+          y = signed32(readWord(stream, key, offset + 16)),
+          z = signed32(readWord(stream, key, offset + 20)),
+        }
+        offset = offset + 8 + blockCount * 4
+      end
+      instruction.typeOffsets = typeOffsets
     end
+    -- The script-driven camera mode reads four words inline
+    -- (BattleAnimEmitterCameraCb_SetAngleFromScript): consume its
+    -- [skip, count, four words] trailer for framing and carry the
+    -- used angle triple; the first word rides the framing only.
     if instruction.emitterConfig.cameraMode == 2 then
-      error(decodeError(key, offset, "configure-from-script script-driven camera is not staged"), 0)
+      local cameraCount = readWord(stream, key, offset + 4)
+      if cameraCount ~= 4 then
+        error(decodeError(key, offset, "emitter camera count disagrees with the source reader"), 0)
+      end
+      instruction.cameraAngles = {
+        x = readWord(stream, key, offset + 12),
+        y = readWord(stream, key, offset + 16),
+        z = readWord(stream, key, offset + 20),
+      }
+      offset = offset + 8 + cameraCount * 4
     end
     if positionMode == 3 or positionMode == 4 or positionMode == 5 or positionMode == 12 or positionMode == 13 then
       local offsetCount = readWord(stream, key, offset + 4)
@@ -430,12 +460,84 @@ local function decodeParticleOperands(key, stream, offset, start, opcode, label,
         error(decodeError(key, offset, "emitter offset count disagrees with the source reader"), 0)
       end
       instruction.emitterOffset = {
+        ignoreSide = readWord(stream, key, offset + 8),
+        x = signed32(readWord(stream, key, offset + 12)),
+        y = signed32(readWord(stream, key, offset + 16)),
+        z = signed32(readWord(stream, key, offset + 20)),
+      }
+      offset = offset + 8 + offsetCount * 4
+    end
+    -- Every meaningful configured flag callback reads its five script
+    -- words inline (BattleAnimEmitter_ReadFlagCbParams) in ascending
+    -- mask order: consume each [skip, count, five words] trailer for
+    -- framing and carry the ordered blocks so the runtime applies the
+    -- native flag order instead of decoding words as opcodes.
+    local fieldScripts = {}
+    for _, mask in ipairs({ 2, 16, 32, 64, 128, 4096, 8192 }) do
+      if math.floor(instruction.emitterConfig.flags / mask) % 2 == 1 then
+        local fieldCount = readWord(stream, key, offset + 4)
+        if fieldCount ~= 5 then
+          error(decodeError(key, offset, "emitter field count disagrees with the source reader"), 0)
+        end
+        fieldScripts[#fieldScripts + 1] = {
+          mask = mask,
+          mode = readWord(stream, key, offset + 8),
+          ignoreSide = readWord(stream, key, offset + 12),
+          x = signed32(readWord(stream, key, offset + 16)),
+          y = signed32(readWord(stream, key, offset + 20)),
+          z = signed32(readWord(stream, key, offset + 24)),
+        }
+        offset = offset + 8 + fieldCount * 4
+      end
+    end
+    if #fieldScripts > 0 then
+      instruction.fieldScripts = fieldScripts
+    end
+  end
+  -- The pair-transform emitter callbacks (indices 5..16) read seven
+  -- script axis triples plus one position triple inline at creation
+  -- (BattleAnimEmitter_SetTransformFromScript), with a four-word
+  -- script target for the from-script convergence/magnet kinds:
+  -- consume every [skip, count, words] trailer for framing and carry
+  -- the staged vectors so the runtime places the emitter from the
+  -- same script words instead of decoding them as opcodes.
+  if callbackIndex ~= nil and callbackIndex >= 5 and callbackIndex <= 16 then
+    local scriptVectors = {}
+    for vectorIndex = 1, 7 do
+      local vectorCount = readWord(stream, key, offset + 4)
+      if vectorCount ~= 3 then
+        error(decodeError(key, offset, "emitter script vector count disagrees with the source reader"), 0)
+      end
+      scriptVectors[vectorIndex] = {
         x = signed32(readWord(stream, key, offset + 8)),
         y = signed32(readWord(stream, key, offset + 12)),
         z = signed32(readWord(stream, key, offset + 16)),
-        ignoreSide = readWord(stream, key, offset + 20),
       }
-      offset = offset + 8 + offsetCount * 4
+      offset = offset + 8 + vectorCount * 4
+    end
+    instruction.scriptVectors = scriptVectors
+    local positionCount = readWord(stream, key, offset + 4)
+    if positionCount ~= 3 then
+      error(decodeError(key, offset, "emitter script position count disagrees with the source reader"), 0)
+    end
+    instruction.scriptPosition = {
+      x = signed32(readWord(stream, key, offset + 8)),
+      y = signed32(readWord(stream, key, offset + 12)),
+      z = signed32(readWord(stream, key, offset + 16)),
+    }
+    offset = offset + 8 + positionCount * 4
+    if callbackIndex == 11 or callbackIndex == 16 then
+      local targetCount = readWord(stream, key, offset + 4)
+      if targetCount ~= 4 then
+        error(decodeError(key, offset, "emitter script target count disagrees with the source reader"), 0)
+      end
+      instruction.scriptTarget = {
+        x = signed32(readWord(stream, key, offset + 8)),
+        y = signed32(readWord(stream, key, offset + 12)),
+        z = signed32(readWord(stream, key, offset + 16)),
+        scaleKind = readWord(stream, key, offset + 20),
+      }
+      offset = offset + 8 + targetCount * 4
     end
   end
   return instruction, offset
@@ -534,19 +636,11 @@ local function decodeNativeStream(key, stream, callbacks, sounds, resolveSourceI
       instruction = { op = "skip-words" }
       targetOffsets[#targetOffsets + 1] = { instruction = #instructions + 1, offset = offset }
     elseif opcode == 32 then
-      -- ClearBattlerBg normally takes one source word, but a trailing 45
-      -- extends the frame by one word (observed once: EXTRASENSORY member
-      -- 326 lowers [32,0,45] with the third word consumed, landing the next
-      -- decode on the following opcode instead of misreading the 45 as one
-      -- and desyncing into its operands).
-      local advance = 8
-      if offset + 12 <= #stream and readWord(stream, key, offset + 8) == 45 then
-        advance = 12
-      end
+      -- ClearBattlerBg consumes exactly one unused operand word; the word
+      -- after it is the next command, never a second operand.
       readWord(stream, key, offset)
-      readWord(stream, key, offset + 4)
       instruction = { op = "clear-background-plane", values = { 2 } }
-      offset = offset + advance
+      offset = offset + 4
     elseif opcode == 4 then
       instruction = { op = "reset-battle-presentation" }
     elseif opcode == 56 then
@@ -880,18 +974,18 @@ local function decodeNativeStream(key, stream, callbacks, sounds, resolveSourceI
       }
       offset = offset + 12
     elseif opcode == 70 then
-      local branchCases = { { sideMask = 0 } }
-      local maskCaseCount = #sources().SIDE_MASK_BRANCHES
-      for caseIndex = 1, maskCaseCount do
-        branchCases[#branchCases + 1] = { sideMask = sources().SIDE_MASK_BRANCHES[caseIndex] }
-      end
-      branchCases[#branchCases + 1] = { otherwise = true }
-      local targetCountOffsets = { offset }
-      for caseIndex = 0, maskCaseCount do
-        targetCountOffsets[#targetCountOffsets + 1] = offset + 4 + caseIndex * 4
+      -- JumpByWeather selects among six independent relative
+      -- destinations by named effective-weather condition: clear, rain,
+      -- sand, sun, hail, or any other condition. Each destination is
+      -- based on its own operand word; raw side masks never drive it.
+      local conditions = { "clear", "rain", "sand", "sun", "hail", "other" }
+      local branchCases = {}
+      for caseIndex = 1, 6 do
+        branchCases[caseIndex] = { condition = conditions[caseIndex] }
       end
       local nextOffset = #stream
-      for caseIndex, countOffset in ipairs(targetCountOffsets) do
+      for caseIndex = 1, 6 do
+        local countOffset = offset + (caseIndex - 1) * 4
         local targetOffset = countOffset + readWord(stream, key, countOffset) * 4
         nextOffset = math.min(nextOffset, targetOffset)
         targetOffsets[#targetOffsets + 1] = {
@@ -900,7 +994,7 @@ local function decodeNativeStream(key, stream, callbacks, sounds, resolveSourceI
           caseIndex = caseIndex,
         }
       end
-      instruction = { op = "branch-on-side-mask", branchCases = branchCases }
+      instruction = { op = "branch-on-weather-condition", branchCases = branchCases }
       offset = nextOffset
     elseif opcode == 71 then
       local countOffset = offset
@@ -973,7 +1067,10 @@ local function decodeNativeStream(key, stream, callbacks, sounds, resolveSourceI
       }
       offset = math.min(equalTarget, unequalTarget)
     elseif opcode == 87 then
-      local countOffset = offset + 4
+      -- JumpIfAttackerActive consumes exactly one relative offset word;
+      -- the taken destination is based on that operand word and
+      -- fallthrough is the next word.
+      local countOffset = offset
       local count = readWord(stream, key, countOffset)
       local setTarget = countOffset + count * 4
       local clearTarget = countOffset + 4
@@ -1056,13 +1153,23 @@ local function decodeNativeStream(key, stream, callbacks, sounds, resolveSourceI
             or resolved.taskKind == "battle-background-sprite-slide-transition"
           then
             expectedSlots = { "character", "palette", "screenDefault", "screenBattlerClassFour", "screenContextFlag" }
+          elseif resolved.taskKind == "battle-sprite-panel-slide" then
+            expectedSlots = {}
+            for graphic = 0, 3 do
+              expectedSlots[#expectedSlots + 1] = "stripeGraphic" .. graphic .. "Char"
+              expectedSlots[#expectedSlots + 1] = "stripeGraphic" .. graphic .. "Palette"
+              expectedSlots[#expectedSlots + 1] = "stripeGraphic" .. graphic .. "Screen"
+            end
           end
           local checkedResourceKeys = checkSourceInputResult(key, offset, resolved, expectedSlots)
-          if
-            next(checkedResourceKeys) ~= nil
-            and resolved.runtimeSelection ~= "battle-background-three-way-screen-selection"
-          then
-            error(decodeError(key, offset, "source callback resources have no runtime selection"), 0)
+          if next(checkedResourceKeys) ~= nil then
+            local selection = resolved.runtimeSelection
+            if
+              selection ~= "battle-background-three-way-screen-selection"
+              and selection ~= "object-window-stripe-selection"
+            then
+              error(decodeError(key, offset, "source callback resources have no runtime selection"), 0)
+            end
           end
           instruction = {
             op = "invoke-battle-animation-callback",
@@ -1074,6 +1181,9 @@ local function decodeNativeStream(key, stream, callbacks, sounds, resolveSourceI
             resourceKeys = next(checkedResourceKeys) ~= nil and checkedResourceKeys or nil,
             runtimeSelection = resolved.runtimeSelection,
           }
+          if resolved.args ~= nil then
+            instruction.args = resolved.args
+          end
           offset = offset + 8 + count * 4
         end
       else
@@ -1114,9 +1224,8 @@ local function decodeNativeStream(key, stream, callbacks, sounds, resolveSourceI
       }
       offset = offset + 12
     elseif opcode == 67 then
-      readWord(stream, key, offset)
+      -- ClearArgs consumes no operand word; the very next word dispatches.
       instruction = { op = "clear-parameters" }
-      offset = offset + 4
     elseif opcode == 68 or opcode == 69 then
       local selector = readWord(stream, key, offset)
       if opcode == 68 and selector > 3 then

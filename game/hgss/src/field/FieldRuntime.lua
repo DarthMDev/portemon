@@ -30,7 +30,11 @@ local FieldPlayerVisual = require("libs.hgss.src.actors.FieldPlayerVisual")
 local FieldZoneIdentity = require("libs.hgss.src.world.FieldZoneIdentity")
 local FollowingMonController = require("libs.hgss.src.field.FollowingMonController")
 local GameSave = require("libs.hgss.src.save.GameSave")
+local FieldPoison = require("libs.hgss.src.field.FieldPoison")
+local FieldPoisonEffect = require("libs.hgss.src.field.FieldPoisonEffect")
+local FieldPoisonSave = require("libs.hgss.src.save.FieldPoisonSave")
 local FashionCaseState = require("libs.hgss.src.save.FashionCaseState")
+local SysInfoState = require("libs.hgss.src.save.SysInfoState")
 local PlayTime = require("libs.hgss.src.save.PlayTime")
 local FieldScriptScreenFade = require("libs.hgss.src.transition.FieldScriptScreenFade")
 local HgssMonService = require("libs.hgss.src.mons.HgssMonService")
@@ -576,12 +580,14 @@ end
 ---@field _partyPrefetchRevision integer? last warmed party revision, nil before the first warmup
 ---@field _partyPrefetchCooldown number? seconds until a deferred party warmup retries, failing closed at zero
 ---@field fashionCase FashionCaseState live accessory inventory restored from the save
+---@field sysInfo SysInfoState live system-info state (mystery-gift flag) restored from the save
 ---@field followerInteractionCatalog table<string, unknown> generated follower interaction rules
 ---@field followerReactionTicks table<string, integer> follower reaction emote kind -> emote action duration
 ---@field bagService HgssBagService the live bag/inventory service
 ---@field martService MartService the live mart inventory/session service
 ---@field martHost table<string, unknown> the one script-owned mart child host
 ---@field kurtBoxHost table<string, unknown> the one script-owned Kurt selector host
+---@field moneyBox FieldMoneyBox? the transient source money window the field draw renders
 ---@field apricornTreePresentation table<string, function>? presentation assets invalidation owner
 ---@field martStockResolver function the selected mart stock provider
 ---@field battleCoordinator FieldBattleCoordinator concrete owner of the battle lifetime
@@ -589,6 +595,7 @@ end
 ---@field pendingEncounter table<string, unknown>? prepared unconsumed encounter
 ---@field _trainerCatalog table<string, unknown>? composed immutable trainer template catalog (nil before composition)
 ---@field _trainerFactory table<string, unknown>? composed native trainer party materializer (nil before composition)
+---@field _encounterCatalog table<string, unknown>? composed immutable encounter table catalog (nil before composition)
 ---@field _battleHost table<string, unknown>? narrow battle host for script battle tasks
 ---@field roamerState table<string, unknown>? the owned roamer and encounter persistence
 ---@field pokedexCatalog table<string, unknown>? the borrowed generated dex catalog behind knowledge (nil after teardown)
@@ -662,6 +669,9 @@ end
 ---@field fieldEffectAssets table<string, unknown>
 ---@field pokemonCenterHeal PokemonCenterHealFlow? source-owned Pokémon Center choreography
 ---@field blackoutFlow FieldBlackoutFlow? runtime-owned whiteout presentation and recovery flow
+---@field fieldPoison FieldPoison? the overworld poison step counter behind field damage ticks
+---@field poisonEffect FieldPoisonEffect? the retail HBlank wobble behind damage ticks; always composed, advanced once per source frame
+---@field poisonCure { slots: integer[], index: integer }? pending cure-message chain behind a survive tick
 ---@field pokemonCenterHealDefinition table<string, unknown>? generated healing-ball asset definition
 ---@field physicalCoverage FieldCoverage?
 ---@field residency FieldResidencyCoordinator?
@@ -1313,38 +1323,52 @@ function FieldRuntime:_composeTransitions(boot)
     doorAt = resolveDoorAt
     escalatorAt = resolveEscalatorAt
   end
-  self.transition = self.worldSwapCoordinator:createTransition(self, doorAt, escalatorAt, function(_, sourceMap, warp)
-    local physical
-    local ok, result = pcall(function()
-      local function loadDestination(_, mapId)
-        assert(mapId == warp.destinationMapId, "transition destination map mismatch")
-        local logicalMap = self.mapLoader:load(mapId)
-        local destinationPosition
-        if warp.direct then
-          destinationPosition = { fieldX = warp.x, fieldZ = warp.z }
-        else
-          local destinationWarp = logicalMap.fieldData.events.warps[warp.destinationWarpId + 1]
-          assert(destinationWarp, "transition destination warp is missing")
-          destinationPosition = { fieldX = destinationWarp.x, fieldZ = destinationWarp.z }
+  self.transition = self.worldSwapCoordinator:createTransition(
+    self,
+    doorAt,
+    escalatorAt,
+    function(_, sourceMap, warp, dynamicWarp)
+      local WarpSystem = require("libs.hgss.src.transition.WarpSystem")
+      local physical
+      local ok, result = pcall(function()
+        -- A dynamic anchor is loaded by the symbol the saved destination names;
+        -- the sentinel header it was triggered with names no map.
+        local function loadDestination(_, destinationMap)
+          local logicalMap = self.mapLoader:load(destinationMap)
+          local destinationPosition
+          if warp.direct then
+            assert(destinationMap == warp.destinationMapId, "transition destination map mismatch")
+            destinationPosition = { fieldX = warp.x, fieldZ = warp.z }
+          elseif warp.destinationWarpId == WarpSystem.DYNAMIC_WARP_SENTINEL then
+            assert(dynamicWarp ~= nil, "a dynamic warp anchor carries the saved destination")
+            assert(destinationMap == dynamicWarp.map, "transition destination map mismatch")
+            local arrival = WarpSystem.dynamicDestination(logicalMap, dynamicWarp)
+            destinationPosition = { fieldX = arrival.fieldX, fieldZ = arrival.fieldZ }
+          else
+            assert(destinationMap == warp.destinationMapId, "transition destination map mismatch")
+            local destinationWarp = logicalMap.fieldData.events.warps[warp.destinationWarpId + 1]
+            assert(destinationWarp, "transition destination warp is missing")
+            destinationPosition = { fieldX = destinationWarp.x, fieldZ = destinationWarp.z }
+          end
+          local composed, ownership = boot.composePreparedMap(logicalMap, destinationPosition)
+          physical = ownership
+          return composed
         end
-        local composed, ownership = boot.composePreparedMap(logicalMap, destinationPosition)
-        physical = ownership
-        return composed
+        return WarpSystem.resolveDestination({
+          load = loadDestination,
+        }, sourceMap, warp, dynamicWarp)
+      end)
+      if not ok then
+        if physical and physical.replacement and physical.state == "prepared" then
+          physical.coverage:release()
+          physical.state = "released"
+        end
+        error(result, 0)
       end
-      return require("libs.hgss.src.transition.WarpSystem").resolveDestination({
-        load = loadDestination,
-      }, sourceMap, warp)
-    end)
-    if not ok then
-      if physical and physical.replacement and physical.state == "prepared" then
-        physical.coverage:release()
-        physical.state = "released"
-      end
-      error(result, 0)
+      result.physical = physical
+      return result
     end
-    result.physical = physical
-    return result
-  end)
+  )
   self.transition.player = self.player
   self.transition.suppression = nil
 
@@ -1354,6 +1378,10 @@ function FieldRuntime:_composeTransitions(boot)
   -- only reads its status().
   self.screenFade = FieldScriptScreenFade.new()
   self.scentTint = require("libs.hgss.src.transition.FieldScentTint").new()
+  -- The poison wobble composes unconditionally beside the other
+  -- presentation-only source-frame effects; ticks start it, the
+  -- source-frame pump advances it, and the field draw consumes it.
+  self.poisonEffect = FieldPoisonEffect.new()
 
   -- Modal dialogue is pure and fixed-tick. Runtime layout needs only the
   -- compiled font definition; presentation later owns the atlas and drawing.
@@ -1490,6 +1518,10 @@ function FieldRuntime:_composeFieldServices(boot)
     dex = assert(self.dexKnowledge, "field runtime composes dex knowledge before the mon service"),
     stats = assert(self.gameStats, "field runtime composes game stats before the mon service"),
   })
+  self.sysInfo = SysInfoState.new(
+    boot.loadedGame and boot.loadedGame.sysInfo
+      or assert(boot.activeGame.sysInfo, "finalized game sysInfo bucket is required")
+  )
   self.mailbox = Mailbox.new(
     boot.loadedGame and boot.loadedGame.mailbox
       or assert(boot.activeGame.mailbox, "finalized game mailbox bucket is required"),
@@ -1498,6 +1530,15 @@ function FieldRuntime:_composeFieldServices(boot)
   self.photoAlbum = PhotoAlbum.new(
     boot.loadedGame and boot.loadedGame.photoAlbum
       or assert(boot.activeGame.photoAlbum, "finalized game photo album bucket is required")
+  )
+  -- The overworld poison step phase restores from the loaded bucket and
+  -- falls back to the finalized game (pre-poison saves resume on phase
+  -- zero through the same default the finalized record carries).
+  self.fieldPoison = FieldPoison.restore(
+    FieldPoisonSave.restore(
+      boot.loadedGame and boot.loadedGame.fieldPoison
+        or assert(boot.activeGame.fieldPoison, "finalized game field poison bucket is required")
+    )
   )
   self:_composePokegear(boot.loadedGame, boot.cacheFs)
   self:_composePokegearFeature(boot)
@@ -2146,6 +2187,9 @@ function FieldRuntime:update(dt)
         local FieldTransition = require("libs.hgss.src.transition.FieldTransition")
         if self.transition.phase ~= FieldTransition.PHASES.preview then
           self.followingMon:update()
+          -- The follower commits its own step after the session tick; publish
+          -- it in this same tick so its grass lands with its feet.
+          self.session:emitCommittedActorSteps()
         end
       elseif entry:isActive() then
         -- Map entry owns publication of the destination actor set. Until it
@@ -2193,6 +2237,9 @@ function FieldRuntime:update(dt)
     end
     self.screenFade:updateSourceFrame()
     self.scentTint:updateSourceFrame()
+    if self.poisonEffect ~= nil then
+      self.poisonEffect:updateSourceFrame()
+    end
     if self.blackoutFlow then
       self.blackoutFlow:updateSourceFrame()
     end
@@ -2983,13 +3030,29 @@ local function phoneGreetingRefs(catalog, provider, profile, fontDef, runtime)
   local messages = {}
   local contactsByKey = {}
   local firstRef = nil
+  -- Maps a map header identity onto its native map section for caller
+  -- landmarks, mirroring MapHeader_GetMapSec behind slot 3.
+  ---@param headerId integer map header identity
+  ---@return integer map section
+  local function headerMapSection(headerId)
+    assert(type(headerId) == "number" and headerId % 1 == 0, "caller landmarks read header identities")
+    local okMaps, maps = pcall(require, "romdump.src.catalog.hgss.maps")
+    assert(okMaps and type(maps) == "table", "caller landmarks read the static map-header catalog")
+    local byId = (maps --[[@as table<string, unknown>]]).byId
+    assert(type(byId) == "table", "caller landmarks read indexed map headers")
+    local header = (byId --[[@as table<integer, unknown>]])[headerId]
+    assert(type(header) == "table", "caller landmarks need a header for the caller map")
+    local section = (header --[[@as table<string, unknown>]]).mapSectionNativeId
+    assert(type(section) == "number" and section % 1 == 0, "caller landmarks read native map sections")
+    return section
+  end
   for _, record in
     ipairs(contacts --[[@as table<integer, unknown>]])
   do
     local contact = record --[[@as table<string, unknown>]]
     local key = contact.key
     local bank = contact.messageBank
-    local entry = contact.greeting
+    local entry = contact.phoneScriptIfLocal
     assert(type(key) == "string" and key ~= "", "companion greeting references name their contact")
     assert(
       type(bank) == "number" and bank % 1 == 0 and bank >= 0,
@@ -3012,6 +3075,41 @@ local function phoneGreetingRefs(catalog, provider, profile, fontDef, runtime)
   end
   assert(firstRef ~= nil, "companion greeting references need at least one compiled contact")
   messages.greeting = firstRef
+  -- Per-call substitution staging behind generic and word scripts:
+  -- the conversation engine draws the chatter species pair and the
+  -- word pick before the text prints, and the resolvers below read
+  -- them back by caller. One foreground call owns the lease, so one
+  -- staged entry at a time is exact.
+  messages.speciesStaging = {}
+  messages.wordStaging = {}
+  ---@param contactKey string
+  ---@param resolveMessage fun(bankId: integer, messageId: integer, contactKey: string): table<string, unknown>
+  ---@return string word display text
+  local function wordTextFor(contactKey, resolveMessage)
+    local staging = assert(messages.wordStaging, "word scripts stage their pick before the text prints")
+    local stored = (staging --[[@as table<string, unknown>]])[contactKey]
+    assert(type(stored) == "table", "word scripts stage their pick for the caller")
+    local record = stored --[[@as table<string, unknown>]]
+    local base, pick = record.base, record.pick
+    assert(type(base) == "string" and type(pick) == "number", "word picks carry their bank reference and draw")
+    local PhoneGreetingSets = require("game.hgss.src.pokegear.PhoneGreetingSets")
+    local bank, entry = PhoneGreetingSets.wordEntry(base --[[@as string]], pick --[[@as integer]])
+    return resolveMessage(bank, entry, contactKey).text
+  end
+  ---@param contactKey string
+  ---@param which string "a" for the party mon, "b" for the encounter mon
+  ---@return string species display name
+  local function speciesNameFor(contactKey, which)
+    local staging = assert(messages.speciesStaging, "generic chatter stages its species pair before the text prints")
+    local pair = (staging --[[@as table<string, unknown>]])[contactKey]
+    assert(type(pair) == "table", "generic chatter stages species for its caller")
+    local key = (pair --[[@as table<string, unknown>]])[which]
+    assert(type(key) == "string" and key ~= "", "generic chatter stages species keys")
+    local monCatalog = assert(runtime.monCatalog, "species names resolve through the domain mon catalog")
+    local species = monCatalog:species(key --[[@as string]])
+    assert(type(species) == "table" and type(species.name) == "string", "species keys resolve names")
+    return species.name --[[@as string]]
+  end
   local function resolve(bankId, messageId, contactKey)
     local acquire = provider.acquireBank --[[@as fun(self: table<string, unknown>, bankId: integer): table<string, unknown>? , Errors.Error?]]
     local release = provider.releaseBank --[[@as fun(self: table<string, unknown>, bankId: integer)]]
@@ -3066,6 +3164,25 @@ local function phoneGreetingRefs(catalog, provider, profile, fontDef, runtime)
             elseif slot == 1 then
               local contact = assert(contactsByKey[contactKey], "caller-name substitution resolves a catalog contact")
               text = resolve(contact.messageBank, 0).text
+            elseif slot == 4 then
+              -- Word-kind scripts buffer the drawn bank entry at slot 4
+              -- (BufferString slot 4 behind WORD side effects).
+              text = wordTextFor(contactKey, resolve)
+            elseif slot == 10 then
+              -- Slot 10 is the Mom balance behind dynamic Mother entries
+              -- and the caller-party species behind generic chatter.
+              -- Static lines never address it for Mother, so the static
+              -- path carries no balance and keeps the historical zero.
+              local contact = assert(contactsByKey[contactKey], "slot-ten substitution resolves a catalog contact")
+              if contact.family == "mother" then
+                text = "0"
+              else
+                text = speciesNameFor(contactKey, "a")
+              end
+            elseif slot == 11 then
+              -- Slot 11 is the map encounter species behind generic
+              -- chatter (BufferSpeciesName slot 11).
+              text = speciesNameFor(contactKey, "b")
             elseif slot == 2 or slot == 3 then
               local mapSection = nil
               if slot == 2 then
@@ -3076,7 +3193,7 @@ local function phoneGreetingRefs(catalog, provider, profile, fontDef, runtime)
               else
                 local contact =
                   assert(contactsByKey[contactKey], "caller landmark substitution resolves a catalog contact")
-                mapSection = contact.map
+                mapSection = headerMapSection(contact.mapId)
               end
               assert(
                 type(mapSection) == "number" and mapSection % 1 == 0,
@@ -3160,6 +3277,34 @@ local function phoneGreetingRefs(catalog, provider, profile, fontDef, runtime)
     return resolve(message.bank, message.entry, contactKey)
   end
   messages.resolveLine = resolveLine
+  -- The source time-of-day greeting behind static calls: bank 640
+  -- indexed by the contact greeting set, the call time band, the
+  -- direction, and the player gender, exactly like
+  -- PhoneCall_PrintGreeting over sGreetingMsgIDs. A 0xFF set or an
+  -- unknown contact skips the greeting with nil instead of text.
+  ---@param _ table<string, unknown>
+  ---@param contactKey string
+  ---@param timeOfDay integer 0 morning, 1 day, 2 night
+  ---@param isIncoming boolean
+  ---@return table<string, unknown>? formatted greeting text, nil when the caller skips it
+  local function resolveCallGreeting(_, contactKey, timeOfDay, isIncoming)
+    local contact = contactsByKey[contactKey]
+    if type(contact) ~= "table" then
+      return nil
+    end
+    local set = (contact --[[@as table<string, unknown>]]).greetingMsgSet
+    if type(set) ~= "number" or set == 255 then
+      return nil
+    end
+    assert(timeOfDay == 0 or timeOfDay == 1 or timeOfDay == 2, "call greetings read the call time band")
+    local gender = profile.gender == 0 and 0 or profile.gender == 1 and 1 or nil
+    assert(gender ~= nil, "call greetings have a native player gender")
+    local GreetingSets = require("game.hgss.src.pokegear.PhoneGreetingSets")
+    local entry = GreetingSets.entry(set, timeOfDay, isIncoming == true, gender)
+    assert(type(entry) == "number", "call greetings resolve a bank 640 entry")
+    return resolve(640, entry, contactKey)
+  end
+  messages.resolveCallGreeting = resolveCallGreeting
   -- Direct bank-entry reader behind the dynamic Mother flow: intro
   -- 664.(7+param), prompt 22/23/24/27/28, gift-full 21, result 25/26.
   -- Entries resolve through the caller's own bank with the same player
@@ -3178,6 +3323,63 @@ local function phoneGreetingRefs(catalog, provider, profile, fontDef, runtime)
     local balance = type(opts) == "table" and opts.balance or nil
     if balance ~= nil then
       assert(type(balance) == "number" and balance % 1 == 0, "phone balance formats its integer slot")
+    end
+    -- Dynamic Bill stages the active box name and free count for the
+    -- slot-10/11 substitutions behind GearPhoneCall_Bill case 2
+    -- (BufferString slot 10, BufferIntegerAsString slot 11).
+    local boxName = type(opts) == "table" and opts.boxName or nil
+    if boxName ~= nil then
+      assert(type(boxName) == "string" and boxName ~= "", "phone box names format their string slot")
+    end
+    local freeCount = type(opts) == "table" and opts.freeCount or nil
+    if freeCount ~= nil then
+      assert(type(freeCount) == "number" and freeCount % 1 == 0, "phone box counts format their integer slot")
+    end
+    -- Dynamic Kurt stages the ball item and handed quantity for the
+    -- slot-10/11 substitutions behind GearPhoneCall_Kurt case 1
+    -- (BufferItemName slot 10, BufferIntegerAsString slot 11).
+    local ballItem = type(opts) == "table" and opts.ballItem or nil
+    if ballItem ~= nil then
+      assert(type(ballItem) == "string" and ballItem ~= "", "phone ball items format their string slot")
+    end
+    local kurtCount = type(opts) == "table" and opts.kurtCount or nil
+    if kurtCount ~= nil then
+      assert(type(kurtCount) == "number" and kurtCount % 1 == 0, "phone kurt counts format their integer slot")
+    end
+    -- Dynamic Day Care Man stages both stabled nicknames for slots
+    -- 10/11 behind the whole call, exactly like the selection-time
+    -- buffers; the Lady re-buffers one nickname and growth per
+    -- growth report instead.
+    local nickA = type(opts) == "table" and opts.nickA or nil
+    if nickA ~= nil then
+      assert(type(nickA) == "string" and nickA ~= "", "phone nicknames format their string slot")
+    end
+    local nickB = type(opts) == "table" and opts.nickB or nil
+    if nickB ~= nil then
+      assert(type(nickB) == "string" and nickB ~= "", "phone nicknames format their string slot")
+    end
+    local nickname = type(opts) == "table" and opts.nickname or nil
+    if nickname ~= nil then
+      assert(type(nickname) == "string" and nickname ~= "", "phone nicknames format their string slot")
+    end
+    local growth = type(opts) == "table" and opts.growth or nil
+    if growth ~= nil then
+      assert(type(growth) == "number" and growth % 1 == 0, "phone growth formats its integer slot")
+    end
+    -- Dynamic Oak stages the seen and owned counts for slots 5/6
+    -- behind the evaluation message, like BufferIntegerAsString in
+    -- GearPhoneCall_ProfOak case 3.
+    local seenCount = type(opts) == "table" and opts.seenCount or nil
+    if seenCount ~= nil then
+      assert(type(seenCount) == "number" and seenCount % 1 == 0, "phone dex counts format their integer slot")
+    end
+    local ownedCount = type(opts) == "table" and opts.ownedCount or nil
+    if ownedCount ~= nil then
+      assert(type(ownedCount) == "number" and ownedCount % 1 == 0, "phone dex counts format their integer slot")
+    end
+    local areaNames = type(opts) == "table" and opts.areaNames or nil
+    if areaNames ~= nil then
+      assert(type(areaNames) == "table", "phone area names stage their string slots")
     end
     local bankId, messageId = contact.messageBank, entry
     local acquire = provider.acquireBank
@@ -3214,6 +3416,19 @@ local function phoneGreetingRefs(catalog, provider, profile, fontDef, runtime)
             elseif slot == 1 then
               local contactRecord = assert(contactsByKey[contactKey])
               text = resolve(contactRecord.messageBank, 0, contactKey).text
+            elseif slot == 5 then
+              -- Slot 5 is the seen count behind dynamic Oak
+              -- evaluations; other families leave it unresolved so
+              -- the provider reports the missing substitution.
+              if contact.family == "oak" and seenCount ~= nil then
+                text = tostring(seenCount)
+              end
+            elseif slot == 6 then
+              -- Slot 6 is the owned count behind dynamic Oak
+              -- evaluations.
+              if contact.family == "oak" and ownedCount ~= nil then
+                text = tostring(ownedCount)
+              end
             elseif slot == 2 or slot == 3 then
               local mapSection = nil
               if slot == 2 then
@@ -3223,7 +3438,7 @@ local function phoneGreetingRefs(catalog, provider, profile, fontDef, runtime)
                 mapSection = currentMap.mapSectionNativeId
               else
                 local contactRecord = assert(contactsByKey[contactKey])
-                mapSection = contactRecord.map
+                mapSection = headerMapSection(contactRecord.mapId)
               end
               local landmarkBankId, landmarkEntryId = phoneLabels.bank, mapSection
               local landmarkBank = assert(provider.acquireBank(phoneLabels.bank))
@@ -3233,8 +3448,44 @@ local function phoneGreetingRefs(catalog, provider, profile, fontDef, runtime)
                 landmarkBankId, landmarkEntryId = phoneLabels.fallbackBank, phoneLabels.fallbackEntry
               end
               text = resolve(landmarkBankId, landmarkEntryId, contactKey).text
-            elseif slot == 10 then
-              text = tostring(balance or 0)
+            elseif slot == 10 or slot == 12 or slot == 13 or slot == 14 then
+              if contact.family == "bill" and boxName ~= nil then
+                text = boxName
+              elseif contact.family == "kurt" and ballItem ~= nil then
+                local item = assert(runtime.itemCatalog, "phone ball names resolve through the item catalog")
+                local definition = item:item(ballItem --[[@as string]])
+                assert(
+                  type(definition) == "table" and type((definition --[[@as table<string, unknown>]]).name) == "string",
+                  "phone ball items resolve display names"
+                )
+                text = (definition --[[@as table<string, unknown>]]).name --[[@as string]]
+              elseif contact.family == "daycare" and nickA ~= nil then
+                text = nickA
+              elseif contact.family == "daycare" and nickname ~= nil then
+                text = nickname
+              elseif contact.family == "baoba" and areaNames ~= nil then
+                text = areaNames[slot - 9]
+              else
+                text = tostring(balance or 0)
+              end
+            elseif slot == 11 then
+              -- Slot 11 is the free box count behind dynamic Bill
+              -- status lines, the handed quantity behind Kurt, the
+              -- second nickname behind the Day Care Man pair report,
+              -- the growth behind Lady reports, and the second area
+              -- name behind Baoba; other families leave it unresolved
+              -- so the provider reports the missing substitution.
+              if contact.family == "bill" and freeCount ~= nil then
+                text = tostring(freeCount)
+              elseif contact.family == "kurt" and kurtCount ~= nil then
+                text = tostring(kurtCount)
+              elseif contact.family == "daycare" and nickB ~= nil then
+                text = nickB
+              elseif contact.family == "daycare" and growth ~= nil then
+                text = tostring(growth)
+              elseif contact.family == "baoba" and areaNames ~= nil then
+                text = areaNames[2]
+              end
             end
             if text == nil then
               return nil
@@ -3267,7 +3518,7 @@ local function phoneGreetingRefs(catalog, provider, profile, fontDef, runtime)
   local function resolvePhoneUiMessage(_, entryId)
     local known = type(entryId) == "number"
       and entryId % 1 == 0
-      and ((entryId >= 8 and entryId <= 19) or entryId == 22 or (entryId >= 33 and entryId <= 35))
+      and ((entryId >= 8 and entryId <= 19) or entryId == 22 or (entryId >= 30 and entryId <= 35) or entryId == 37)
     if not known then
       local failure = Errors.new(
         ScriptErrors.FEATURE_UNAVAILABLE,
@@ -3712,6 +3963,7 @@ function FieldRuntime:composeEncounters(compiled)
     game = self.versionId,
     speciesTypes = slotTypes,
   })
+  self._encounterCatalog = catalog
 end
 
 -- Composes the concrete trainer materializer over a compiled trainer
@@ -3866,6 +4118,148 @@ function FieldRuntime:_stepSwarmActive()
   return RadioWorldContext.swarmInfoFromSeed(identity.outbreakSeed) ~= nil
 end
 
+-- The retail field-poison cue message behind one cured mon, resolved
+-- through the live message pipeline (never copied text): the nickname
+-- rides buffer slot 0 exactly like the BufferPartyMonNick binding the
+-- native script leaves behind (STRVAR_1 names the first string buffer).
+local POISON_CURE_MESSAGE = "msg.hgss.0040.00053"
+
+local function copyPoisonRecord(record)
+  if type(record) ~= "table" then
+    return record
+  end
+  local out = {}
+  for key, value in pairs(record) do
+    out[key] = copyPoisonRecord(value)
+  end
+  return out
+end
+
+-- Notes one processed committed step on the poison counter and runs the
+-- damage tick every fourth step: HP drains through the staged mon
+-- service, the poison jingle and HBlank wobble fire, and a cure outcome
+-- opens its nickname message chain. Returns the tick outcome ("survive"
+-- claims the step), or nil when no tick ran. Inert without a poison
+-- counter or a mon service; the headless seams that omit either keep
+-- their old boundary.
+---@return string? the tick outcome kind, nil without a tick
+function FieldRuntime:_tickFieldPoison()
+  local poison = self.fieldPoison
+  local mons = self.monService
+  if poison == nil or mons == nil then
+    return nil
+  end
+  if not poison:noteStep() then
+    return nil
+  end
+  local count = mons:partyCount()
+  if type(count) ~= "number" or count < 1 then
+    return nil
+  end
+  local records = {}
+  for slot = 0, count - 1 do
+    records[#records + 1] = mons:partyMon(slot)
+  end
+  local outcome = FieldPoison.tickParty(records)
+  if outcome.kind == "none" then
+    return nil
+  end
+  local updates = {}
+  for slot, update in pairs(outcome.updates) do
+    local staged = copyPoisonRecord(records[slot + 1])
+    assert(type(staged) == "table", "poison staging requires the live mon record")
+    local condition = assert(staged.condition, "poison staging requires the live condition")
+    condition.currentHp = update.currentHp
+    if update.cured then
+      condition.effects = update.effects
+      staged.friendship = update.friendship
+      staged.mood = update.mood
+    end
+    updates[#updates + 1] = { slot = slot, mon = staged }
+  end
+  local preparation, reason = mons:preparePartyChanges(mons:partyRevision(), updates)
+  if preparation == nil then
+    error("field poison party staging went stale: " .. tostring(reason), 0)
+  end
+  preparation.publish()
+  if self.audio ~= nil then
+    self.audio:play("SEQ_SE_DP_DOKU2")
+  end
+  -- The HBlank wobble fires for both damage and survive ticks, matching
+  -- the native DoPoisonEffect call on either ApplyPoisonStep outcome. The
+  -- effect owner is optional in headless seams that never composed it.
+  local effect = self.poisonEffect
+  if effect ~= nil then
+    effect:start()
+  end
+  if outcome.kind == "survive" then
+    self:_beginPoisonCureMessages(outcome)
+  end
+  return outcome.kind
+end
+
+-- Opens the cure message chain behind a survive tick: one nickname
+-- message per cured mon, in slot order, through the session dialogue.
+-- The modal gate pauses steps and encounters until every message
+-- dismisses, matching the native script claim on the step.
+---@param outcome { kind: string, updates: table<integer, table<string, unknown>> }
+function FieldRuntime:_beginPoisonCureMessages(outcome)
+  local slots = {}
+  for slot, update in pairs(outcome.updates) do
+    if update.cured then
+      slots[#slots + 1] = slot
+    end
+  end
+  table.sort(slots)
+  if #slots == 0 then
+    return
+  end
+  self.poisonCure = { slots = slots, index = 1 }
+  self:_openPoisonCureMessage()
+end
+
+-- Opens the pending cure message at the chain head. The completion
+-- callback advances the chain, so sequential cures never overlap.
+function FieldRuntime:_openPoisonCureMessage()
+  local pending = assert(self.poisonCure, "poison cure chain requires its pending slots")
+  local slot = assert(pending.slots[pending.index], "poison cure chain requires its head slot")
+  local host = assert(self.scripts and self.scripts.dialogueHost, "poison cure messages require the dialogue host")
+  local message = host:resolveMessage(POISON_CURE_MESSAGE, {}, { [0] = { text = "party_nickname", position = slot } })
+  local dialogue = assert(self.session and self.session.dialogue, "poison cure messages require the field dialogue")
+  -- The cure box is the ordinary NPCMsg field box: it carries the
+  -- player-selected window frame like every script-owned message. Without
+  -- it the renderer draws only the content-background fill with no frame
+  -- tiles (the unstyled box). The host mirrors the same live option, but
+  -- the runtime-owned chain reads the authoritative player options.
+  local frameIndex = self.playerData and self.playerData.options and self.playerData.options.textFrame or nil
+  local handle = dialogue:open({
+    id = "field-poison-cure",
+    message = message,
+    allowCancel = false,
+    frameIndex = frameIndex,
+  })
+  handle:onComplete(function()
+    self:_advancePoisonCureMessages()
+  end)
+end
+
+-- Advances the cure chain past one dismissed message: the next cured mon
+-- announces itself, and after the last one the chain clears. A wipe needs
+-- no recovery here on top of the cure: damage floors every drained mon at
+-- 1 HP, so a survive tick always leaves the party conscious.
+function FieldRuntime:_advancePoisonCureMessages()
+  local pending = self.poisonCure
+  if pending == nil then
+    return
+  end
+  pending.index = pending.index + 1
+  if pending.index <= #pending.slots then
+    self:_openPoisonCureMessage()
+    return
+  end
+  self.poisonCure = nil
+end
+
 -- The committed-step encounter boundary, once per fixed tick: at most one
 -- fresh unclaimed completed step is considered, after that step's warp,
 -- coordinate-script, and map-boundary arbitration already ran inside the
@@ -3897,6 +4291,13 @@ function FieldRuntime:_consumeCommittedStep()
     if presentPhase ~= "present" then
       return
     end
+  end
+  -- Field poison ticks on every processed committed step before the
+  -- encounter boundary, matching the native per-step update order. A cure
+  -- flow claims the step: like a claimed warp or script, it never becomes
+  -- a delayed encounter.
+  if self:_tickFieldPoison() == "survive" then
+    return
   end
   local map = session.currentMap --[[@as table<string, unknown>]]
   local method = self:_stepEncounterMethod(map, self.player)
@@ -4710,6 +5111,11 @@ function FieldRuntime:_releaseAll()
   if self.propAnimations then
     self.propAnimations:clear()
   end
+  -- A source floor box outlives the script that showed it, so field teardown
+  -- releases whatever is still open exactly once.
+  if self.scripts ~= nil and self.scripts.floorWindow ~= nil then
+    self.scripts.floorWindow:dispose()
+  end
   if self.overworld then
     self.overworld:dispose()
   end
@@ -4732,6 +5138,11 @@ function FieldRuntime:_releaseAll()
   if self.kurtBoxHost then
     self.kurtBoxHost:dispose()
   end
+  if self.moneyBox then
+    -- The transient source money window is field presentation state: close
+    -- it so no window outlives the field that opened it.
+    self.moneyBox:dispose()
+  end
   if self.pcTerminal then
     self.pcTerminal:releaseEffect()
   end
@@ -4739,6 +5150,7 @@ function FieldRuntime:_releaseAll()
   self.easyChatScriptHost = nil
   self.martHost = nil
   self.kurtBoxHost = nil
+  self.moneyBox = nil
   self.applications = nil
   self.displayContext, self.presentationDisplay, self.presentationOverrides = nil, nil, nil
   self._displayTopology = nil
@@ -4818,7 +5230,8 @@ function FieldRuntime:_releaseAll()
   self.pokedexCatalog, self.dexKnowledge, self.gameStats = nil, nil, nil
   self.bagService, self.bagCursor = nil, nil
   self.martService = nil
-  self.mailbox, self.photoAlbum = nil, nil
+  self.mailbox, self.photoAlbum, self.sysInfo = nil, nil, nil
+  self.fieldPoison, self.poisonEffect, self.poisonCure = nil, nil, nil
   if self.pokegear ~= nil then
     self.pokegear:dispose()
   end

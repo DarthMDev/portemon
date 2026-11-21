@@ -10,10 +10,16 @@ local NitroModelFixture = require("tests.support.NitroModelFixture")
 
 local T = { metadata = { capabilities = {} }, tests = {} }
 
-local function updateWithOwner(effects, owner)
+-- The effect clock advances with every live owner keyed by its semantic
+-- identity: the session's player and the walking partner.
+local function updateWithOwners(effects, owners)
   local update = effects.updateFixed
-  ---@cast update fun(self: table, owner: table)
-  return update(effects, owner)
+  ---@cast update fun(self: table, owners: table<string, table>)
+  return update(effects, owners)
+end
+
+local function updateWithOwner(effects, owner)
+  return updateWithOwners(effects, { player = owner })
 end
 
 local function definition(kind)
@@ -222,6 +228,52 @@ T.tests["held grass removals do not skip neighboring instances"] = function()
   Assert.equal(instances[1].fieldX, 1)
 end
 
+-- Each held effect belongs to the object that stepped into it. The player
+-- standing still in its own grass must not keep a partner-owned effect alive,
+-- a moving partner must release only its own effect, and an owner that leaves
+-- the owner set releases its held effect with it.
+T.tests["held effects belong to their own owner, not to the player"] = function()
+  local effects = controller()
+  effects:emit({ ownerKey = "player", kind = "tall_grass", fieldX = 1, fieldZ = 1, worldY = 0, direction = "south" })
+  effects:emit({
+    ownerKey = "field:partner",
+    kind = "tall_grass",
+    fieldX = 4,
+    fieldZ = 4,
+    worldY = 0,
+    direction = "south",
+  })
+  local owners = {
+    player = { fieldX = 1, fieldZ = 1, facing = "south" },
+    ["field:partner"] = { fieldX = 4, fieldZ = 4, facing = "south" },
+  }
+  for _ = 1, 13 do
+    updateWithOwners(effects, owners)
+  end
+  Assert.equal(#effects:status().instances, 2, "both owners still stand on their own grass")
+
+  owners["field:partner"] = { fieldX = 5, fieldZ = 4, facing = "east" }
+  updateWithOwners(effects, owners)
+  local remaining = effects:status().instances
+  Assert.equal(#remaining, 1, "only the partner-owned effect releases when the partner walks off")
+  Assert.equal(remaining[1].fieldX, 1)
+  Assert.equal(remaining[1].ownerKey, "player")
+
+  effects:emit({
+    ownerKey = "field:partner",
+    kind = "tall_grass",
+    fieldX = 5,
+    fieldZ = 4,
+    worldY = 0,
+    direction = "east",
+  })
+  updateWithOwners(effects, owners)
+  Assert.equal(#effects:status().instances, 2, "a re-arrived partner holds its new grass")
+  owners["field:partner"] = nil
+  updateWithOwners(effects, owners)
+  Assert.equal(#effects:status().instances, 1, "an owner that left the field keeps no held effect")
+end
+
 T.tests["dynamic grass instances change pose independently from their semantic age"] = function()
   local clip = NitroModelFixture.doorOpenClip()
   local effectDefinition = {
@@ -247,7 +299,7 @@ T.tests["dynamic grass instances change pose independently from their semantic a
   local firstCell1, firstCell3 = firstItem.transform[1], firstItem.transform[3]
   Assert.equal(effects:status().instances[1].frame, 0)
 
-  effects:updateFixed({ fieldX = 1, fieldZ = 1, facing = "east" })
+  effects:updateFixed({ player = { fieldX = 1, fieldZ = 1, facing = "east" } })
   local second = effects:status().instances[1].modelInstance
   second:evaluatePose()
   local secondTransform = second:drawItems(second.renderMeshesById)[1].transform

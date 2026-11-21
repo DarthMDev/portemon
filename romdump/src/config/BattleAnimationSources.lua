@@ -76,6 +76,8 @@ local NON_MOVE_ANIMATION_ROOTS = {
   [38] = "BATTLE_ANIMATION_DAMAGE_WHIRLPOOL",
   [39] = "BATTLE_ANIMATION_DAMAGE_SAND_TOMB",
   [40] = "BATTLE_ANIMATION_DAMAGE_INGRAIN",
+  [41] = "BATTLE_ANIMATION_FOLLOWER_ENTER",
+  [42] = "BATTLE_ANIMATION_FOLLOWER_RECALL",
 }
 
 -- Build-only inputs whose source-selected resources or callbacks are supplied
@@ -269,53 +271,62 @@ local PARTICLE_ACTION_PROFILES = {
 -- Callback table ov07_0223649C maps to the continuation routines below.
 -- Task names describe the continuation's observed sprite/picture effects;
 -- the native callback index and function addresses stay in this source catalog.
+-- Index 8 is the ZigzagSlash sprite func (BattleAnimSpriteFunc_ZigzagSlash
+-- in battle_anim_effects.c): a six-leg defender-anchored assault with its
+-- own fade and pokepic flash, not a palette fade, so it names its own
+-- task instead of sharing the picture-fade vocabulary.
 local CONFIGURED_SPRITE_TASKS = {
-  { taskKind = "multi-sprite-position-tick", context = "sprite-system" },
-  { taskKind = "sprite-affine-scale-draw-transition", context = "battle-sprite" },
-  { taskKind = "sprite-animation-position-transition", context = "battle-sprite" },
-  { taskKind = "pokemon-picture-multi-sprite-animation", context = "pokemon-picture" },
-  { taskKind = "sprite-affine-rotation-motion", context = "battle-sprite" },
-  { taskKind = "pokemon-picture-sprite-position-transition", context = "pokemon-picture" },
-  { taskKind = "pokemon-picture-affine-transition", context = "pokemon-picture" },
-  { taskKind = "sprite-alpha-transition", context = "pokemon-picture" },
-  { taskKind = "pokemon-picture-palette-fade", context = "pokemon-picture" },
-  { taskKind = "pokemon-picture-animation-palette-fade", context = "pokemon-picture" },
-  { taskKind = "pokemon-picture-relative-sprite-path-transition", context = "pokemon-picture" },
-  { taskKind = "sprite-brightness-transition", context = "battle-display" },
-  { taskKind = "pokemon-picture-animation", context = "pokemon-picture" },
-  { taskKind = "pokemon-picture-animation-speed-transition", context = "pokemon-picture" },
-  { taskKind = "sprite-affine-animation", context = "pokemon-picture" },
-  { taskKind = "pokemon-picture-oam-animation-transition", context = "pokemon-picture" },
-  { taskKind = "pokemon-picture-animation-position-transition", context = "pokemon-picture" },
-  { taskKind = "sprite-affine-rotation-transition", context = "battle-sprite" },
-  { taskKind = "sprite-animation-completion", context = "battle-sprite" },
-  { taskKind = "sprite-animation-affine-scale-transition", context = "battle-sprite" },
-  { taskKind = "sprite-flip-animation-transition", context = "battle-sprite" },
-  { taskKind = "sprite-randomized-affine-motion", context = "battle-sprite" },
-  { taskKind = "sprite-flip-and-offset-transition", context = "battle-sprite" },
-  { taskKind = "pokemon-picture-randomized-position-motion", context = "pokemon-picture" },
-  { taskKind = "pokemon-picture-priority-motion", context = "pokemon-picture" },
-  { taskKind = "sprite-position-offset", context = "battle-sprite" },
-  { taskKind = "sprite-affine-transform-motion", context = "battle-sprite" },
-  { taskKind = "sprite-animation-lifecycle", context = "battle-sprite" },
-  { taskKind = "sprite-affine-animation-lifecycle", context = "battle-sprite" },
-  { taskKind = "multi-sprite-battler-animation", context = "pokemon-picture" },
-  { taskKind = "multi-sprite-position-transition", context = "battle-sprite" },
-  { taskKind = "sprite-animation-palette-offset", context = "battle-palette" },
-  { taskKind = "multi-sprite-picture-animation", context = "pokemon-picture" },
+  { taskKind = "sprite-spread-copies", context = "sprite-system" },
+  { taskKind = "sprite-blink-scale-fade", context = "battle-sprite" },
+  { taskKind = "sprite-orbit-trail", context = "battle-sprite" },
+  { taskKind = "sprite-crossing", context = "pokemon-picture" },
+  { taskKind = "sprite-grow-rock-shrink", context = "battle-sprite" },
+  { taskKind = "sprite-stack-on-defender", context = "pokemon-picture" },
+  { taskKind = "sprite-boomerang", context = "pokemon-picture" },
+  { taskKind = "sprite-rise-stretch", context = "pokemon-picture" },
+  { taskKind = "pokemon-picture-zigzag-slash", context = "pokemon-picture" },
+  { taskKind = "sprite-zigzag-flash", context = "pokemon-picture" },
+  { taskKind = "sprite-pops", context = "pokemon-picture" },
+  { taskKind = "sprite-pulse-brightness", context = "battle-display" },
+  { taskKind = "sprite-fan-around-attacker", context = "pokemon-picture" },
+  { taskKind = "sprite-shrink-attacker-into", context = "pokemon-picture" },
+  { taskKind = "sprite-scale-over-defender", context = "pokemon-picture" },
+  { taskKind = "sprite-orbit-attacker-bobbing", context = "pokemon-picture" },
+  { taskKind = "sprite-floating-stream", context = "pokemon-picture" },
+  { taskKind = "sprite-throw-arc", context = "battle-sprite" },
+  { taskKind = "sprite-fade-anim", context = "battle-sprite" },
+  { taskKind = "sprite-blink-center", context = "battle-sprite" },
+  { taskKind = "sprite-sliding-pairs", context = "battle-sprite" },
+  { taskKind = "sprite-pop-scatter", context = "battle-sprite" },
+  { taskKind = "sprite-quad", context = "battle-sprite" },
+  { taskKind = "sprite-flash-around-attacker", context = "pokemon-picture" },
+  { taskKind = "sprite-trail-to-defender", context = "pokemon-picture" },
+  { taskKind = "sprite-offset-animate", context = "battle-sprite" },
+  { taskKind = "sprite-orbit", context = "battle-sprite" },
+  { taskKind = "sprite-above-defender", context = "battle-sprite" },
+  { taskKind = "sprite-arc", context = "battle-sprite" },
+  { taskKind = "sprite-rising-shrink", context = "pokemon-picture" },
+  { taskKind = "sprite-row-sequence", context = "battle-sprite" },
+  { taskKind = "sprite-palette-cycle", context = "battle-palette" },
+  { taskKind = "sprite-orbit-attacker", context = "pokemon-picture" },
 }
 
 local CONFIGURED_SPRITE_PARAMETERS = {
+  -- BattleAnimSpriteFunc_BlinkScaleFadeSprites / CrossingSprites /
+  -- BlinkSpritesCenter / SlidingSpritePairs copy counts.
   [1] = { { name = "spriteCount", index = 1, encoding = "signed32" } },
   [3] = { { name = "spriteCount", index = 1, encoding = "signed32" } },
+  -- BattleAnimSpriteFunc_ThrowSpriteArc reads its four script words as the
+  -- defender-relative offset, flight duration, and arc height.
   [17] = {
-    { name = "spriteSpacingX", index = 1, encoding = "signed16" },
-    { name = "spriteSpacingY", index = 2, encoding = "signed16" },
-    { name = "positionTransitionTicks", index = 3, encoding = "unsigned16" },
-    { name = "rotationAngle", index = 4, encoding = "unsigned32" },
+    { name = "offsetX", index = 1, encoding = "signed16" },
+    { name = "offsetY", index = 2, encoding = "signed16" },
+    { name = "durationTicks", index = 3, encoding = "unsigned16" },
+    { name = "arcHeight", index = 4, encoding = "signed32" },
   },
   [19] = { { name = "spriteCount", index = 1, encoding = "unsigned8" } },
   [20] = { { name = "spriteCount", index = 1, encoding = "unsigned8" } },
+  -- BattleAnimSpriteFunc_MoveSpriteAndAnimate reads its two offset words.
   [25] = {
     { name = "offsetX", index = 1, encoding = "signed16" },
     { name = "offsetY", index = 2, encoding = "signed16" },
@@ -323,6 +334,17 @@ local CONFIGURED_SPRITE_PARAMETERS = {
 }
 
 BattleAnimationSources.CONFIGURED_SPRITE_TASK_COUNT = #CONFIGURED_SPRITE_TASKS
+
+-- Build-only member rows from battle_anim_data.s::gBattleAnimObjWindowBgFiles.
+-- Each row is {graphics, palette, screen} in NARC_a_0_0_7 for one
+-- BattleAnimObjWindowBg graphic selection (the runtime Arg0); the fourth
+-- table word duplicates the screen and carries no distinct member.
+BattleAnimationSources.OBJECT_WINDOW_BG_ROWS = {
+  { 0x36, 0x126, 0x37 },
+  { 0x30, 0x123, 0x31 },
+  { 0x32, 0x124, 0x33 },
+  { 0x34, 0x125, 0x35 },
+}
 
 -- Build-only member rows from overlay_07.s::ov07_02234F48. Each row is
 -- {character, palette, screen-default, screen-alternate, auxiliary}; the
@@ -435,6 +457,148 @@ BattleAnimationSources.EMITTER_AXIS_MODE10 = {
   vectorBytes = 12,
   entryCount = 36,
   unit = 4096,
+}
+
+-- gBattleAnimEmitterOffsetsX/Y (battle_anim_emitter.c) in the overlay 7
+-- data: one signed pixel step per ordered battler-type pair. The runtime
+-- scales each step by 172 raw units and adds the immutable resource base.
+BattleAnimationSources.EMITTER_OFFSET_X = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x02235440,
+  entryCount = 36,
+  entryBytes = 2,
+}
+
+BattleAnimationSources.EMITTER_OFFSET_Y = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x02235488,
+  entryCount = 36,
+  entryBytes = 2,
+}
+
+-- gBattleAnimEmitterAxisBase (battle_anim_emitter.c): the single
+-- four-word signed vector/flag row the static axis rows fall back to.
+BattleAnimationSources.EMITTER_AXIS_BASE = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x022354D0,
+  wordCount = 4,
+}
+
+-- gBattleAnimEmitterPositions_Mode31 (battle_anim_emitter.c): six signed
+-- fx32 XY pairs indexed by battler type, Z stays zero.
+BattleAnimationSources.EMITTER_POSITIONS_MODE31 = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x022354E0,
+  pairCount = 6,
+  unit = 4096,
+}
+
+-- gBattleAnimEmitterAxisPositions (battle_anim_emitter.c): six signed
+-- fx32 XY pairs indexed by battler type behind axis mode 24, Z stays zero.
+BattleAnimationSources.EMITTER_AXIS_POSITIONS = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x02235510,
+  pairCount = 6,
+  unit = 4096,
+}
+
+-- gBattleAnimEmitterPositions_Mode32/Mode30 (battle_anim_emitter.c):
+-- seven signed fx32 XY pairs each; the seventh row serves contest use.
+BattleAnimationSources.EMITTER_POSITIONS_MODE32 = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x02235540,
+  pairCount = 7,
+  unit = 4096,
+}
+
+BattleAnimationSources.EMITTER_POSITIONS_MODE30 = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x02235578,
+  pairCount = 7,
+  unit = 4096,
+}
+
+-- gBattleAnimEmitterAxisRows (battle_anim_emitter.c): seven four-word
+-- signed vector/flag rows behind static axis modes 6 and 7. The fourth
+-- word is the mirror flag, not an axis component.
+BattleAnimationSources.EMITTER_AXIS_ROWS = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x022355B0,
+  rowCount = 7,
+  wordCount = 4,
+}
+
+-- Remaining gBattleAnimEmitterAxes_ModeN tables (battle_anim_emitter.c):
+-- one fixed-point axis vector per ordered battler-type pair each.
+BattleAnimationSources.EMITTER_AXIS_MODE8 = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x02235620,
+  vectorBytes = 12,
+  entryCount = 36,
+  unit = 4096,
+}
+
+BattleAnimationSources.EMITTER_AXIS_MODE16 = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x02235980,
+  vectorBytes = 12,
+  entryCount = 36,
+  unit = 4096,
+}
+
+BattleAnimationSources.EMITTER_AXIS_MODE12 = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x02235B30,
+  vectorBytes = 12,
+  entryCount = 36,
+  unit = 4096,
+}
+
+BattleAnimationSources.EMITTER_AXIS_MODE14 = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x02235E90,
+  vectorBytes = 12,
+  entryCount = 36,
+  unit = 4096,
+}
+
+BattleAnimationSources.EMITTER_AXIS_MODE18 = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x02236040,
+  vectorBytes = 12,
+  entryCount = 36,
+  unit = 4096,
+}
+
+BattleAnimationSources.EMITTER_AXIS_MODE20 = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x022361F0,
+  vectorBytes = 12,
+  entryCount = 36,
+  unit = 4096,
+}
+
+-- gBattleAnimEmitterCameraAngles (battle_anim_emitter.c): six unsigned
+-- XYZ angle triples behind the configured camera presets.
+BattleAnimationSources.EMITTER_CAMERA_ANGLES = {
+  cpu = "arm9",
+  overlayId = 7,
+  address = 0x02236414,
+  tripleCount = 6,
 }
 
 -- Native SPL members with a source-resolved semantic identity.
@@ -681,6 +845,68 @@ function BattleAnimationSources.resolveBattleAnimationCallback(operands)
   if type(count) ~= "number" or count % 1 ~= 0 or count < 0 or count > 10 or #operands ~= count + 2 then
     return nil, "battle animation callback parameter count is invalid"
   end
+  if selector == 0 then
+    -- None: a genuine synchronous no-op with no explicit arguments.
+    if count ~= 0 then
+      return nil, "empty callback carries no source operands"
+    end
+    return {
+      callback = "battle-visual-none",
+      taskKind = "battle-visual-none",
+      context = "pokemon-picture",
+      parameters = {},
+    }
+  end
+  if selector == 1 then
+    -- OneFrameTask: a counted two-state wait/end task.
+    if count ~= 0 then
+      return nil, "one-frame callback carries no source operands"
+    end
+    return {
+      callback = "battle-visual-one-frame-task",
+      taskKind = "battle-visual-one-frame-task",
+      context = "pokemon-picture",
+      parameters = {},
+    }
+  end
+  if selector == 2 then
+    -- OneFrameSoundTask: a sound-counted two-state wait/end task.
+    if count ~= 0 then
+      return nil, "one-frame sound callback carries no source operands"
+    end
+    return {
+      callback = "battle-visual-one-frame-sound-task",
+      taskKind = "battle-visual-one-frame-sound-task",
+      context = "pokemon-picture",
+      parameters = {},
+    }
+  end
+  if selector == 3 then
+    -- OneFrameUncountedTask: an uncounted two-state wait/end task.
+    if count ~= 0 then
+      return nil, "one-frame uncounted callback carries no source operands"
+    end
+    return {
+      callback = "battle-visual-one-frame-uncounted-task",
+      taskKind = "battle-visual-one-frame-uncounted-task",
+      context = "pokemon-picture",
+      parameters = {},
+    }
+  end
+  if selector == 21 then
+    -- ShowAttackerObjWindowSprites: source object-window copies with
+    -- delay/show/hold phases and explicit window cleanup.
+    if count ~= 0 then
+      return nil, "object-window callback carries no source operands"
+    end
+    return {
+      callback = "battle-visual-show-attacker-obj-window-sprites",
+      taskKind = "battle-visual-show-attacker-obj-window-sprites",
+      context = "battle-display",
+      battlerTarget = "attacker",
+      parameters = {},
+    }
+  end
   if selector == 6 then
     return {
       callback = "pokemon-picture-five-phase-affine-size-transition",
@@ -907,6 +1133,62 @@ function BattleAnimationSources.resolveBattleAnimationCallback(operands)
         repeatCount = operands[8],
         firstDurationTicks = signed16(math.floor(packedDurations / 0x10000)),
         returnDurationTicks = packedDurations % 0x10000,
+      },
+    }
+  elseif selector == 63 then
+    -- BattleAnimFunc_BlendSpritePalette (battle_anim_funcs.c) blends
+    -- the collected sprites' OBJ palette from start to end by step
+    -- after delay ticks, toward color, retiring once the blend reaches
+    -- its end. Flags use the battler-role bits; shipped scripts blend
+    -- the attacker (DISABLE, LUNAR_DANCE) or the defender (TOXIC).
+    if count ~= 6 then
+      return nil, "sprite palette blend callback requires six source operands"
+    end
+    local blendTarget = linearRoleTargets(operands[3])
+    if blendTarget == nil then
+      return nil, "sprite palette blend callback follows its source assertion path"
+    end
+    local delay = signed8(operands[4] or 0)
+    local step = signed8(operands[5] or 0)
+    local start = (operands[6] or 0) % 0x100
+    local finish = (operands[7] or 0) % 0x100
+    -- The native blend task applies its start coefficient first, then
+    -- steps toward its end once per delay period: simulate that loop
+    -- so the compiled duration retires exactly when the source does.
+    local blends = 0
+    local current = start
+    while true do
+      blends = blends + 1
+      if current == finish then
+        break
+      end
+      if blends > 512 then
+        return nil, "sprite palette blend callback never reaches its end coefficient"
+      end
+      local next = current + step
+      local nextS8 = next % 0x100
+      if nextS8 >= 0x80 then
+        nextS8 = nextS8 - 0x100
+      end
+      if step > 0 then
+        current = nextS8 > finish and finish or next
+      else
+        current = nextS8 < finish and finish or next
+      end
+    end
+    local period = delay > 1 and delay or 1
+    return {
+      callback = "pokemon-picture-blend-sprite-palette",
+      taskKind = "pokemon-picture-blend-sprite-palette",
+      context = "pokemon-picture",
+      parameters = {
+        pictureTarget = blendTarget,
+        wait = delay,
+        startCoefficient = start,
+        endCoefficient = finish,
+        nextColor = (operands[8] or 0) % 0x10000,
+        blendStep = step,
+        durationTicks = 1 + (blends - 1) * period,
       },
     }
   elseif selector == 77 then
@@ -1255,11 +1537,14 @@ function BattleAnimationSources.resolveBattleAnimationCallback(operands)
     if count ~= 4 then
       return nil, "Pokepic offset transition requires four source operands"
     end
+    -- The opposing-pair word is 272, matching the sibling selector-51
+    -- table and every shipped script: the corpus carries 258/264/272
+    -- for this callback and no 276 anywhere.
     local pictureTargets = {
       [258] = "active-battler",
       [260] = "active-battler-pair-when-enabled",
       [264] = "opposing-battler",
-      [276] = "opposing-battler-pair-when-enabled",
+      [272] = "opposing-battler-pair-when-enabled",
     }
     local pictureTarget = pictureTargets[operands[6]]
     if pictureTarget == nil then
@@ -1430,17 +1715,25 @@ function BattleAnimationSources.resolveBattleAnimationCallback(operands)
       parameters = {},
     }
   elseif selector == 15 then
+    -- AttackerLeapOffscreen: two gBattleAnimLeapOffscreenSteps scale legs
+    -- around a five-tick rise, then the terminal vanish write on the
+    -- attacker's own picture. The source reads no script words.
+    return {
+      callback = "pokemon-picture-leap-offscreen-transition",
+      taskKind = "pokemon-picture-leap-offscreen-transition",
+      context = "pokemon-picture",
+      battlerTarget = "attacker",
+      parameters = {},
+    }
+  elseif selector == 16 then
+    -- AttackerSilhouette: the battlefield palette fades to white while the
+    -- attacker picture palette fades to black, holds six ticks, and both
+    -- fade back. The source reads no script words.
     return {
       callback = "pokemon-picture-and-battle-palette-fade-cycle",
       taskKind = "pokemon-picture-and-battle-palette-fade-cycle",
       context = "battle-palette",
-      parameters = {},
-    }
-  elseif selector == 16 then
-    return {
-      callback = "pokemon-picture-battle-palette-fade-cycle",
-      taskKind = "pokemon-picture-battle-palette-fade-cycle",
-      context = "battle-palette",
+      battlerTarget = "attacker",
       parameters = {},
     }
   elseif selector == 17 then
@@ -1553,26 +1846,21 @@ function BattleAnimationSources.resolveBattleAnimationCallback(operands)
       parameters = {},
     }
   elseif selector == 27 then
-    if operands[3] == 0 then
-      return {
-        callback = "battle-background-picture-scroll-oscillation",
-        taskKind = "battle-background-picture-scroll-oscillation",
-        context = "battle-display",
-        parameters = {
-          directionState = (operands[4] or 0) % 256,
-          phaseIndex = (operands[5] or 0) % 256,
-        },
-      }
-    end
+    -- RockOrShakeAttacker (battle_anim_move_effects.c): a zero shake word
+    -- rocks the attacker picture through gBattleAnimRockAttackerSteps, and
+    -- any other word shakes the defender picture with the amplitude,
+    -- interval, and count words that follow it.
     return {
-      callback = "battle-background-picture-coordinate-sweep",
-      taskKind = "battle-background-picture-coordinate-sweep",
+      callback = "battle-background-picture-scroll-oscillation",
+      taskKind = "battle-background-picture-scroll-oscillation",
       context = "battle-display",
       parameters = {
-        startX = signed16(operands[4] or 0),
-        startY = signed16(operands[5] or 0),
-        deltaX = signed16(operands[6] or 0),
-        deltaY = signed16(operands[7] or 0),
+        shake = (operands[3] or 0) ~= 0 and 1 or 0,
+        shakeAmpX = signed16(operands[4] or 0),
+        shakeAmpY = signed16(operands[5] or 0),
+        shakeInterval = signed16(operands[6] or 0),
+        shakeCount = signed16(operands[7] or 0),
+        shakeExtra = signed16(operands[8] or 0),
       },
     }
   elseif selector == 49 then
@@ -1840,14 +2128,46 @@ function BattleAnimationSources.resolveBattleAnimationCallback(operands)
     -- same hold and blend; only the scroll velocity (the lowered
     -- offsets) and the graphic/target selection vary, and none of
     -- those gate completion, so no lowered operand can wedge the run.
+    -- The graphic and target ride the runtime animation args
+    -- (BattleAnimObjWindowBg_InitParams reads Arg0/Arg1): every script
+    -- in the corpus passes both words, so the compiler lowers them onto
+    -- the invocation and the player loads them into the scratch
+    -- context exactly like CallFunc, while every graphic row still
+    -- stages at compile time for the runtime selection.
+    if count ~= 2 then
+      return nil, "object window scroll carries its graphic and target selections"
+    end
     local offsetY = ({ [80] = 3, [81] = -3, [82] = 3, [83] = -6 })[selector]
     local callback = offsetY == 3 and "battle-sprite-panel-slide-down"
       or offsetY == -3 and "battle-sprite-panel-slide-up"
       or "battle-sprite-panel-slide-far-up"
+    local sourceSelections = {}
+    for graphic = 0, 3 do
+      local row = BattleAnimationSources.OBJECT_WINDOW_BG_ROWS[graphic + 1]
+      sourceSelections["stripeGraphic" .. graphic .. "Char"] = {
+        archiveSymbol = BattleAnimationSources.LOWER_NARC,
+        memberId = row[1],
+        decoder = "char",
+        kind = "texture",
+      }
+      sourceSelections["stripeGraphic" .. graphic .. "Palette"] = {
+        archiveSymbol = BattleAnimationSources.LOWER_NARC,
+        memberId = row[2],
+        decoder = "palette",
+        kind = "palette",
+      }
+      sourceSelections["stripeGraphic" .. graphic .. "Screen"] = {
+        archiveSymbol = BattleAnimationSources.LOWER_NARC,
+        memberId = row[3],
+        decoder = "screen",
+        kind = "map",
+      }
+    end
     return {
       callback = callback,
       taskKind = "battle-sprite-panel-slide",
       context = "sprite-system",
+      runtimeSelection = "object-window-stripe-selection",
       parameters = {
         firstPanelOffsetX = 0,
         firstPanelOffsetY = offsetY,
@@ -1855,6 +2175,8 @@ function BattleAnimationSources.resolveBattleAnimationCallback(operands)
         secondPanelOffsetY = 4,
         durationTicks = 37,
       },
+      sourceSelections = sourceSelections,
+      args = { operands[3], operands[4] },
     }
   end
   return nil, "battle animation callback selector is outside the normalized source set"

@@ -430,6 +430,59 @@ local function checkMenuStep(context, step, path)
   end
 end
 
+-- A source money amount is a non-negative integer literal or a value
+-- reference; strings are never amounts. The money box carries its two source
+-- tile coordinates exactly on show and no operand on update/hide.
+local function checkMoneyStep(context, step, path, name)
+  local function checkOperand(value, field)
+    if type(value) == "number" then
+      if value % 1 ~= 0 or value < 0 then
+        fail(
+          context,
+          ScriptErrors.SCRIPT_SCHEMA_INVALID,
+          fieldPath(path, field),
+          "expected a non-negative integer literal or value reference",
+          { field = field, op = name }
+        )
+      end
+    elseif type(value) ~= "table" then
+      fail(
+        context,
+        ScriptErrors.SCRIPT_SCHEMA_INVALID,
+        fieldPath(path, field),
+        "expected a non-negative integer literal or value reference",
+        { field = field, op = name }
+      )
+    end
+  end
+  if name ~= "money_box" then
+    checkOperand(step.amount, "amount")
+    return
+  end
+  local hasColumn, hasRow = step.tileX ~= nil, step.tileY ~= nil
+  if step.action == "show" then
+    if not hasColumn or not hasRow then
+      fail(
+        context,
+        ScriptErrors.SCRIPT_SCHEMA_INVALID,
+        path,
+        "the source money box opens at two tile coordinates",
+        { op = name }
+      )
+    end
+    checkOperand(step.tileX, "tileX")
+    checkOperand(step.tileY, "tileY")
+  elseif hasColumn or hasRow then
+    fail(
+      context,
+      ScriptErrors.SCRIPT_SCHEMA_INVALID,
+      path,
+      "no money box action besides show carries a coordinate",
+      { op = name }
+    )
+  end
+end
+
 -- The low-level compare-state branches need either a local label target or a
 -- cross-script reference.
 local function checkCompareBranchStep(context, step, path, name)
@@ -499,6 +552,8 @@ local function checkStep(context, step, path)
         { kind = step.kind }
       )
     end
+  elseif name == "money_change" or name == "money_check" or name == "money_box" then
+    checkMoneyStep(context, step, path, name)
   elseif name == "goto_compared" or name == "call_compared" then
     checkCompareBranchStep(context, step, path, name)
   end
@@ -609,6 +664,15 @@ local function checkScalarOrValue(context, v, path, field)
   end
   checkValueRef(context, v, path, field)
 end
+-- A source direction operand: a cardinal name, or the script variable that
+-- carries the source direction code until the command runs.
+local function checkDirectionOrValue(context, v, path, field)
+  if type(v) == "string" and ENUM_SETS.direction[v] then
+    return
+  end
+  checkValueRef(context, v, path, field)
+end
+CHECKERS.direction_or_value = checkDirectionOrValue
 CHECKERS.value = checkValueRef
 CHECKERS.writable_value = checkWritableValue
 CHECKERS.text_value = checkTextValue
@@ -632,6 +696,16 @@ local function checkIdOrVar(context, v, path, field)
     return
   end
   checkVarRef(context, v, path, field)
+end
+-- A flag identifier: a world id, a variable reference, or any value that
+-- resolves to a flag id at runtime. Only flag reads accept the value form;
+-- world-id write destinations stay world ids or variable references.
+local function checkFlagId(context, v, path, field)
+  if type(v) == "table" then
+    checkValueRef(context, v, path, field)
+    return
+  end
+  checkIdOrVar(context, v, path, field)
 end
 CHECKERS.actor = checkActor
 local function checkActorList(context, v, path, field)
@@ -817,6 +891,7 @@ CHECKERS.scalar_or_value = checkScalarOrValue
 CHECKERS.value = checkValueRef
 CHECKERS.text_value = checkTextValue
 CHECKERS.id_or_var = checkIdOrVar
+CHECKERS.flag_id = checkFlagId
 CHECKERS.actor = checkActor
 CHECKERS.actor_list = checkActorList
 CHECKERS.condition = checkCondition

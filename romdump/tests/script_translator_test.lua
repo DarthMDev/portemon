@@ -15,6 +15,7 @@ local SourceCatalog = require("romdump.src.digest.script.SourceCatalog")
 local CommandCatalog = require("romdump.src.digest.script.CommandCatalog")
 local Narc = require("libs.nds.src.nitro.Narc")
 local S = require("gen4.script")
+local ScriptIdentity = require("libs.assets.src.ScriptIdentity")
 local NarcBuilder = require("tests.support.NarcBuilder")
 
 local T = {}
@@ -28,7 +29,7 @@ local T = {}
 local CATALOG = {
   sounds = { [1500] = "SEQ_SE_DP_SELECT" },
   flags = { [0x6A] = "FLAG_GOT_STARTER" },
-  vars = { [0x8008] = "VAR_SPECIAL_x8008" },
+  vars = { [0x8008] = "VAR_SPECIAL_x8008", [0x800C] = "VAR_SPECIAL_RESULT" },
   maps = {},
   spawns = { [5] = "SPAWN_GOLDENROD" },
 }
@@ -112,7 +113,7 @@ T["opcode 609 lowers to the follower gate"] = function()
     },
   })
   local _, steps, report = translate(bytes, 845, 0)
-  Assert.equal(steps[1].op, "yield_tick")
+  Assert.equal(steps[1].op, "follower_reset_movement")
   Assert.isTrue(report.complete)
 end
 
@@ -253,7 +254,7 @@ T["retained compiler uses injected hashing and counts coverage once"] = function
   Assert.equal(bundle.memberCoverage[1].totals.members, 1)
 end
 
--- 3. An unsupported instruction (e.g. SetTrainerFlag) makes the script
+-- 3. An unsupported instruction (e.g. ChatotHasCry) makes the script
 -- partial with an explicit unsupported node.
 T["unsupported instructions stay explicit"] = function()
   local bytes = ScriptFixture.member({
@@ -261,7 +262,7 @@ T["unsupported instructions stay explicit"] = function()
       {
         offset = 0x20,
         instructions = {
-          { op = 36, args = { { value = 1, width = 2 }, { value = 2, width = 2 } } },
+          { op = 89, args = { { value = 1, width = 2 } } },
           { op = 2, args = {} },
         },
       },
@@ -270,8 +271,8 @@ T["unsupported instructions stay explicit"] = function()
   local ir = assert(ScriptBinaryDecoder.parseMember(bytes, 5, "synthetic", { msgBank = 543, catalog = CATALOG }))
   local lowered = SemanticLowering.lowerScript(ir.scripts[0], ir, { stdCatalog = SourceCatalog.catalog() })
   Assert.equal(#lowered.unsupported, 1)
-  Assert.equal(lowered.unsupported[1].command, 36)
-  Assert.equal(lowered.unsupported[1].originalName, "ScrCmd_SetTrainerFlag")
+  Assert.equal(lowered.unsupported[1].command, 89)
+  Assert.equal(lowered.unsupported[1].originalName, "ScrCmd_ChatotHasCry")
   local report = Verifier.verifyScript(Structurer.structure(lowered, 0), ir.scripts[0], ir, lowered.omissions)
   Assert.isFalse(report.complete)
   Assert.equal(report.unsupportedCount, 1)
@@ -614,6 +615,120 @@ T["field menu operations verify as supported"] = function()
   Assert.equal(report.unsupportedCount, 0)
 end
 
+-- Source multichoice (ScrCmd_Multichoice*) is the foreground framed family,
+-- not the touchscreen list family: Script_CreateMenuFromArgs reads four bytes
+-- of native geometry then the result halfword, and the item operands are the
+-- immediate message id and result byte that ScriptMenu_AddItem stores as is.
+T["source multichoice commands lower with native geometry and immediate operands"] = function()
+  local bytes = ScriptFixture.member({
+    scripts = {
+      {
+        offset = 0x20,
+        instructions = {
+          {
+            op = 64,
+            args = {
+              { value = 17, width = 1 },
+              { value = 3, width = 1 },
+              { value = 1, width = 1 },
+              { value = 1, width = 1 },
+              { value = 0x4002, width = 2 },
+            },
+          },
+          { op = 841, args = { { value = 1, width = 1 } } },
+          { op = 66, args = { { value = 200, width = 1 }, { value = 255, width = 1 } } },
+          { op = 66, args = { { value = 7, width = 1 }, { value = 0, width = 1 } } },
+          { op = 67, args = {} },
+          { op = 2, args = {} },
+        },
+      },
+    },
+  })
+  local ir = assert(ScriptBinaryDecoder.parseMember(bytes, 5, "synthetic", { msgBank = 543, catalog = CATALOG }))
+  local lowered = SemanticLowering.lowerScript(ir.scripts[0], ir, { stdCatalog = SourceCatalog.catalog() })
+  Assert.equal(#lowered.unsupported, 0)
+  Assert.deepEqual(lowered.items[1], {
+    op = "menu_begin",
+    kind = "multichoice",
+    tileX = 17,
+    tileY = 3,
+    messageSource = "standard",
+    initialCursor = 1,
+    cancellable = true,
+    cancelValue = 0xFFFE,
+    result = { value = "var", id = "VAR_0x4002" },
+    provenance = { offsets = { 32 }, opcodes = { 64 } },
+  })
+  Assert.deepEqual(lowered.items[2], {
+    op = "menu_anchor_right",
+    enabled = true,
+    provenance = { offsets = { 40 }, opcodes = { 841 } },
+  })
+  Assert.deepEqual(lowered.items[3], {
+    op = "menu_add",
+    messageId = 200,
+    value = 255,
+    provenance = { offsets = { 43 }, opcodes = { 66 } },
+  })
+  Assert.deepEqual(lowered.items[4], {
+    op = "menu_add",
+    messageId = 7,
+    value = 0,
+    provenance = { offsets = { 47 }, opcodes = { 66 } },
+  })
+  Assert.deepEqual(lowered.items[5], {
+    op = "menu_exec",
+    provenance = { offsets = { 51 }, opcodes = { 67 } },
+  })
+end
+
+-- The same family resolves labels from the current script bank (65) instead of
+-- the standard message data, and each source return value keeps its own
+-- execution boundary: init and the anchor request a later tick, item add stays
+-- on the current tick, and exec waits for the source result variable.
+T["source multichoice commands classify with their source timing"] = function()
+  local bytes = ScriptFixture.member({
+    scripts = {
+      {
+        offset = 0x20,
+        instructions = {
+          {
+            op = 65,
+            args = {
+              { value = 31, width = 1 },
+              { value = 6, width = 1 },
+              { value = 0, width = 1 },
+              { value = 0, width = 1 },
+              { value = 0x4003, width = 2 },
+            },
+          },
+          { op = 841, args = { { value = 0, width = 1 } } },
+          { op = 66, args = { { value = 8, width = 1 }, { value = 1, width = 1 } } },
+          { op = 67, args = {} },
+          { op = 2, args = {} },
+        },
+      },
+    },
+  })
+  Assert.equal(CommandCatalog.classification(64), CommandCatalog.YIELD)
+  Assert.equal(CommandCatalog.classification(65), CommandCatalog.YIELD)
+  Assert.equal(CommandCatalog.classification(66), CommandCatalog.CONTINUE)
+  Assert.equal(CommandCatalog.classification(67), CommandCatalog.NATIVE_WAIT)
+  Assert.equal(CommandCatalog.classification(841), CommandCatalog.YIELD)
+
+  local ir = assert(ScriptBinaryDecoder.parseMember(bytes, 5, "synthetic", { msgBank = 543, catalog = CATALOG }))
+  local lowered = SemanticLowering.lowerScript(ir.scripts[0], ir, { stdCatalog = SourceCatalog.catalog() })
+  Assert.equal(#lowered.unsupported, 0)
+  Assert.equal(lowered.items[1].messageSource.kind, "script")
+  Assert.equal(lowered.items[1].messageSource.bank, 543)
+  Assert.isFalse(lowered.items[1].cancellable)
+  Assert.isFalse(lowered.items[2].enabled)
+  local report = Verifier.verifyScript(Structurer.structure(lowered, 0), ir.scripts[0], ir, lowered.omissions)
+  Assert.equal(report.unsupportedCount, 0)
+  Assert.isTrue(report.ok, report.problems[1] and report.problems[1].message or "source multichoice must verify")
+  Assert.isTrue(report.complete)
+end
+
 -- 12. Opcodes 55-61 carry their execution classifications (runtime support
 -- lands atomically with each; 61 is the std_signpost context end).
 T["signpost 55-61 classify as supported"] = function()
@@ -728,7 +843,7 @@ T["unknown signpost action command is malformed source"] = function()
   end
 end
 
--- 17. Opcode 61 (ScrCmd_061, the std_signpost context end): no operands,
+-- 17. Opcode 61 (ScrCmd_ReopenStartMenuOnEnd, the std_signpost context end): no operands,
 -- ends the script context and requests the Start Menu reopen hook. It
 -- lowers to the canonical terminal request_start_menu node and verifies as
 -- a stop-classified supported translation, never an unsupported node.
@@ -1090,7 +1205,7 @@ T["unclassified sound commands stay attributed unsupported"] = function()
   local lowered = SemanticLowering.lowerScript(ir.scripts[0], ir, { stdCatalog = SourceCatalog.catalog() })
   Assert.equal(#lowered.unsupported, 1)
   Assert.equal(lowered.unsupported[1].command, 86)
-  Assert.equal(lowered.unsupported[1].originalName, "ScrCmd_086")
+  Assert.equal(lowered.unsupported[1].originalName, "ScrCmd_SetSoundPlayerPause")
   local report = Verifier.verifyScript(Structurer.structure(lowered, 0), ir.scripts[0], ir, lowered.omissions)
   Assert.isFalse(report.complete)
 end
@@ -1243,7 +1358,7 @@ T["opcode 596 reads live partner state and 600 recalls the follower"] = function
     },
   })
   Assert.equal(CommandCatalog.classification(596), CommandCatalog.CONTINUE)
-  Assert.equal(CommandCatalog.classification(600), CommandCatalog.CONTINUE)
+  Assert.equal(CommandCatalog.classification(600), CommandCatalog.NATIVE_WAIT)
   local ir = assert(ScriptBinaryDecoder.parseMember(bytes, 5, "synthetic", { msgBank = 543, catalog = CATALOG }))
   local lowered = SemanticLowering.lowerScript(ir.scripts[0], ir, { stdCatalog = SourceCatalog.catalog() })
   Assert.deepEqual(lowered.items[1], {
@@ -1252,7 +1367,7 @@ T["opcode 596 reads live partner state and 600 recalls the follower"] = function
     provenance = { offsets = { 32 }, opcodes = { 596 } },
   })
   Assert.equal(#lowered.unsupported, 0)
-  Assert.equal(lowered.items[2].op, "follower_recall_to_player")
+  Assert.equal(lowered.items[2].op, "follower_recall")
 end
 
 -- Opcode 582 (the source special-spawn setter) must lower to a named
@@ -1741,7 +1856,7 @@ T["unsupported and omitted instructions stay accounted beside folds"] = function
     { opcode = 28, operands = { { raw = 1 }, { raw = "_END" } }, offset = 0x26 },
     { opcode = 0, operands = {}, offset = 0x2D },
     { opcode = 1, operands = {}, offset = 0x2E },
-    { opcode = 36, operands = { { raw = 1 }, { raw = 2 } }, offset = 0x2F },
+    { opcode = 89, operands = { { raw = 1 } }, offset = 0x2F },
     { opcode = 2, operands = {}, offset = 0x33, label = "_END" },
   }
   local script = { label = "_ENTRY", instructions = instructions }
@@ -1757,12 +1872,12 @@ T["unsupported and omitted instructions stay accounted beside folds"] = function
     { offset = 0x2E, opcode = 1 },
   })
   Assert.equal(#lowered.unsupported, 1)
-  Assert.equal(lowered.unsupported[1].command, 36)
-  Assert.equal(lowered.unsupported[1].originalName, "ScrCmd_SetTrainerFlag")
+  Assert.equal(lowered.unsupported[1].command, 89)
+  Assert.equal(lowered.unsupported[1].originalName, "ScrCmd_ChatotHasCry")
   Assert.isTrue(lowered.unsupported[1] == lowered.items[2], "the diagnostic node is the emitted item")
   Assert.deepEqual(
     lowered.items[2].provenance,
-    { offsets = { 0x2F }, opcodes = { 36 } },
+    { offsets = { 0x2F }, opcodes = { 89 } },
     "the unsupported node keeps its source provenance"
   )
   local seen = {}
@@ -1784,6 +1899,629 @@ T["unsupported and omitted instructions stay accounted beside folds"] = function
   Assert.isTrue(report.ok, report.problems[1] and report.problems[1].message or "partial script must verify")
   Assert.isFalse(report.complete)
   Assert.equal(report.unsupportedCount, 1)
+end
+
+-- 50. Source Call keeps its resolved member target and timing: a call into
+-- another script's interior label is one cross-script call node naming that
+-- script and label, the caller's continuation stays balanced, and a target
+-- that no member instruction defines stays an attributed unsupported node
+-- instead of becoming a silent no-op.
+T["cross-script call resolves its target and a missing target stays unsupported"] = function()
+  local bytes = ScriptFixture.member({
+    scripts = {
+      {
+        offset = 0x20,
+        instructions = {
+          -- 0x20: Call (6) -> 0x26, target 0x2C in the other script
+          { op = 26, args = { { target = 0x2C, width = 4 } } },
+          -- 0x26: End (2) -> 0x28
+          { op = 2, args = {} },
+        },
+      },
+      {
+        offset = 0x28,
+        instructions = {
+          -- 0x28: WaitButton (2) -> 0x2A
+          { op = 50, args = {} },
+          -- 0x2A: Return (2) -> 0x2C
+          { op = 27, args = {} },
+          -- 0x2C: the called label, SetFlag (4) -> 0x30
+          { op = 30, args = { { value = 7, width = 2 } } },
+          -- 0x30: Return (2) -> 0x32
+          { op = 27, args = {} },
+        },
+      },
+    },
+  })
+  local ir = assert(ScriptBinaryDecoder.parseMember(bytes, 5, "synthetic", { msgBank = 543, catalog = CATALOG }))
+  local function translateIndex(index)
+    local lowered = SemanticLowering.lowerScript(ir.scripts[index], ir, { stdCatalog = SourceCatalog.catalog() })
+    local steps = Structurer.structure(lowered, index)
+    local report = Verifier.verifyScript(steps, ir.scripts[index], ir, lowered.omissions)
+    return lowered, steps, report
+  end
+
+  local lowered, steps, report = translateIndex(0)
+  Assert.equal(#lowered.unsupported, 0)
+  Assert.deepEqual(steps[1], {
+    op = "call",
+    target = ScriptIdentity.formatVanilla(5, 1),
+    label = "_002C",
+    provenance = { offsets = { 0x20 }, opcodes = { 26 } },
+  })
+  Assert.equal(steps[2].op, "stop")
+  Assert.isTrue(report.ok, report.problems[1] and report.problems[1].message or "cross-script call must verify")
+  Assert.isTrue(report.complete)
+  local warnedOpenFrame = false
+  for _, warning in ipairs(report.warnings) do
+    if warning.message == "script ends with a non-empty call stack" then
+      warnedOpenFrame = true
+    end
+  end
+  Assert.isFalse(warnedOpenFrame, "the call's own continuation does not run with a pushed frame")
+
+  local missing = ScriptFixture.member({
+    scripts = {
+      {
+        offset = 0x20,
+        instructions = {
+          -- 0x20: Call (6) -> 0x26, target no instruction defines
+          { op = 26, args = { { target = 0x900, width = 4 } } },
+          -- 0x26: End (2) -> 0x28
+          { op = 2, args = {} },
+        },
+      },
+    },
+  })
+  local missingIr =
+    assert(ScriptBinaryDecoder.parseMember(missing, 5, "synthetic", { msgBank = 543, catalog = CATALOG }))
+  local missingLowered = SemanticLowering.lowerScript(missingIr.scripts[0], missingIr, {
+    stdCatalog = SourceCatalog.catalog(),
+  })
+  local missingSteps = Structurer.structure(missingLowered, 0)
+  local missingReport = Verifier.verifyScript(missingSteps, missingIr.scripts[0], missingIr, missingLowered.omissions)
+  Assert.equal(missingSteps[1].op, "unsupported", "a missing call target never becomes a call or a no-op")
+  Assert.equal(missingSteps[1].command, 26)
+  Assert.isTrue(
+    type(missingSteps[1].reason) == "string" and missingSteps[1].reason ~= "",
+    "the unresolved call stays attributed"
+  )
+  Assert.deepEqual(missingSteps[1].provenance, { offsets = { 0x20 }, opcodes = { 26 } })
+  Assert.equal(#missingLowered.unsupported, 1)
+  Assert.isTrue(missingReport.ok, missingReport.problems[1] and missingReport.problems[1].message or "reported")
+  Assert.isFalse(missingReport.complete)
+  Assert.equal(missingReport.unsupportedCount, 1)
+end
+
+-- NameRival blocks the script on the shared field naming screen and writes
+-- the native no-input result into its destination variable, so the lowering
+-- emits one blocking operation without inventing any nickname operand.
+T["name rival lowers to the blocking rival naming operation"] = function()
+  Assert.deepEqual(CommandCatalog.widths(143), { 2 })
+  Assert.equal(CommandCatalog.classification(143), CommandCatalog.NATIVE_WAIT)
+  Assert.isNil(CommandCatalog.disposition(143))
+  local bytes = ScriptFixture.member({
+    scripts = {
+      {
+        offset = 0x20,
+        instructions = {
+          { op = 143, args = { { value = 0x8008, width = 2 } } },
+          { op = 2, args = {} },
+        },
+      },
+    },
+  })
+  local _, steps, report = translate(bytes, 5, 0)
+  Assert.deepEqual(steps[1], {
+    op = "rival_naming",
+    result = { value = "var", id = "VAR_SPECIAL_x8008" },
+    provenance = { offsets = { 0x20 }, opcodes = { 143 } },
+  })
+  Assert.isNil(steps[1].slot, "rival naming is not a party nickname slot")
+  Assert.isTrue(report.ok, report.problems[1] and report.problems[1].message or "rival naming must verify")
+  Assert.isTrue(report.complete)
+end
+
+-- The source money family (scrcmd_money.c) reads its own operand shapes: the
+-- u32 immediates of AddMoney/SubMoneyImmediate are true 32-bit amounts, the
+-- result pointer of HasEnoughMoneyImmediate/Var is read before the amount, and
+-- the variable forms take their amount through ScriptGetVar. Every command
+-- returns in the same tick (ScrCmd_* all return FALSE), and the money box
+-- window commands carry either the two source tile coordinates or no operand.
+T["source money commands lower to the money operations"] = function()
+  local bytes = ScriptFixture.member({
+    scripts = {
+      {
+        offset = 0x20,
+        instructions = {
+          -- 0x20: AddMoney 999999 (6)
+          { op = 110, args = { { value = 999999, width = 4 } } },
+          -- 0x26: AddMoney 1000000 (6) -- over the wallet cap, still a valid source amount
+          { op = 110, args = { { value = 1000000, width = 4 } } },
+          -- 0x2C: SubMoneyImmediate 1000000 (6)
+          { op = 111, args = { { value = 1000000, width = 4 } } },
+          -- 0x32: HasEnoughMoneyImmediate(VAR_SPECIAL_x8008, 1000) (8)
+          { op = 112, args = { { value = 0x8008, width = 2 }, { value = 1000, width = 4 } } },
+          -- 0x3A: ShowMoneyBox(3, 5) (6)
+          { op = 113, args = { { value = 3, width = 2 }, { value = 5, width = 2 } } },
+          -- 0x40: HideMoneyBox (2)
+          { op = 114, args = {} },
+          -- 0x42: UpdateMoneyBox (2)
+          { op = 115, args = {} },
+          -- 0x44: SubMoneyVar(40) (4)
+          { op = 360, args = { { value = 40, width = 2 } } },
+          -- 0x48: SubMoneyVar(VAR_0x4000) (4)
+          { op = 360, args = { { value = 0x4000, width = 2 } } },
+          -- 0x4C: HasEnoughMoneyVar(VAR_SPECIAL_x8008, VAR_0x4000) (6)
+          { op = 368, args = { { value = 0x8008, width = 2 }, { value = 0x4000, width = 2 } } },
+          { op = 2, args = {} },
+        },
+      },
+    },
+  })
+  for _, opcode in ipairs({ 110, 111, 112, 113, 114, 115, 360, 368 }) do
+    Assert.equal(
+      CommandCatalog.classification(opcode),
+      CommandCatalog.CONTINUE,
+      "source money command " .. opcode .. " is a same-tick command"
+    )
+  end
+  local ir = assert(ScriptBinaryDecoder.parseMember(bytes, 843, "synthetic", { msgBank = 543, catalog = CATALOG }))
+  local lowered = SemanticLowering.lowerScript(ir.scripts[0], ir, { stdCatalog = SourceCatalog.catalog() })
+  Assert.equal(#lowered.unsupported, 0, "no source money command stays unsupported")
+  Assert.deepEqual(lowered.items[1], {
+    op = "money_change",
+    action = "add",
+    amount = 999999,
+    provenance = { offsets = { 0x20 }, opcodes = { 110 } },
+  }, "AddMoney carries its u32 immediate as an amount, not as a currency id")
+  Assert.deepEqual(lowered.items[2], {
+    op = "money_change",
+    action = "add",
+    amount = 1000000,
+    provenance = { offsets = { 0x26 }, opcodes = { 110 } },
+  }, "an amount over the wallet cap stays the source amount; the wallet clamps at runtime")
+  Assert.deepEqual(lowered.items[3], {
+    op = "money_change",
+    action = "subtract",
+    amount = 1000000,
+    provenance = { offsets = { 0x2C }, opcodes = { 111 } },
+  })
+  Assert.deepEqual(lowered.items[4], {
+    op = "money_check",
+    amount = 1000,
+    result = { value = "var", id = "VAR_SPECIAL_x8008" },
+    provenance = { offsets = { 0x32 }, opcodes = { 112 } },
+  }, "the money check reads its result pointer first and its amount second")
+  Assert.deepEqual(lowered.items[5], {
+    op = "money_box",
+    action = "show",
+    tileX = 3,
+    tileY = 5,
+    provenance = { offsets = { 0x3A }, opcodes = { 113 } },
+  }, "the money box opens at its two source tile coordinates")
+  Assert.deepEqual(lowered.items[6], {
+    op = "money_box",
+    action = "hide",
+    provenance = { offsets = { 0x40 }, opcodes = { 114 } },
+  })
+  Assert.deepEqual(lowered.items[7], {
+    op = "money_box",
+    action = "update",
+    provenance = { offsets = { 0x42 }, opcodes = { 115 } },
+  })
+  Assert.deepEqual(lowered.items[8], {
+    op = "money_change",
+    action = "subtract",
+    amount = 40,
+    provenance = { offsets = { 0x44 }, opcodes = { 360 } },
+  }, "a small ScriptGetVar operand is the literal it encodes")
+  Assert.deepEqual(lowered.items[9], {
+    op = "money_change",
+    action = "subtract",
+    amount = { value = "var", id = "VAR_0x4000" },
+    provenance = { offsets = { 0x48 }, opcodes = { 360 } },
+  }, "a variable ScriptGetVar operand stays a value reference")
+  Assert.deepEqual(lowered.items[10], {
+    op = "money_check",
+    amount = { value = "var", id = "VAR_0x4000" },
+    result = { value = "var", id = "VAR_SPECIAL_x8008" },
+    provenance = { offsets = { 0x4C }, opcodes = { 368 } },
+  })
+  local steps = Structurer.structure(lowered, 0)
+  local report = Verifier.verifyScript(steps, ir.scripts[0], ir, lowered.omissions)
+  Assert.isTrue(report.ok, report.problems[1] and report.problems[1].message or "reported")
+  Assert.isTrue(report.complete, "the whole money command slice is supported and verified")
+  Assert.equal(report.unsupportedCount, 0)
+
+  -- Both box coordinates come through ScriptGetVar, so each one may be a
+  -- variable instead of a tile literal.
+  local varBytes = ScriptFixture.member({
+    scripts = {
+      {
+        offset = 0x20,
+        instructions = {
+          { op = 113, args = { { value = 0x4000, width = 2 }, { value = 0x4001, width = 2 } } },
+          { op = 2, args = {} },
+        },
+      },
+    },
+  })
+  local varIr =
+    assert(ScriptBinaryDecoder.parseMember(varBytes, 843, "synthetic", { msgBank = 543, catalog = CATALOG }))
+  local varLowered = SemanticLowering.lowerScript(varIr.scripts[0], varIr, {
+    stdCatalog = SourceCatalog.catalog(),
+  })
+  Assert.deepEqual(varLowered.items[1], {
+    op = "money_box",
+    action = "show",
+    tileX = { value = "var", id = "VAR_0x4000" },
+    tileY = { value = "var", id = "VAR_0x4001" },
+    provenance = { offsets = { 0x20 }, opcodes = { 113 } },
+  }, "variable box coordinates stay value references")
+end
+
+-- The source operand *kind* is the contract for a lowered field command: a
+-- ScriptGetVar operand becomes a variable reference somewhere in the step,
+-- an immediate operand never does. Counting the references proves that
+-- without freezing where the semantic node keeps them.
+local function countVariableReferences(step)
+  local count = 0
+  local seen = {}
+  local function walk(value)
+    if type(value) ~= "table" or seen[value] then
+      return
+    end
+    seen[value] = true
+    if value.value == "var" then
+      count = count + 1
+      return
+    end
+    for _, item in pairs(value) do
+      walk(item)
+    end
+  end
+  walk(step)
+  return count
+end
+
+local function translateOnly(instructions)
+  local bytes = ScriptFixture.member({
+    scripts = { { offset = 0x20, instructions = instructions } },
+  })
+  return translate(bytes, 843, 0)
+end
+
+-- The emitted steps must also be a valid generated script: the semantic field
+-- names the source operands lower to are part of the DSL contract.
+local function validateSteps(id, steps)
+  local ok, err = S.validate({ api = 1, id = id, steps = steps })
+  Assert.isTrue(ok, "the emitted steps are a valid script: " .. tostring(err))
+end
+
+T["object movement and facing commands carry their distinct source operands"] = function()
+  Assert.equal(CommandCatalog.classification(109), CommandCatalog.CONTINUE, "a movement change returns in its own tick")
+  Assert.equal(CommandCatalog.classification(344), CommandCatalog.CONTINUE, "a facing refresh returns in its own tick")
+
+  -- ChangeObjectMovement: the object id is a ScriptGetVar operand, the
+  -- movement selector is an immediate halfword, so the step names the source
+  -- movement type without a second variable read.
+  local _, movementSteps, movementReport = translateOnly({
+    { op = 109, args = { { value = 0x8008, width = 2 }, { value = 3, width = 2 } } },
+    { op = 2, args = {} },
+  })
+  Assert.equal(movementSteps[1].op, "set_object_movement_type")
+  Assert.equal(movementSteps[1].movementType, "wander_around", "the immediate selector lowers to its source movement")
+  Assert.equal(movementSteps[1].changeMovement, true, "the source command reinitializes the object's movement")
+  Assert.equal(countVariableReferences(movementSteps[1]), 1, "only the object id comes from a script variable")
+  Assert.deepEqual(movementSteps[1].provenance, { offsets = { 0x20 }, opcodes = { 109 } })
+  Assert.isTrue(movementReport.complete, "a movement change is a complete translation")
+  validateSteps("test.source_109", movementSteps)
+
+  -- The selector is an immediate: a value inside the variable range is an
+  -- invalid movement code, never a variable dereference.
+  local selectorError = Assert.throws(function()
+    translateOnly({
+      { op = 109, args = { { value = 0x8008, width = 2 }, { value = 0x4001, width = 2 } } },
+      { op = 2, args = {} },
+    })
+  end)
+  Assert.equal(selectorError.code, "SCRIPT_UNKNOWN_OBJECT_MOVEMENT")
+
+  -- SetObjectFacingAndUpdateDraw: both the object id and the direction are
+  -- ScriptGetVar operands, so the step reads two script variables.
+  local _, facingSteps, facingReport = translateOnly({
+    { op = 344, args = { { value = 0x8008, width = 2 }, { value = 0x8009, width = 2 } } },
+    { op = 2, args = {} },
+  })
+  Assert.equal(facingSteps[1].op, "set_object_facing")
+  Assert.equal(countVariableReferences(facingSteps[1]), 2, "the direction is read through a script variable")
+  Assert.deepEqual(facingSteps[1].provenance, { offsets = { 0x20 }, opcodes = { 344 } })
+  Assert.isTrue(facingReport.complete, "a facing refresh is a complete translation")
+  validateSteps("test.source_344", facingSteps)
+
+  -- The same command with immediate operands (the retail corpus shape): a
+  -- literal object id stays an index and a literal direction code is the
+  -- cardinal direction it names, not a bare source code.
+  local _, literalFacingSteps, literalFacingReport = translateOnly({
+    { op = 344, args = { { value = 3, width = 2 }, { value = 2, width = 2 } } },
+    { op = 2, args = {} },
+  })
+  Assert.deepEqual(literalFacingSteps[1].actor, { ref = "actor", mapIndex = 3 })
+  Assert.equal(literalFacingSteps[1].direction, "west", "a literal direction code lowers to its cardinal")
+  Assert.equal(countVariableReferences(literalFacingSteps[1]), 0, "immediate operands read no script variable")
+  Assert.isTrue(literalFacingReport.complete, "an immediate facing refresh is a complete translation")
+  validateSteps("test.source_344_literal", literalFacingSteps)
+end
+
+T["dynamic warp and warp-event commands lower to their own travel operations"] = function()
+  for _, opcode in ipairs({ 240, 241, 342 }) do
+    Assert.equal(
+      CommandCatalog.classification(opcode),
+      CommandCatalog.CONTINUE,
+      "opcode " .. opcode .. " returns same tick"
+    )
+  end
+
+  local _, setSteps, setReport = translateOnly({
+    {
+      op = 240,
+      args = {
+        { value = 0x8008, width = 2 },
+        { value = 0x8009, width = 2 },
+        { value = 0x800A, width = 2 },
+        { value = 0x800B, width = 2 },
+        { value = 0x800C, width = 2 },
+      },
+    },
+    { op = 2, args = {} },
+  })
+  Assert.equal(setSteps[1].op, "set_dynamic_warp")
+  Assert.equal(countVariableReferences(setSteps[1]), 5, "every SetDynamicWarp operand is a script variable")
+  Assert.deepEqual(setSteps[1].provenance, { offsets = { 0x20 }, opcodes = { 240 } })
+  Assert.isTrue(setReport.complete)
+  validateSteps("test.source_240", setSteps)
+
+  -- The retail corpus passes the destination cells and the direction as
+  -- immediates: SetDynamicWarp reads every operand through ScriptGetVar, so a
+  -- literal direction code is still the semantic cardinal, never a source
+  -- code the runtime would have to reinterpret.
+  local _, literalSteps, literalReport = translateOnly({
+    {
+      op = 240,
+      args = {
+        { value = 60, width = 2 },
+        { value = 1, width = 2 },
+        { value = 5, width = 2 },
+        { value = 3, width = 2 },
+        { value = 2, width = 2 },
+      },
+    },
+    { op = 2, args = {} },
+  })
+  Assert.equal(literalSteps[1].direction, "west", "a literal direction code lowers to its cardinal")
+  Assert.equal(countVariableReferences(literalSteps[1]), 0, "immediate operands read no script variable")
+  Assert.isTrue(literalReport.complete)
+  validateSteps("test.source_240_literal", literalSteps)
+
+  -- A code outside the pinned table fails with the rejected source code
+  -- named, never a fallback cardinal.
+  local unknownDirection = Assert.throws(function()
+    translateOnly({
+      {
+        op = 240,
+        args = {
+          { value = 60, width = 2 },
+          { value = 1, width = 2 },
+          { value = 5, width = 2 },
+          { value = 3, width = 2 },
+          { value = 7, width = 2 },
+        },
+      },
+      { op = 2, args = {} },
+    })
+  end)
+  Assert.isTrue(
+    tostring(unknownDirection):find("unknown direction code 7", 1, true) ~= nil,
+    "an unknown direction code names the source operand it rejected"
+  )
+
+  local _, floorSteps, floorReport = translateOnly({
+    { op = 241, args = { { value = 0x8008, width = 2 } } },
+    { op = 2, args = {} },
+  })
+  Assert.equal(floorSteps[1].op, "get_dynamic_warp_floor")
+  Assert.equal(countVariableReferences(floorSteps[1]), 1, "the floor answer is written to the result variable")
+  Assert.isTrue(floorReport.complete)
+  validateSteps("test.source_241", floorSteps)
+
+  local _, moveSteps, moveReport = translateOnly({
+    {
+      op = 342,
+      args = { { value = 0x8008, width = 2 }, { value = 0x8009, width = 2 }, { value = 0x800A, width = 2 } },
+    },
+    { op = 2, args = {} },
+  })
+  Assert.equal(moveSteps[1].op, "move_warp_event")
+  Assert.equal(countVariableReferences(moveSteps[1]), 3, "the warp index and its new cell are script variables")
+  Assert.isTrue(moveReport.complete)
+  validateSteps("test.source_342", moveSteps)
+end
+
+-- ScrCmd_Warp reads map, the unused halfword, x, y, and direction through
+-- ScriptGetVar into CallTask_ScriptWarp. The direction is therefore one value
+-- read: a literal code is the cardinal it names, while a script variable stays
+-- a value reference the runtime decodes from the code the variable holds.
+T["script warp lowers its direction as a script-read direction operand"] = function()
+  Assert.equal(CommandCatalog.classification(176), CommandCatalog.NATIVE_WAIT, "Warp blocks until the transition ends")
+
+  local _, literalSteps, literalReport = translateOnly({
+    {
+      op = 176,
+      args = {
+        { value = 5, width = 2 },
+        { value = 0, width = 2 },
+        { value = 60, width = 2 },
+        { value = 1, width = 2 },
+        { value = 3, width = 2 },
+      },
+    },
+    { op = 2, args = {} },
+  })
+  Assert.equal(literalSteps[1].op, "warp")
+  Assert.equal(literalSteps[1].facing, "east", "a literal direction code lowers to its cardinal")
+  Assert.equal(countVariableReferences(literalSteps[1]), 0, "immediate operands read no script variable")
+  Assert.isTrue(literalReport.complete, "an immediate warp is a complete translation")
+  validateSteps("test.source_176_literal", literalSteps)
+
+  -- The retail corpus shape: the direction is the special-result variable, so
+  -- the step keeps the reference instead of naming the variable a direction.
+  local _, variableSteps, variableReport = translateOnly({
+    {
+      op = 176,
+      args = {
+        { value = 0x8008, width = 2 },
+        { value = 0, width = 2 },
+        { value = 0x8009, width = 2 },
+        { value = 0x800A, width = 2 },
+        { value = 0x800C, width = 2 },
+      },
+    },
+    { op = 2, args = {} },
+  })
+  Assert.deepEqual(
+    variableSteps[1].facing,
+    { value = "var", id = "VAR_SPECIAL_RESULT" },
+    "a variable direction stays a value reference"
+  )
+  Assert.equal(countVariableReferences(variableSteps[1]), 4, "map, x, z and the direction are script variables")
+  Assert.isTrue(variableReport.complete, "a variable warp is a complete translation")
+  validateSteps("test.source_176_variable", variableSteps)
+
+  -- A code outside the pinned table fails with the rejected source code named.
+  local unknownDirection = Assert.throws(function()
+    translateOnly({
+      {
+        op = 176,
+        args = {
+          { value = 5, width = 2 },
+          { value = 0, width = 2 },
+          { value = 60, width = 2 },
+          { value = 1, width = 2 },
+          { value = 7, width = 2 },
+        },
+      },
+      { op = 2, args = {} },
+    })
+  end)
+  Assert.isTrue(
+    tostring(unknownDirection):find("unknown direction code 7", 1, true) ~= nil,
+    "an unknown direction code names the source operand it rejected"
+  )
+end
+
+T["floor window, elevator animation and clock commands keep source timing"] = function()
+  Assert.equal(CommandCatalog.classification(242), CommandCatalog.CONTINUE, "the floor window does not wait")
+  Assert.equal(
+    CommandCatalog.classification(488),
+    CommandCatalog.NATIVE_WAIT,
+    "the elevator animation blocks the script"
+  )
+  Assert.equal(CommandCatalog.classification(522), CommandCatalog.CONTINUE, "the clock answer is same tick")
+
+  local _, floorWindowSteps, floorWindowReport = translateOnly({
+    {
+      op = 242,
+      args = {
+        { value = 5, width = 1 },
+        { value = 6, width = 1 },
+        { value = 0x8008, width = 2 },
+        { value = 0x8009, width = 2 },
+      },
+    },
+    { op = 2, args = {} },
+  })
+  Assert.equal(floorWindowSteps[1].op, "floor_window_show")
+  Assert.equal(floorWindowSteps[1].tileX, 5, "the window tile x is a source byte")
+  Assert.equal(floorWindowSteps[1].tileY, 6, "the window tile y is a source byte")
+  Assert.equal(countVariableReferences(floorWindowSteps[1]), 2, "the result pointer and the floor are script variables")
+  Assert.isTrue(floorWindowReport.complete)
+  validateSteps("test.source_242", floorWindowSteps)
+
+  local _, elevatorSteps, elevatorReport = translateOnly({
+    { op = 488, args = { { value = 0x8008, width = 2 }, { value = 0x8009, width = 2 } } },
+    { op = 2, args = {} },
+  })
+  Assert.equal(elevatorSteps[1].op, "elevator_anim")
+  Assert.equal(countVariableReferences(elevatorSteps[1]), 2, "direction and length are script variables")
+  Assert.isTrue(elevatorReport.complete)
+  validateSteps("test.source_488", elevatorSteps)
+
+  local _, clockSteps, clockReport = translateOnly({
+    { op = 522, args = { { value = 0x8008, width = 2 } } },
+    { op = 2, args = {} },
+  })
+  Assert.equal(clockSteps[1].op, "field_clock_hour")
+  Assert.equal(countVariableReferences(clockSteps[1]), 1, "the hour is written to the result variable")
+  Assert.isTrue(clockReport.complete)
+  validateSteps("test.source_522", clockSteps)
+end
+
+T["the source overlay command lowers to an inert step with its provenance"] = function()
+  Assert.equal(
+    CommandCatalog.classification(784),
+    CommandCatalog.CONTINUE,
+    "the overlay command returns in its own tick"
+  )
+
+  local _, steps, report = translateOnly({
+    { op = 784, args = { { value = 5, width = 1 }, { value = 0, width = 1 } } },
+    { op = 30, args = { { value = 0x6A, width = 2 } } },
+    { op = 2, args = {} },
+  })
+  Assert.equal(steps[1].op, "noop", "the DS-only overlay load has no gameplay effect to run")
+  Assert.deepEqual(
+    steps[1].provenance,
+    { offsets = { 0x20 }, opcodes = { 784 } },
+    "the source command stays attributed"
+  )
+  Assert.equal(steps[2].op, "set_flag", "the following source command keeps its own position")
+  Assert.deepEqual(steps[2].provenance, { offsets = { 0x24 }, opcodes = { 30 } })
+  Assert.isTrue(report.complete, "an inert source command still completes its script")
+  Assert.equal(report.unsupportedCount, 0)
+  validateSteps("test.source_784", steps)
+
+  -- An unload action and a selector outside the source overlay table are the
+  -- same same-tick no-effect, never a runtime overlay operation.
+  for _, overlay in ipairs({ { 2, 1 }, { 4, 0 }, { 5, 0 } }) do
+    local _, unloadSteps, unloadReport = translateOnly({
+      { op = 784, args = { { value = overlay[1], width = 1 }, { value = overlay[2], width = 1 } } },
+      { op = 30, args = { { value = 0x6A, width = 2 } } },
+      { op = 2, args = {} },
+    })
+    Assert.equal(unloadSteps[1].op, "noop", "overlay selector " .. overlay[1] .. " is inert")
+    Assert.deepEqual(unloadSteps[1].provenance, { offsets = { 0x20 }, opcodes = { 784 } })
+    Assert.isTrue(unloadReport.complete)
+  end
+end
+
+-- ScrCmd_BufferDeptStoreFloorNo reads both operands as source bytes and
+-- buffers the storey label the floor box substitutes: the slot is the first
+-- byte and the floor the second, with no script-variable read between them
+-- (src/scrcmd_lottery.c -> src/message_format.c::BufferDeptStoreFloorNo).
+T["the department store floor buffer lowers its byte operands into buffered text"] = function()
+  local _, steps, report = translateOnly({
+    { op = 852, args = { { value = 0, width = 1 }, { value = 4, width = 1 } } },
+    { op = 2, args = {} },
+  })
+  Assert.equal(steps[1].op, "buffer_text", "the source buffer writes one message slot")
+  Assert.equal(steps[1].slot, 0, "the slot is the first source byte")
+  Assert.deepEqual(steps[1].value, { text = "dept_store_floor_no", floor = 4 }, "the floor is the second source byte")
+  Assert.deepEqual(steps[1].provenance, { offsets = { 0x20 }, opcodes = { 852 } })
+  Assert.equal(countVariableReferences(steps[1]), 0, "both operands are immediate source bytes")
+  Assert.isTrue(report.complete, "a buffered floor label is a complete translation")
+  Assert.equal(report.unsupportedCount, 0)
+  validateSteps("test.source_852", steps)
 end
 
 return { tests = T }

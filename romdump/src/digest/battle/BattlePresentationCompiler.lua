@@ -50,6 +50,7 @@ local BattlePresentationCompiler = {}
 ---@field resourcePayloads table<string, table<string, unknown>> decoded payloads keyed by cache-relative path; build-only
 ---@field provenance table<string, unknown> producer-only physical source selections
 ---@field requiredContext table<string, string|number|boolean> typed context parameters
+---@field displayPolicy table<string, boolean> immutable root display policy
 
 ---@class BattlePresentationCompiler.PictureMotionHeader per-species send-out motion header
 ---@field program integer motion program identity
@@ -1363,7 +1364,7 @@ local function compileMenuTextSets()
     ["keep-forget"] = { entries = { "label/keep-move", "label/forget-move" }, routes = {}, fonts = { "menu" } },
     ["give-up"] = { entries = {}, routes = { "menu/give-up-move" }, fonts = { "menu" } },
     ["switch-or-flee"] = {
-      entries = { "label/switch", "label/flee", "label/switch-flee" },
+      entries = { "label/switch", "label/use-next-mon", "label/flee" },
       routes = {},
       fonts = { "menu" },
     },
@@ -2795,17 +2796,53 @@ end
 local function compileTextPalettes(romFs)
   local textPalettes = {}
   for role, source in pairs(Sources.TEXT_PALETTES) do
-    local archive = openArchive(romFs, source.narc, role .. " text palette")
-    local decoded = decodePalette(archive, source.member, role .. " text palette")
+    -- A banked role mirrors the hardware palette file exactly (see
+    -- TEXT_PALETTES.party): the screen member supplies all sixteen
+    -- SUB_BG banks while one bank is overwritten with the font member
+    -- the loader places there, so each window template palette resolves
+    -- its ink through its own bank.
+    local baseSource = source.base --[[@as table<string, unknown>?]]
+    local bankNarc = source.narc
+    local bankMember = source.member
+    if type(baseSource) == "table" then
+      bankNarc = assert(baseSource.narc, role .. " text palette base names its archive")
+      bankMember = assert(baseSource.member, role .. " text palette base names its member")
+    end
+    local archive = openArchive(romFs, bankNarc, role .. " text palette")
+    local decoded = decodePalette(archive, bankMember, role .. " text palette")
     local colors = {}
     for index = 1, source.banks * 16 do
       local color = decoded.colors[index]
       assert(color ~= nil, role .. " text palette carries its source banks")
       colors[index] = { r = color.r, g = color.g, b = color.b }
     end
+    -- A font-bank role transcribes the loader's bank overwrite exactly
+    -- (see TEXT_PALETTES.party): the named bank is replaced with the
+    -- font member before the patch below lands the loader's slot edit.
+    local fontBank = source.fontBank --[[@as table<string, unknown>?]]
+    if type(fontBank) == "table" then
+      local bank = assert(fontBank.bank, role .. " text palette font bank names its bank")
+      assert(
+        type(bank) == "number" and bank % 1 == 0 and bank >= 0 and bank < source.banks,
+        role .. " text palette font bank stays inside its staged banks"
+      )
+      local fontArchive = openArchive(
+        romFs,
+        assert(fontBank.narc, role .. " text palette font bank names its archive"),
+        role .. " text palette font bank"
+      )
+      local fontMember = assert(fontBank.member, role .. " text palette font bank names its member")
+      local fontDecoded = decodePalette(fontArchive, fontMember, role .. " text palette font bank")
+      for slot = 0, 15 do
+        local color = assert(fontDecoded.colors[slot + 1], role .. " text palette font bank carries its sixteen colors")
+        colors[bank * 16 + slot + 1] = { r = color.r, g = color.g, b = color.b }
+      end
+    end
     -- A patched role transcribes the loader's bank edit exactly (see
     -- TEXT_PALETTES.party): the named source slots replace the base
     -- font slots, keeping the staged bank pixel-identical to runtime.
+    -- A font-bank role patches inside its overwritten bank; other roles
+    -- patch the staged base directly.
     if type(source.patch) == "table" then
       local patchSource = source.patch --[[@as table<string, unknown>]]
       local patchArchive = openArchive(
@@ -2816,14 +2853,18 @@ local function compileTextPalettes(romFs)
       local patchMember = assert(patchSource.member, role .. " text palette patch names its member")
       local patched = decodePalette(patchArchive, patchMember, role .. " text palette patch")
       local slots = assert(patchSource.slots, role .. " text palette patch names its slots")
+      local patchBank = 0
+      if type(source.fontBank) == "table" then
+        patchBank = assert(source.fontBank.bank, role .. " text palette patch lands in its font bank") --[[@as integer]]
+      end
       for slot, sourceIndex in pairs(slots) do
         assert(
-          type(slot) == "number" and slot % 1 == 0 and slot >= 0 and slot < source.banks * 16,
-          role .. " text palette patch stays inside its staged banks"
+          type(slot) == "number" and slot % 1 == 0 and slot >= 0 and slot < 16,
+          role .. " text palette patch stays inside its sixteen-color bank"
         )
         local replacement =
           assert(patched.colors[sourceIndex + 1], role .. " text palette patch carries its source color")
-        colors[slot + 1] = { r = replacement.r, g = replacement.g, b = replacement.b }
+        colors[patchBank * 16 + slot + 1] = { r = replacement.r, g = replacement.g, b = replacement.b }
       end
     end
     textPalettes[role] = { colors = colors }
@@ -3353,12 +3394,19 @@ local function compileBallParticleSet(archive, memberId, emitterCount, itemKey, 
   end
   local textures = {}
   for _, texture in ipairs(compiled.particles.textures) do
-    textures[#textures + 1] = { id = texture.id, width = texture.width, height = texture.height, image = texture.image }
+    textures[#textures + 1] = {
+      id = texture.id,
+      width = texture.width,
+      height = texture.height,
+      image = texture.image,
+      sampler = texture.sampler,
+      alphaUsage = texture.alphaUsage,
+    }
   end
   for path, png in pairs(compiled.files) do
     pngs[path] = png
   end
-  return { seed = compiled.particles.seed, emitters = compiled.particles.emitters, textures = textures }
+  return { emitters = compiled.particles.emitters, textures = textures }
 end
 
 -- Compiles exactly one ball selector: its frame rasters plus the
@@ -3449,6 +3497,7 @@ function BattlePresentationCompiler.compileBallForSelector(romFs, opts, selector
       image = imagePath,
       width = raster.width,
       height = raster.height,
+      durationTicks = animation.frames[sourceFrameIndex].duration,
       sourceIndices = {
         format = "source-index-rgba8",
         plane = "mainObj",
@@ -3459,16 +3508,75 @@ function BattlePresentationCompiler.compileBallForSelector(romFs, opts, selector
     }
   end
   assert(#frames > 0, "ball animation exposes at least one rendered frame for ball " .. tostring(ballId))
-  local entry =
-    { frames = frames, fadeColor = fadeColors[ballId], paletteSource = { words = paletteWords(paletteData) } }
+  -- The source opening animation (NANR sequence 1) plays when the ball
+  -- lands: BallThrow_RunThrowArc switches the sprite to it, then ticks its
+  -- cells by their source durations while the white flash and the seal
+  -- run. Stage every cell with its duration so the runtime advances the
+  -- open beat from source data.
+  local sourceOpening = assert(animationData.anims[2], label .. " has its opening animation")
+  assert(#sourceOpening.frames > 0, label .. " opening animation exposes its cells")
+  local openingFrames = {}
+  for sourceFrameIndex = 1, #sourceOpening.frames do
+    local raster =
+      G2dRasterizer.renderAnimationFrame(charData, paletteData, cellData, sourceOpening, sourceFrameIndex, {
+        asset = "battle-balls",
+        member = resource.animationMember,
+        role = label .. " opening",
+        frame = sourceFrameIndex - 1,
+      }, nil, mapping)
+    local sourceIndexRaster =
+      G2dRasterizer.renderAnimationFrame(charData, sourceIndexPalette, cellData, sourceOpening, sourceFrameIndex, {
+        asset = "battle-balls",
+        member = resource.animationMember,
+        role = label .. " opening source indices",
+        frame = sourceFrameIndex - 1,
+      }, nil, mapping)
+    assert(
+      sourceIndexRaster.width == raster.width and sourceIndexRaster.height == raster.height,
+      label .. " opening source-index raster matches its color raster"
+    )
+    local frameIndex = sourceFrameIndex - 1
+    local imagePath = BattlePresentationCache.assetDir() .. "/balls/" .. itemKey .. "-open-" .. frameIndex .. ".png"
+    local variants = sourceIndexSlotVariants(
+      "battle-ball-open-" .. itemKey .. "-" .. frameIndex,
+      sourceIndexRaster.pixels,
+      Sources.MAIN_OBJ_PALETTE_BASE.contextualBall,
+      { 48, 64, 80, 96 },
+      rawFiles
+    )
+    images[imagePath] = raster
+    openingFrames[#openingFrames + 1] = {
+      drawableKey = "battle-ball-open:" .. itemKey .. ":" .. frameIndex,
+      image = imagePath,
+      width = raster.width,
+      height = raster.height,
+      durationTicks = sourceOpening.frames[sourceFrameIndex].duration,
+      sourceIndices = {
+        format = "source-index-rgba8",
+        plane = "mainObj",
+        width = sourceIndexRaster.width,
+        height = sourceIndexRaster.height,
+        variants = variants,
+      },
+    }
+  end
+  local entry = {
+    frames = frames,
+    opening = {
+      playMode = sourceOpening.playMode,
+      loopStartFrameIdx = sourceOpening.loopStartFrameIdx,
+      frames = openingFrames,
+    },
+    fadeColor = fadeColors[ballId],
+    paletteSource = { words = paletteWords(paletteData) },
+  }
   local particlePngs = {}
   local particleSource = assert(particleSources.entries[itemKey], "every ball sprite has its particle sources")
   if particleSources.unrepresented[itemKey] == nil then
     -- BallThrow_CaptureStateOpen starts the burst once the opening
     -- animation (sequence 1) reaches its third frame, one task step after
     -- the first two frames' durations elapsed.
-    local opening = assert(animationData.anims[2], label .. " has its opening animation")
-    assert(#opening.frames >= 3, label .. " opening animation reaches its third frame")
+    assert(#sourceOpening.frames >= 3, label .. " opening animation reaches its third frame")
     entry.particles = {
       seal = compileBallParticleSet(
         particleArchive,
@@ -3487,7 +3595,7 @@ function BattlePresentationCompiler.compileBallForSelector(romFs, opts, selector
         particlePngs
       ),
       clickEmitter = particleSource.burstClickEmitter,
-      burstStartTick = opening.frames[1].duration + opening.frames[2].duration + 1,
+      burstStartTick = sourceOpening.frames[1].duration + sourceOpening.frames[2].duration + 1,
     }
   end
   local metadata = romFs:metadata()
@@ -3968,6 +4076,272 @@ function BattlePresentationCompiler.compileBagScreens(romFs, stageSlice)
   }
 end
 
+-- Crops one decoded party screen to its visible 256x192 sub-screen view.
+-- LoadPageTilemaps loads each page pair to the SUB_BG layers whose
+-- visible region is the top-left 32x24 tiles.
+---@param screenData { width: integer, height: integer, entries: table[] } decoded party screen
+---@param label string diagnostic label
+---@return { width: integer, height: integer, entries: table[] } visible view
+local function cropPartyLayer(screenData, label)
+  local columns = screenData.width / 8
+  assert(columns == 32, label .. " keeps the 32-tile tilemap stride")
+  assert(screenData.height / 8 >= 24, label .. " keeps its 24 visible tile rows")
+  local entries = {}
+  for row = 0, 23 do
+    for col = 0, 31 do
+      entries[#entries + 1] = assert(screenData.entries[row * columns + col + 1], label .. " keeps its visible entries")
+    end
+  end
+  return { width = 256, height = 192, entries = entries }
+end
+
+---@param button integer BattlePartyButton order
+---@return table<string, unknown> button face family owning the button
+local function partyFaceFamily(button)
+  for _, family in pairs(Sources.PARTY_BUTTON_FACES.families) do
+    for _, member in ipairs(family.buttons) do
+      if member == button then
+        return family
+      end
+    end
+  end
+  return assert(nil, "every staged party button belongs to a face family")
+end
+
+-- Renders one party button face: the atlas rect cut of one frame (the
+-- partner variant for mon buttons) through the staged screen palette.
+-- The egg/fainted/partner/new-move palette overrides in
+-- BuildButtonTilemap stay runtime-applied.
+---@param charData { depth: integer, tiles: string } decoded shared characters
+---@param paletteData { colors: table[] } decoded shared screen palette
+---@param atlases { small: { width: integer, height: integer, entries: table[] }, large: { width: integer, height: integer, entries: table[] } } decoded button atlases by family atlas
+---@param family table<string, unknown> face family owning the button
+---@param frame integer zero-based staged frame
+---@param variant string "self" or "partner"
+---@return { width: integer, height: integer, pixels: string } face raster
+local function renderPartyFace(charData, paletteData, atlases, family, frame, variant)
+  local atlasName = assert(family.atlas, "party face families name their atlas")
+  local atlasScreen = assert(atlases[atlasName], "party face atlases cover every family")
+  local columns = atlasScreen.width / 8
+  assert(columns == 32, "the party button atlas spans the 32-tile tilemap stride")
+  local origin
+  if variant == "partner" and family.partnerFrames ~= nil then
+    origin = assert(family.partnerFrames[frame + 1], "the mon family carries its partner frame")
+  else
+    assert(variant == "self", "only mon buttons carry a partner variant")
+    origin = assert(family.frames[frame + 1], "party face families carry their frame")
+  end
+  local width = assert(family.w, "party face families carry their width")
+  local height = assert(family.h, "party face families carry their height")
+  local entries = {}
+  for tileY = 0, height - 1 do
+    for tileX = 0, width - 1 do
+      local source = assert(
+        atlasScreen.entries[(origin.y + tileY) * columns + (origin.x + tileX) + 1],
+        "party button atlas rects stay inside the tilemap"
+      )
+      entries[#entries + 1] = {
+        tile = source.tile,
+        flipH = source.flipH,
+        flipV = source.flipV,
+        palette = source.palette,
+      }
+    end
+  end
+  return G2dRasterizer.renderScreen(charData, paletteData, {
+    width = width * 8,
+    height = height * 8,
+    entries = entries,
+  }, {
+    asset = Sources.PARTY_SCREEN.archive,
+    role = "Battle party button face",
+  })
+end
+
+---@param key string semantic party page key
+---@return string page slug after "party:page/"
+local function partyPageSlug(key)
+  local slug = string.match(key, "^party:page/(.+)$")
+  return assert(slug, "party pages stage under party:page/ keys: " .. tostring(key))
+end
+
+-- Compiles the retail battle-party screen (battle_party_menu.c
+-- BattlePartyMenu_LoadBgGraphics): the NARC_a_0_7_1 character, page
+-- screen, button-tilemap screen, and palette members plus the transcribed
+-- window templates, touchscreen hitboxes, button rects, and cursor boxes.
+-- Returns decoded records with the rasterized page layers; staging into
+-- the global manifest rides the page slice pattern when the renderer
+-- consumes it.
+---@param romFs RomFs
+---@param opts { versionId: string }? compile options
+---@return table<string, unknown> compiled battle-party screen records
+function BattlePresentationCompiler.compilePartyScreen(romFs, opts)
+  opts = opts or {}
+  local versionId = opts.versionId or romFs:version()
+  checkVersion(versionId)
+  local source = Sources.PARTY_SCREEN
+  local archive = openArchive(romFs, source.archive, "battle party screen")
+  local label = "battle party screen"
+  local charData = decodeChars(archive, source.character, label .. " characters")
+  local paletteData = decodePalette(archive, source.palette, label .. " screen palette")
+  checkColorCount(paletteData, 256, "Battle party screen palette")
+  local smallAtlas = decodeScreen(archive, source.buttonSmallScreen, label .. " small button atlas")
+  local largeAtlas = decodeScreen(archive, source.buttonLargeScreen, label .. " large button atlas")
+  local pages = {}
+  for _, page in ipairs(source.pages) do
+    local members = {}
+    local layers = {}
+    for _, member in ipairs(page.screens) do
+      local screenData = decodeScreen(archive, member, label .. " " .. page.key)
+      local view = cropPartyLayer(screenData, "Battle party " .. page.key)
+      local raster = G2dRasterizer.renderScreen(charData, paletteData, view, {
+        asset = source.archive,
+        role = "Battle party page",
+      })
+      members[#members + 1] = member
+      layers[#layers + 1] = {
+        member = member,
+        width = raster.width,
+        height = raster.height,
+        pixels = raster.pixels,
+      }
+    end
+    pages[#pages + 1] = { key = page.key, screens = members, layers = layers }
+  end
+  return {
+    characterMember = source.character,
+    paletteMember = source.palette,
+    buttonSmallMember = source.buttonSmallScreen,
+    buttonLargeMember = source.buttonLargeScreen,
+    smallAtlasWidth = smallAtlas.width,
+    smallAtlasHeight = smallAtlas.height,
+    largeAtlasWidth = largeAtlas.width,
+    largeAtlasHeight = largeAtlas.height,
+    pages = pages,
+    windows = Sources.PARTY_WINDOWS,
+    hitboxes = Sources.PARTY_HITBOXES,
+    buttonRects = Sources.PARTY_BUTTON_RECTS,
+    cursorBoxes = Sources.PARTY_CURSOR_BOXES,
+    spritePositions = Sources.PARTY_SPRITE_POSITIONS,
+    provenance = {
+      archive = source.archive,
+    },
+  }
+end
+
+-- Compiles the retail battle-party screen for the global bundle (shared
+-- with compilePartyScreen's leaf path): the NARC_a_0_7_1 character,
+-- page screen, button-tilemap screen, and palette members plus the
+-- transcribed window templates, touchscreen hitboxes, button rects,
+-- cursor boxes, and sprite icon positions. Each page pair loads to SUB_BG layers 6 and 7 per
+-- LoadPageTilemaps; each staged layer crops its visible 256x192
+-- sub-screen view from the decoded screen for the renderer to composite.
+-- Returns the manifest section plus its archive provenance entry.
+---@param romFs RomFs
+---@param stageSlice fun(name: string, pixels: string, width: integer, height: integer)
+---@return table<string, unknown> partyScreens manifest section
+---@return table<string, unknown> partyProvenance archive provenance entry
+function BattlePresentationCompiler.compilePartyScreens(romFs, stageSlice)
+  local partySource = Sources.PARTY_SCREEN
+  local partyArchive = openArchive(romFs, partySource.archive, "battle party screen")
+  local partyChars = decodeChars(partyArchive, partySource.character, "battle party screen characters")
+  local partyPalette = decodePalette(partyArchive, partySource.palette, "battle party screen palette")
+  checkColorCount(partyPalette, 256, "Battle party screen palette")
+  local atlases = {
+    small = decodeScreen(partyArchive, partySource.buttonSmallScreen, "battle party small button atlas"),
+    large = decodeScreen(partyArchive, partySource.buttonLargeScreen, "battle party large button atlas"),
+  }
+  local partyPages = {}
+  for _, page in ipairs(partySource.pages) do
+    local slug = partyPageSlug(page.key)
+    local layers = {}
+    for layerIndex, member in ipairs(page.screens) do
+      local screenData = decodeScreen(partyArchive, member, "battle party screen " .. page.key)
+      local view = cropPartyLayer(screenData, "Battle party " .. page.key)
+      local raster = G2dRasterizer.renderScreen(partyChars, partyPalette, view, {
+        asset = partySource.archive,
+        role = "Battle party page",
+      })
+      local name = "party-page-" .. slug .. "-" .. layerIndex
+      stageSlice(name, raster.pixels, raster.width, raster.height)
+      layers[layerIndex] = {
+        image = BattlePresentationCache.globalImagePath(name),
+        x = 0,
+        y = 0,
+        width = raster.width,
+        height = raster.height,
+      }
+    end
+    partyPages[#partyPages + 1] = { key = page.key, layers = layers }
+  end
+  -- Battle-party experience-bar tiles (battle_party_menu.c
+  -- DrawExpBar/SetExpBarTile): the eight track cells at tiles (10..17,
+  -- 8) repaint through tiles 0x16-0x1E of the shared characters, keeping
+  -- the track cells' palette bank. Level p (0-7) is tile 0x16 + p, the
+  -- full cell is tile 0x1E; each staged 8x8 image reproduces its tile
+  -- exactly (grey borders, blue fill, cream remainder).
+  local partyExpTiles = {}
+  for level = 0, 8 do
+    local tile = level >= 8 and 0x1E or 0x16 + level
+    local expRaster = G2dRasterizer.renderScreen(partyChars, partyPalette, {
+      width = 8,
+      height = 8,
+      entries = { { tile = tile, palette = 5 } },
+    }, {
+      asset = partySource.archive,
+      role = "Battle party exp tile",
+    })
+    local expName = "party-exp-" .. tostring(level)
+    stageSlice(expName, expRaster.pixels, expRaster.width, expRaster.height)
+    partyExpTiles[#partyExpTiles + 1] = {
+      level = level,
+      image = BattlePresentationCache.globalImagePath(expName),
+    }
+  end
+  -- Battle-party button faces (StoreButtonTilemaps/StoreLargeButtonTilemaps
+  -- atlas rects through the staged screen palette): press frames repaint
+  -- the pressed button, disabled frames repaint empty controls. Rest
+  -- frames ride the staged page raster; only the staged inventory below
+  -- repaints. Partner mon buttons render their x + 16 atlas variant.
+  local faceSource = Sources.PARTY_BUTTON_FACES
+  local partyFaces = {}
+  for _, staged in ipairs(faceSource.staged) do
+    local family = partyFaceFamily(staged.button)
+    for _, frame in ipairs(staged.frames) do
+      for _, variant in ipairs(staged.variants) do
+        local faceRaster = renderPartyFace(partyChars, partyPalette, atlases, family, frame, variant)
+        local suffix = variant == "partner" and "p" or ""
+        local faceName = "party-button-" .. staged.button .. "-" .. frame .. suffix
+        stageSlice(faceName, faceRaster.pixels, faceRaster.width, faceRaster.height)
+        partyFaces[#partyFaces + 1] = {
+          button = staged.button,
+          frame = frame,
+          variant = variant,
+          image = BattlePresentationCache.globalImagePath(faceName),
+        }
+      end
+    end
+  end
+  return {
+    pages = partyPages,
+    windows = Sources.PARTY_WINDOWS,
+    hitboxes = Sources.PARTY_HITBOXES,
+    buttonRects = Sources.PARTY_BUTTON_RECTS,
+    cursorBoxes = Sources.PARTY_CURSOR_BOXES,
+    spritePositions = Sources.PARTY_SPRITE_POSITIONS,
+    buttons = partyFaces,
+    expTiles = partyExpTiles,
+  }, {
+    archive = partySource.archive,
+    character = partySource.character,
+    palette = partySource.palette,
+    buttonSmallScreen = partySource.buttonSmallScreen,
+    buttonLargeScreen = partySource.buttonLargeScreen,
+    pages = partySource.pages,
+    buttonFaces = Sources.PARTY_BUTTON_FACES,
+  }
+end
+
 -- Stages one compiled ball leaf through a worker artifact: the
 -- schema-valid record, exactly its owned frame and particle images, and
 -- the completion marker. Returns the marker.
@@ -4086,10 +4460,11 @@ function BattlePresentationCompiler.compileEvolutionParticles(romFs)
       width = texture.width,
       height = texture.height,
       image = texture.image,
+      sampler = texture.sampler,
+      alphaUsage = texture.alphaUsage,
     }
   end
   return {
-    seed = compiled.particles.seed,
     emitters = compiled.particles.emitters,
     textures = textures,
   },
@@ -5049,6 +5424,12 @@ function BattlePresentationCompiler.compileGlobal(romFs, opts)
     -- transcribed overlay-8 tables for the renderer to composite.
     local bagScreens, bagProvenanceEntry = BattlePresentationCompiler.compileBagScreens(romFs, stageSlice)
 
+    -- Retail battle-party screen (battle_party_menu.c
+    -- BattlePartyMenu_LoadBgGraphics): staged page slices plus the
+    -- transcribed window/hitbox/button-rect/cursor-box tables and the
+    -- button face inventory for the renderer to composite.
+    local partyScreens, partyProvenanceEntry = BattlePresentationCompiler.compilePartyScreens(romFs, stageSlice)
+
     local pictureAttributes, pictureSelectors = compilePictureAttributes(romFs)
     local pictureMotionSpecies, pictureMotionPrograms = BattlePresentationCompiler.stagePictureMotions(romFs)
 
@@ -5204,6 +5585,7 @@ function BattlePresentationCompiler.compileGlobal(romFs, opts)
         contexts = menuContexts,
       },
       bag = bagScreens,
+      party = partyScreens,
       messages = {
         roles = {
           narration = { font = narrationFont, palette = textPalettes.narration },
@@ -5307,6 +5689,7 @@ function BattlePresentationCompiler.compileGlobal(romFs, opts)
       menuLayouts = menuLayoutProvenance,
       menuLayerIndices = menuLayerIndices,
       bag = bagProvenanceEntry,
+      party = partyProvenanceEntry,
       hudComponents = {
         source = Sources.HUD_COMPONENTS.source,
         contentIdentity = Hashing.sha1hex(componentBytes),
@@ -5475,12 +5858,17 @@ local function compileEncounterParticles(romFs, sceneKey, terrain)
     end
     local textures = {}
     for _, texture in ipairs(compiled.particles.textures) do
-      textures[#textures + 1] =
-        { id = texture.id, width = texture.width, height = texture.height, image = texture.image }
+      textures[#textures + 1] = {
+        id = texture.id,
+        width = texture.width,
+        height = texture.height,
+        image = texture.image,
+        sampler = texture.sampler,
+        alphaUsage = texture.alphaUsage,
+      }
     end
     sets[setIndex] = {
       startTick = BattlePresentationSchema.ENCOUNTER_START_TICKS[setIndex],
-      seed = compiled.particles.seed,
       emitters = compiled.particles.emitters,
       textures = textures,
     }
@@ -6095,7 +6483,7 @@ end
 ---@field managedSpriteCapacities table<integer, { multiCell: boolean, multiAnimation: boolean }>
 ---@field pendingCharacterRasters table<string, table<string, unknown>>
 ---@field particleByBattler table<integer, string>
----@field decodedParticleResources table<string, { bytes: string, compiled: table<string, unknown>|nil, unsupported: string|nil, source: table<string, unknown> }>
+---@field decodedParticleResources table<string, { bytes: string, compiled: table<string, unknown>, source: table<string, unknown> }>
 
 ---@param state BattleEffectStaging
 ---@param role string source input role
@@ -6213,21 +6601,26 @@ local function resolveManagerDisposal(state, role, operands)
   return {}
 end
 
--- Reads and decodes one battler particle archive member, failing as an
--- unavailable source when the member is absent.
 -- Compiles one particle member into emitter records plus its textures staged
--- as raw RGBA keyed by their semantic texture resource key.
+-- as raw RGBA keyed by their semantic texture resource key. Source-undefined
+-- vocabulary fails at compile with source context through the existing
+-- malformed-boundary errors: the corpus gate proves no valid reviewed
+-- feature needs a staged marker, so none is produced.
+---@param state BattleEffectStaging
 ---@param bytes string raw SPL member bytes
----@return table<string, unknown>|nil compiled particle set and staged texture files
----@return string|nil unsupported cause when the member uses vocabulary the replay does not reproduce
-local function compileParticleMember(bytes)
+---@param source { archiveSymbol: string, memberId: integer } selected particle source
+---@return table<string, unknown> compiled particle set
+local function compileParticleMember(state, bytes, source)
   local compiled, compileErr = SplEmitterCompiler.compile(bytes, { embedPixels = true })
   if compiled == nil then
-    -- The member stays staged as an explicit unsupported marker: the effect
-    -- still closes, and the runtime fails the occurrence loudly where it
-    -- would load the system instead of replaying invented motion. The
-    -- members this producer pins as supported never reach this branch.
-    return nil, tostring(compileErr)
+    error(
+      Errors.new("BATTLE_EFFECT_SOURCE_UNRESOLVED", "particle member uses vocabulary the replay does not reproduce", {
+        effectKey = state.effectKey,
+        provenance = { archiveSymbol = source.archiveSymbol, memberId = source.memberId },
+        cause = tostring(compileErr),
+      }),
+      0
+    )
   end
   return compiled
 end
@@ -6311,14 +6704,158 @@ local function readEmitterAxisTable(state, source)
   return axes
 end
 
+-- Reads one overlay table the configured emitter callbacks index. The
+-- reader mirrors the native table layout exactly: signed 16-bit pixel
+-- steps, signed 32-bit words, signed fx32 XY pairs, and unsigned 16-bit
+-- camera angle triples.
+---@param state BattleEffectStaging
+---@param source table<string, unknown> overlay table description
+---@param entryBytes integer entry width in bytes
+---@param count integer entry count under reading
+---@return integer[] signed table entries in source order
+local function readSignedWords(state, source, entryBytes, count)
+  local bytes, info = state.romFs:readOverlay(source.cpu, source.overlayId)
+  if bytes == nil then
+    error(info, 0)
+  end
+  assert(info ~= nil, "overlay reads describe their image")
+  local base = source.address - info.ramAddress --[[@as integer]]
+  local size = count * entryBytes
+  if base < 0 or base + size > #bytes then
+    error(Errors.new("BATTLE_SOURCE_UNEXPECTED", "emitter table lies outside its overlay", {}), 0)
+  end
+  local entries = {}
+  for index = 0, count - 1 do
+    local at = base + index * entryBytes
+    local value = 0
+    local mult = 1
+    for byte = 0, entryBytes - 1 do
+      value = value + string.byte(bytes, at + byte + 1) * mult
+      mult = mult * 256
+    end
+    if value >= 2 ^ (entryBytes * 8 - 1) then
+      value = value - 2 ^ (entryBytes * 8)
+    end
+    entries[index + 1] = value
+  end
+  return entries
+end
+
+---@param state BattleEffectStaging
+---@param source table<string, unknown> overlay table description
+---@return table<string, integer>[] unsigned XYZ angle triples in source order
+local function readCameraAngles(state, source)
+  local bytes, info = state.romFs:readOverlay(source.cpu, source.overlayId)
+  if bytes == nil then
+    error(info, 0)
+  end
+  assert(info ~= nil, "overlay reads describe their image")
+  local base = source.address - info.ramAddress --[[@as integer]]
+  local count = source.tripleCount
+  assert(type(count) == "number" and count % 1 == 0 and count >= 1, "camera tables declare their triple count")
+  if base < 0 or base + count * 6 > #bytes then
+    error(Errors.new("BATTLE_SOURCE_UNEXPECTED", "emitter table lies outside its overlay", {}), 0)
+  end
+  local triples = {}
+  for index = 0, count - 1 do
+    local at = base + index * 6
+    local low1, low2, low3, low4, low5, low6 = string.byte(bytes, at + 1, at + 6)
+    triples[index + 1] = { x = low1 + low2 * 256, y = low3 + low4 * 256, z = low5 + low6 * 256 }
+  end
+  return triples
+end
+
+---@param state BattleEffectStaging
+---@param source table<string, unknown> overlay table description
+---@return table<string, number>[] signed fx32 XY pairs in source order
+local function readEmitterPositionPairs(state, source)
+  local words = readSignedWords(state, source, 4, source.pairCount * 2)
+  local unit = source.unit
+  assert(unit == 4096, "emitter position pairs keep the exact raw/4096 unit contract")
+  local pairs = {}
+  for index = 0, source.pairCount - 1 do
+    pairs[index + 1] = { x = words[index * 2 + 1] / unit, y = words[index * 2 + 2] / unit }
+  end
+  return pairs
+end
+
+---@param words integer[] signed source words in table order
+---@param at integer zero-based row index behind the record
+---@return table<string, number> signed vector/flag row with its mirror flag
+local function axisRowRecord(words, at)
+  return {
+    x = words[at * 4 + 1] / 4096,
+    y = words[at * 4 + 2] / 4096,
+    z = words[at * 4 + 3] / 4096,
+    mirrorFlag = words[at * 4 + 4],
+  }
+end
+
+---@param state BattleEffectStaging
+---@param source table<string, unknown> overlay table description
+---@return table<string, integer>[] signed vector/flag rows in source order
+local function readEmitterAxisRows(state, source)
+  local words = readSignedWords(state, source, 4, source.rowCount * source.wordCount)
+  local rows = {}
+  for index = 0, source.rowCount - 1 do
+    rows[index + 1] = axisRowRecord(words, index)
+  end
+  return rows
+end
+
+-- Stages the complete configured-emitter source tables behind one
+-- particle payload: the axis family per ordered battler-type pair plus
+-- the pixel-offset, static-row, XY-position, and camera-angle tables
+-- the valid position/axis/camera modes index.
+---@param state BattleEffectStaging
+---@return table<string, unknown> staged axis tables by configured mode
+---@return table<string, unknown> staged emitter tables behind configured callbacks
+local function readConfiguredEmitterTables(state)
+  local sources = state.sources
+  local axisTables = {
+    mode1 = readEmitterAxisTable(state, sources.EMITTER_AXIS_MODE1),
+    mode8 = readEmitterAxisTable(state, sources.EMITTER_AXIS_MODE8),
+    mode10 = readEmitterAxisTable(state, sources.EMITTER_AXIS_MODE10),
+    mode12 = readEmitterAxisTable(state, sources.EMITTER_AXIS_MODE12),
+    mode14 = readEmitterAxisTable(state, sources.EMITTER_AXIS_MODE14),
+    mode16 = readEmitterAxisTable(state, sources.EMITTER_AXIS_MODE16),
+    mode18 = readEmitterAxisTable(state, sources.EMITTER_AXIS_MODE18),
+    mode20 = readEmitterAxisTable(state, sources.EMITTER_AXIS_MODE20),
+  }
+  local emitterTables = {
+    offsetX = readSignedWords(
+      state,
+      sources.EMITTER_OFFSET_X,
+      sources.EMITTER_OFFSET_X.entryBytes,
+      sources.EMITTER_OFFSET_X.entryCount
+    ),
+    offsetY = readSignedWords(
+      state,
+      sources.EMITTER_OFFSET_Y,
+      sources.EMITTER_OFFSET_Y.entryBytes,
+      sources.EMITTER_OFFSET_Y.entryCount
+    ),
+    axisBase = axisRowRecord(
+      readSignedWords(state, sources.EMITTER_AXIS_BASE, 4, sources.EMITTER_AXIS_BASE.wordCount),
+      0
+    ),
+    axisRows = readEmitterAxisRows(state, sources.EMITTER_AXIS_ROWS),
+    axisPositions = readEmitterPositionPairs(state, sources.EMITTER_AXIS_POSITIONS),
+    position30 = readEmitterPositionPairs(state, sources.EMITTER_POSITIONS_MODE30),
+    position31 = readEmitterPositionPairs(state, sources.EMITTER_POSITIONS_MODE31),
+    position32 = readEmitterPositionPairs(state, sources.EMITTER_POSITIONS_MODE32),
+    cameraAngles = readCameraAngles(state, sources.EMITTER_CAMERA_ANGLES),
+  }
+  return axisTables, emitterTables
+end
+
 ---@param state BattleEffectStaging
 ---@param role string source input role
 ---@param operands integer[] source operands
 ---@param source { archiveSymbol: string, memberId: integer } selected particle source
 ---@param memberId integer selected member
 ---@return string bytes
----@return table<string, unknown>|nil compiled
----@return string|nil unsupported
+---@return table<string, unknown> compiled
 local function decodeBattlerParticle(state, role, operands, source, memberId)
   local particleArchive = effectArchive(state, source.archiveSymbol, "animation battler particle")
   local bytes, readErr = particleArchive:readMember(memberId)
@@ -6337,8 +6874,8 @@ local function decodeBattlerParticle(state, role, operands, source, memberId)
       0
     )
   end
-  local compiled, unsupported = compileParticleMember(bytes)
-  return bytes, compiled, unsupported
+  local compiled = compileParticleMember(state, bytes, source)
+  return bytes, compiled
 end
 
 ---@param state BattleEffectStaging
@@ -6374,14 +6911,13 @@ local function resolveBattlerParticleResource(state, role, operands)
     or sources.resolveParticleResource(memberId)
   local particle = particleKey ~= nil and state.decodedParticleResources[particleKey] or nil
   if particle == nil then
-    local bytes, compiled, unsupported = decodeBattlerParticle(state, role, operands, source, memberId)
+    local bytes, compiled = decodeBattlerParticle(state, role, operands, source, memberId)
     particleKey = particleKey or ("battle/particle/content/" .. Hashing.sha1hex(bytes))
     selection = {
       resourceKeys = { particle = particleKey },
       sourceSelections = { particle = source },
     }
-    state.decodedParticleResources[particleKey] =
-      { bytes = bytes, compiled = compiled, unsupported = unsupported, source = source }
+    state.decodedParticleResources[particleKey] = { bytes = bytes, compiled = compiled, source = source }
   end
   state.particleByBattler[operands[1]] = selection.resourceKeys.particle
   local selections = {
@@ -6495,18 +7031,17 @@ end
 ---@param role string source input role
 ---@param operands integer[] source operands
 ---@param particleKey string selected particle archive key
----@param particle { compiled: table<string, unknown>|nil } compiled particle archive
+---@param particle { bytes: string, compiled: table<string, unknown>, source: table<string, unknown> } compiled particle archive
 ---@param emitterOrdinal unknown zero-based emitter ordinal from the source plan
 ---@param caseKey string selection case behind the emitter
 ---@return integer ordinal checked emitter ordinal
 local function checkActionEmitter(state, role, operands, particleKey, particle, emitterOrdinal, caseKey)
-  -- An unsupported member names no emitters to check against.
-  local emitters = particle.compiled ~= nil and particle.compiled.particles.emitters or nil --[[@as table[]|nil]]
+  local emitters = particle.compiled.particles.emitters --[[@as table[] ]]
   if
     type(emitterOrdinal) ~= "number"
     or emitterOrdinal < 0
     or emitterOrdinal % 1 ~= 0
-    or (emitters ~= nil and emitters[emitterOrdinal + 1] == nil)
+    or emitters[emitterOrdinal + 1] == nil
   then
     error(
       Errors.new("BATTLE_EFFECT_SOURCE_UNRESOLVED", "particle emitter ordinal has no compiled emitter", {
@@ -6723,8 +7258,12 @@ local function stageSelectedSources(state, role, operands, sourceSelections)
     -- (BattleScene:installBackgroundLayer), never as uploaded RGBA
     -- textures: the staged character keeps its decoded tile bytes beside
     -- the palette and screen records, and skips the sprite raster queue.
+    -- Object-window stripes install the same way through the panel task
+    -- (BattleScene:installStripeLayer); only their slot names differ.
     local kind = source.kind
     if role == "battle-background" and slot == "character" then
+      kind = "tiles"
+    elseif role == "battle-animation-callback" and string.find(slot, "^stripeGraphic%dChar$") ~= nil then
       kind = "tiles"
     end
     local previous = state.resolvedResources[resourceKey]
@@ -6828,6 +7367,7 @@ local function selectedSourceOutput(resourceKeys, selection, isCallbackPlan)
     callback = selection.callback,
     actionProfile = selection.actionProfile,
     callbackCases = selection.callbackCases,
+    args = selection.args,
   }
   if isCallbackPlan then
     output.context = selection.context
@@ -6942,6 +7482,87 @@ local function collectRequiredContext(requiredContext, instruction)
       collectRequiredContext(requiredContext, nested)
     end
   end
+end
+
+-- Root display policy behind one feedback member: source
+-- MoveAnim_GetDisplayFlags arms for the auxiliary archive members
+-- (src/battle/battle_controller_opponent.c). Weather continuations,
+-- nightmare, leech seed, wrap, fire spin, clamp, and sand tomb
+-- suspend healthbar updates without battler G3 updates; magma storm
+-- and whirlpool suspend with G3 updates; every other feedback member
+-- (including follower entry/recall) changes neither. Runtime reads
+-- only the two named booleans, never member IDs.
+local FEEDBACK_DISPLAY_POLICY = {
+  [18] = { suspendHealthbarUpdates = true, updateBattlerG3 = false },
+  [19] = { suspendHealthbarUpdates = true, updateBattlerG3 = false },
+  [20] = { suspendHealthbarUpdates = true, updateBattlerG3 = false },
+  [21] = { suspendHealthbarUpdates = true, updateBattlerG3 = false },
+  [22] = { suspendHealthbarUpdates = true, updateBattlerG3 = false },
+  [31] = { suspendHealthbarUpdates = true, updateBattlerG3 = false },
+  [32] = { suspendHealthbarUpdates = true, updateBattlerG3 = false },
+  [34] = { suspendHealthbarUpdates = true, updateBattlerG3 = false },
+  [35] = { suspendHealthbarUpdates = true, updateBattlerG3 = false },
+  [36] = { suspendHealthbarUpdates = true, updateBattlerG3 = true },
+  [37] = { suspendHealthbarUpdates = true, updateBattlerG3 = false },
+  [38] = { suspendHealthbarUpdates = true, updateBattlerG3 = true },
+  [39] = { suspendHealthbarUpdates = true, updateBattlerG3 = false },
+}
+
+-- Reads the immutable root display policy behind one routed effect:
+-- ordinary moves decode their source move-table flags (MOVEATTR_UNK9
+-- is the flags byte; bit 0x40 keeps healthbar updates live, bit 0x80
+-- arms battler G3 updates), feedback members read the source feedback
+-- switch above. The first field suspends source healthbar updates;
+-- it never hides the HUD.
+---@param romFs RomFs
+---@param route table<string, unknown> resolved semantic root
+---@return table<string, boolean> detached root display policy
+local function rootDisplayPolicy(romFs, route)
+  if route.kind == "battle-animation" then
+    local memberId = route.animationCategory --[[@as integer]]
+    local policy = FEEDBACK_DISPLAY_POLICY[memberId]
+    if policy ~= nil then
+      return {
+        suspendHealthbarUpdates = policy.suspendHealthbarUpdates,
+        updateBattlerG3 = policy.updateBattlerG3,
+      }
+    end
+    return { suspendHealthbarUpdates = false, updateBattlerG3 = false }
+  end
+  assert(route.kind == "move", "display policy resolves its semantic root kind")
+  local moveId = route.moveId --[[@as integer]]
+  assert(
+    type(moveId) == "number" and moveId % 1 == 0 and moveId >= 1 and moveId <= 467,
+    "ordinary display policy reads its source move identity"
+  )
+  local archive = openArchive(romFs, "NARC_poketool_waza_waza_tbl", "move display flags")
+  -- Move-table members are raw 16-byte entries, never LZ streams: a
+  -- first byte of 0x10 is an ordinary effect low byte, not an LZ10
+  -- tag, so the shared compressed-member decoder must not touch them.
+  local rawMember, rawErr = archive:readMember(moveId)
+  if rawMember == nil then
+    if Errors.is(rawErr) then
+      error(rawErr, 0)
+    end
+    error(
+      Errors.new("BATTLE_MEMBER_MISSING", "move display flags member " .. moveId .. " is absent", {
+        member = moveId,
+        label = "move display flags",
+      }),
+      0
+    )
+  end
+  local member = rawMember --[[@as string]]
+  local MonCatalogCompiler = require("romdump.src.digest.mons.MonCatalogCompiler")
+  local decoded, decodeErr = MonCatalogCompiler.decodeMove(member, { archive = "moves", memberId = moveId })
+  if decoded == nil then
+    error(decodeErr, 0)
+  end
+  local flags = decoded.flags --[[@as integer]]
+  return {
+    suspendHealthbarUpdates = flags % 128 < 64,
+    updateBattlerG3 = flags % 256 >= 128,
+  }
 end
 
 -- Validates the semantic effect key and reads its routed source stream.
@@ -7059,7 +7680,7 @@ end
 -- reusing an archive a battler particle input already compiled.
 ---@param state BattleEffectStaging
 ---@param resourceKey string particle resource key
----@return { bytes: string, compiled: table<string, unknown>|nil, unsupported: string|nil, source: table<string, unknown> }|nil particle
+---@return { bytes: string, compiled: table<string, unknown>, source: table<string, unknown> }|nil particle
 ---@return unknown|nil failure
 local function closureParticle(state, resourceKey)
   local particle = state.decodedParticleResources[resourceKey]
@@ -7087,8 +7708,8 @@ local function closureParticle(state, resourceKey)
   if bytes == nil then
     return nil, particleReadErr
   end
-  local compiled, unsupported = compileParticleMember(bytes)
-  particle = { bytes = bytes, compiled = compiled, unsupported = unsupported, source = source }
+  local compiled = compileParticleMember(state, bytes, source)
+  particle = { bytes = bytes, compiled = compiled, source = source }
   state.decodedParticleResources[resourceKey] = particle
   return particle
 end
@@ -7098,14 +7719,8 @@ end
 -- table as the source-independent particle system payload.
 ---@param state BattleEffectStaging
 ---@param resourceKey string particle resource key
----@param particle { bytes: string, compiled: table<string, unknown>|nil, unsupported: string|nil, source: table<string, unknown> } compiled particle archive
+---@param particle { bytes: string, compiled: table<string, unknown>, source: table<string, unknown> } compiled particle archive
 local function stageClosureParticle(state, resourceKey, particle)
-  if particle.compiled == nil then
-    local marker = { unsupported = particle.unsupported }
-    BattlePresentationSchema.assertParticleSystem(marker)
-    addEffectResource(state, resourceKey, "particle", Hashing.sha1hex(particle.bytes), marker)
-    return
-  end
   local set = particle.compiled.particles --[[@as table<string, unknown>]]
   local digest = Hashing.sha1hex(particle.bytes)
   local textures = {}
@@ -7117,18 +7732,24 @@ local function stageClosureParticle(state, resourceKey, particle)
       width = texture.width,
       height = texture.height,
       rgba8888 = texture.pixels,
+      sampler = texture.sampler,
     })
-    textures[#textures + 1] = { id = texture.id, width = texture.width, height = texture.height, image = textureKey }
+    textures[#textures + 1] = {
+      id = texture.id,
+      width = texture.width,
+      height = texture.height,
+      image = textureKey,
+      sampler = texture.sampler,
+      alphaUsage = texture.alphaUsage,
+    }
   end
+  local axisTables, emitterTables = readConfiguredEmitterTables(state)
   local payload = {
-    seed = set.seed,
     emitters = set.emitters,
     textures = textures,
     placements = readEmitterPlacements(state),
-    axisTables = {
-      mode1 = readEmitterAxisTable(state, state.sources.EMITTER_AXIS_MODE1),
-      mode10 = readEmitterAxisTable(state, state.sources.EMITTER_AXIS_MODE10),
-    },
+    axisTables = axisTables,
+    emitterTables = emitterTables,
   }
   BattlePresentationSchema.assertParticleSystem(payload)
   addEffectResource(state, resourceKey, "particle", Hashing.sha1hex(particle.bytes), payload)
@@ -7259,6 +7880,7 @@ local function validateEffect(effect, sourceOffsets)
     dependencies = effect.dependencies,
     resources = effect.resources,
     requiredContext = effect.requiredContext,
+    displayPolicy = effect.displayPolicy,
   })
   if valid then
     return
@@ -7385,6 +8007,7 @@ function BattlePresentationCompiler.compileEffect(romFs, opts, effectKey)
     resources = state.resolvedResources,
     requiredContext = requiredContext,
     resourcePayloads = state.resourcePayloads,
+    displayPolicy = rootDisplayPolicy(romFs, route),
     provenance = {
       archiveSymbol = route.archiveSymbol,
       memberId = route.memberId,
@@ -7437,6 +8060,7 @@ function BattlePresentationCompiler.stageEffect(artifact, effect, marker)
     dependencies = effect.dependencies,
     resources = effect.resources,
     requiredContext = effect.requiredContext,
+    displayPolicy = effect.displayPolicy,
   })
   stage:write(BattlePresentationCache.effectMarkerPath(effect.key), marker)
   return marker
@@ -7459,6 +8083,7 @@ function BattlePresentationCompiler.effectMarker(romSha1, effect)
       dependencies = effect.dependencies,
       resources = effect.resources,
       requiredContext = effect.requiredContext,
+      displayPolicy = effect.displayPolicy,
       payloads = payloadHashes,
     })
   )

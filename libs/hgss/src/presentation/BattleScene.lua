@@ -31,12 +31,13 @@
 ---@field _taskScalarPatchClock integer publication order behind newest-overlay reads
 ---@field _taskScalarPatchOrder table<table<string, unknown>, integer> publication order by owning task
 ---@field _gaugeTasks table<string, table<string, unknown>> source-ticked displayed gauge tasks
+---@field _wrapperDisplayPolicy table<string, boolean> active script-wrapper root display policy
 ---@field _healthBoxModes table<string, { sideType: integer, mode: string }> double-player native health-box mode by activation
 ---@field _effects table<integer, { id: integer, sourceKey: string, age: integer, picture?: table<string, unknown> }> live transient effect records
 ---@field _battlerSpriteSlots table<string, table<integer, integer>> battler picture copies by source occurrence and sprite slot
 ---@field _nextEffect integer next transient effect identity
 ---@field _particleSystems { id: integer, system: table<string, unknown> }[] live move particle systems in registration order
----@field _nextParticleSystem integer next particle system registration identity
+---@field _nextParticleSystem integer compatibility counter, unused: manager slots are first-free physical slots
 ---@field _released boolean launch-scoped release guard
 local BattleScene = {}
 BattleScene.__index = BattleScene
@@ -85,16 +86,30 @@ function BattleScene.new()
     _pictureAnimations = {},
     _pictureMotions = {},
     _pictureStates = {},
+    _pictureSources = {},
+    _animationPlanes = {},
+    _animationCompositor = {},
+    _animationJournals = {},
+    _scanlineRows = nil,
     _taskPicturePatches = {},
     _taskScalarPatches = {},
     _taskScalarPatchClock = 0,
     _taskScalarPatchOrder = {},
     _gaugeTasks = {},
+    _wrapperDisplayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
     _healthBoxModes = {},
     _effects = {},
     _battlerSpriteSlots = {},
+    _animationSprites = {},
+    _animationSpriteDrawLoops = {},
+    _animationSpriteDrawWindows = {},
+    _animationSpriteManagers = {},
+    _animationSystemBlend = nil,
+    _stripe = nil,
+    _objWindowSilhouette = nil,
     _nextEffect = 1,
     _particleSystems = {},
+    _drawParticleSystems = nil,
     _nextParticleSystem = 1,
     _released = false,
   }, BattleScene)
@@ -538,6 +553,8 @@ local PICTURE_STATE_FIELDS = {
   affineWidth = true,
   affineHeight = true,
   pictureVisible = true,
+  centerX = true,
+  centerY = true,
   pictureXOffset = true,
   pictureXOffset2 = true,
   pictureYOffset2 = true,
@@ -768,6 +785,7 @@ local FIELD_CHECKS = {
   shadowVisible = checkBoolean,
   affineMode = checkBoolean,
   pictureVisible = checkBoolean,
+  layoutMode = checkFiniteNumber,
   shadowAffine = checkBoolean,
   shadowAdjustX = checkBoolean,
   shadowAdjustY = checkBoolean,
@@ -776,6 +794,8 @@ local FIELD_CHECKS = {
   rotation = checkFiniteNumber,
   scaleX = checkFiniteNumber,
   scaleY = checkFiniteNumber,
+  centerX = checkPixelOffset,
+  centerY = checkPixelOffset,
   rotationX = checkAngleIndex,
   rotationY = checkAngleIndex,
   rotationZ = checkAngleIndex,
@@ -1032,6 +1052,32 @@ function BattleScene:resetBlendCoefficients()
   end
 end
 
+-- Installs the native animation system's default blend, the
+-- G2_SetBlendAlpha(NONE, BG0..BG3 | OBJ | BD, 8, 8) that
+-- BattleAnimSystem_InitBlend writes at StartMove and ResetBlend. The
+-- first-target mask stays empty so every plane keeps its own pixels;
+-- the second-target mask lets the 3D layer blend its own alpha and
+-- translucent OBJ fragments blend against what lies beneath. The
+-- state belongs to the system, not to any task, so occurrence
+-- journals never restore it away.
+function BattleScene:initAnimationBlend()
+  assert(not self._released, "released scenes blend nothing")
+  self._animationSystemBlend = {
+    blend = { mode = "alpha", eva = 8, evb = 8, evy = 0 },
+    firstTarget = {},
+    secondTarget = { world3d = true, window = true, transition = true, battlefield = true },
+    objTargets = { second = true },
+  }
+end
+
+-- Restores the native default blend, BattleSystem_SetDefaultBlend's
+-- G2_BlendNone at animation teardown: no color effect is active, so
+-- every plane and fragment keeps its own pixels.
+function BattleScene:setDefaultAnimationBlend()
+  assert(not self._released, "released scenes blend nothing")
+  self._animationSystemBlend = nil
+end
+
 -- Returns a detached per-activation presentation view, if one is active.
 ---@param battler table<string, unknown> activation whose view is read
 ---@return table<string, unknown>? detached presentation view
@@ -1075,6 +1121,304 @@ function BattleScene:restorePictureState(battler)
     self._pictureAnimations[key] = nil
   end
   return copyPictureState(owned.base)
+end
+
+-- Writes one persistent native picture write for an activation: canonical
+-- center, affine, visibility and palette fields survive task retirement
+-- until an explicit reset. The previous values are journaled behind the
+-- owning task so cancellation restores only fields that owner still owns.
+---@param owner table<string, unknown>|integer owning task behind the write
+---@param activation table<string, unknown> activation receiving the write
+---@param patch table<string, unknown> source picture attributes to persist
+function BattleScene:writeBattlerAnimation(owner, activation, patch)
+  assert(not self._released, "released scenes persist no picture writes")
+  assert(
+    type(activation) == "table" and type(activation.combatant) == "number",
+    "picture writes use an activation identity"
+  )
+  assert(type(patch) == "table", "picture writes read source attributes")
+  local current = self:pictureState(activation) or {}
+  local journal = self._animationJournals[owner]
+  if journal == nil then
+    journal = {}
+    self._animationJournals[owner] = journal
+  end
+  local key = entryKey(activation)
+  for field in pairs(patch) do
+    journal[#journal + 1] = { key = key, field = field, had = current[field] ~= nil, old = current[field] }
+  end
+  self:applyPictureState(activation, patch)
+end
+
+-- Restores fields one owner persisted while it still owns them: later
+-- owner writes are never restored away. Silent when nothing is journaled.
+---@param owner table<string, unknown>|integer owning task behind the restore
+---@param activation table<string, unknown> activation behind the restore
+function BattleScene:restoreBattlerAnimation(owner, activation)
+  if self._released then
+    return
+  end
+  local journal = self._animationJournals[owner]
+  if journal == nil then
+    return
+  end
+  local key = entryKey(activation)
+  local remaining = {}
+  for _, record in ipairs(journal) do
+    if record.key == key then
+      local owned = self._pictureStates[key]
+      if owned ~= nil then
+        if record.had then
+          owned.current[record.field] = record.old
+        else
+          owned.current[record.field] = nil
+        end
+      end
+    else
+      remaining[#remaining + 1] = record
+    end
+  end
+  if #remaining == 0 then
+    self._animationJournals[owner] = nil
+  else
+    self._animationJournals[owner] = remaining
+  end
+end
+
+-- Writes one independent animation plane binding for an engine: the main
+-- engine carries world3d/BG0 while the sub engine carries menu/BG0, and
+-- the other five role names are shared but independently bound.
+---@param owner table<string, unknown>|integer owning task behind the write
+---@param engine string "main" or "sub" engine behind the plane
+---@param plane string semantic plane role behind the binding
+---@param patch table<string, unknown> binding/enabled/priority/scroll/offsets/palette binding
+function BattleScene:writeAnimationPlane(owner, engine, plane, patch)
+  assert(not self._released, "released scenes write no animation planes")
+  assert(engine == "main" or engine == "sub", "animation planes belong to one engine")
+  assert(type(plane) == "string" and plane ~= "", "animation planes name their semantic role")
+  assert(type(patch) == "table", "animation planes read their binding")
+  local planes = self._animationPlanes[engine]
+  if planes == nil then
+    planes = {}
+    self._animationPlanes[engine] = planes
+  end
+  local current = planes[plane]
+  if type(current) ~= "table" then
+    current = {}
+    planes[plane] = current
+  end
+  local journal = self._animationJournals[owner]
+  if journal == nil then
+    journal = {}
+    self._animationJournals[owner] = journal
+  end
+  for field, value in pairs(patch) do
+    journal[#journal + 1] =
+      { plane = engine .. "/" .. plane, field = field, had = current[field] ~= nil, old = current[field] }
+    current[field] = value
+  end
+end
+
+-- Writes animation compositor state for an engine: blend, windows,
+-- brightness and mosaic fields with source widths and mode semantics.
+---@param owner table<string, unknown>|integer owning task behind the write
+---@param engine string "main" or "sub" engine behind the state
+---@param patch table<string, unknown> blend/window/brightness/mosaic fields
+function BattleScene:writeAnimationCompositor(owner, engine, patch)
+  assert(not self._released, "released scenes write no compositor state")
+  assert(engine == "main" or engine == "sub", "compositor state belongs to one engine")
+  assert(type(patch) == "table", "compositor writes read their fields")
+  local state = self._animationCompositor[engine]
+  if type(state) ~= "table" then
+    state = {}
+    self._animationCompositor[engine] = state
+  end
+  local journal = self._animationJournals[owner]
+  if journal == nil then
+    journal = {}
+    self._animationJournals[owner] = journal
+  end
+  for field, value in pairs(patch) do
+    journal[#journal + 1] = { compositor = engine, field = field, had = state[field] ~= nil, old = state[field] }
+    state[field] = value
+  end
+end
+
+-- Restores animation compositor fields one owner wrote while it still
+-- owns them: later owner writes are never restored away. Silent when
+-- nothing is journaled. Battle-background palette fades own their
+-- battlefield fade exactly like picture writes own their overlays, so
+-- cancellation mid-fade never strands a darkened battlefield.
+---@param owner table<string, unknown>|integer owning task behind the restore
+---@param engine string "main" or "sub" engine behind the state
+function BattleScene:restoreAnimationCompositor(owner, engine)
+  if self._released then
+    return
+  end
+  local journal = self._animationJournals[owner]
+  if journal == nil then
+    return
+  end
+  local state = self._animationCompositor[engine]
+  local remaining = {}
+  for index = #journal, 1, -1 do
+    local record = journal[index]
+    if type(record) == "table" and record.compositor == engine then
+      if state ~= nil then
+        if record.had then
+          state[record.field] = record.old
+        else
+          state[record.field] = nil
+        end
+      end
+    else
+      remaining[#remaining + 1] = record
+    end
+  end
+  if #remaining == 0 then
+    self._animationJournals[owner] = nil
+  else
+    local ordered = {}
+    for index = #remaining, 1, -1 do
+      ordered[#ordered + 1] = remaining[index]
+    end
+    self._animationJournals[owner] = ordered
+  end
+end
+
+-- Writes the full 192-row source scanline buffer in native row order.
+-- Wave rows differ across scanlines instead of shifting one viewport.
+---@param rows table<integer, table<string, integer>> per-row offsets, exactly 192 entries
+function BattleScene:writeScanlineRows(rows)
+  assert(not self._released, "released scenes write no scanline rows")
+  assert(type(rows) == "table" and #rows == 192, "scanline writes cover every visible scanline")
+  local copy = {}
+  for index = 1, 192 do
+    local row = rows[index]
+    assert(type(row) == "table", "scanline rows carry their per-row offsets")
+    copy[index] = { x = row.x or 0, y = row.y or 0 }
+  end
+  self._scanlineRows = copy
+end
+
+-- Installs the active script-wrapper root display policy: the wrapper
+-- applies the admitted root's immutable policy on entry and restores
+-- the default on its source-defined exit or exceptional cancel. The
+-- first field suspends source healthbar updates; it never hides the
+-- HUD. The second field names the battler G3 refresh the source
+-- performs around script-invoked roots; the animation tasks own every
+-- picture write in this engine, so the frame carries it as explicit
+-- wrapper state for the composition consumer.
+---@param policy table<string, boolean> detached root display policy under installation
+function BattleScene:setWrapperDisplayPolicy(policy)
+  assert(not self._released, "released scenes install no wrapper policy")
+  assert(type(policy) == "table", "wrapper policy stays a record")
+  assert(
+    type(policy.suspendHealthbarUpdates) == "boolean" and type(policy.updateBattlerG3) == "boolean",
+    "wrapper policy carries its two named booleans"
+  )
+  self._wrapperDisplayPolicy = {
+    suspendHealthbarUpdates = policy.suspendHealthbarUpdates,
+    updateBattlerG3 = policy.updateBattlerG3,
+  }
+end
+
+-- Returns a detached copy of the active script-wrapper root display
+-- policy for diagnosis without mutating scene state.
+---@return table<string, boolean> detached active wrapper display policy
+function BattleScene:wrapperDisplayPolicy()
+  assert(not self._released, "released scenes report no wrapper policy")
+  return {
+    suspendHealthbarUpdates = self._wrapperDisplayPolicy.suspendHealthbarUpdates == true,
+    updateBattlerG3 = self._wrapperDisplayPolicy.updateBattlerG3 == true,
+  }
+end
+
+-- Returns a detached immutable animation frame for the renderer: main
+-- and sub engine planes, base and working palettes, battler pictures,
+-- OBJ instances, detached pre-calc particle geometry, the source
+-- scanline buffer and the wrapper display policy. Mutating the
+-- returned record never affects scene state.
+---@return table<string, unknown> detached source frame
+function BattleScene:animationFrame()
+  assert(not self._released, "released scenes publish no animation frame")
+  local function copyValue(value, depth)
+    if type(value) ~= "table" or depth > 6 then
+      return value
+    end
+    local copy = {}
+    for field, entry in pairs(value) do
+      copy[field] = copyValue(entry, depth + 1)
+    end
+    return copy
+  end
+  local planes = {}
+  for _, engine in ipairs({ "main", "sub" }) do
+    local bound = self._animationPlanes[engine] or {}
+    local compositor = self._animationCompositor[engine] or {}
+    planes[engine] = {
+      planes = copyValue(bound, 1),
+      compositor = copyValue(compositor, 1),
+      systemBlend = engine == "main" and copyValue(self._animationSystemBlend, 1) or nil,
+    }
+  end
+  local pictures = {}
+  for key, owned in pairs(self._pictureStates) do
+    pictures[key] = copyPictureState(owned.current)
+  end
+  for key, slot in pairs(self._taskPicturePatches) do
+    local merged = pictures[key] or {}
+    for field, value in pairs(copyPictureState(slot.patch)) do
+      merged[field] = value
+    end
+    pictures[key] = merged
+  end
+  local rows = {}
+  local rowsCopy = {}
+  if type(self._scanlineRows) == "table" then
+    for index = 1, 192 do
+      local row = self._scanlineRows[index] or { x = 0, y = 0 }
+      rows[index] = { x = row.x or 0, y = row.y or 0 }
+      rowsCopy[index] = { x = row.x or 0, y = row.y or 0 }
+    end
+  else
+    for index = 1, 192 do
+      rows[index] = { x = 0, y = 0 }
+      rowsCopy[index] = { x = 0, y = 0 }
+    end
+  end
+  local mainCompositor = self._animationCompositor.main or {}
+  local subCompositor = self._animationCompositor.sub or {}
+  local stripe = nil
+  if self._stripe ~= nil then
+    stripe = {
+      raster = self._stripe.rasterizer:render(),
+      scrollX = self._stripe.scrollX,
+      scrollY = self._stripe.scrollY,
+    }
+  end
+  local silhouette = nil
+  if self._objWindowSilhouette ~= nil then
+    silhouette = {
+      combatant = self._objWindowSilhouette.combatant,
+      activation = self._objWindowSilhouette.activation,
+    }
+  end
+  return {
+    main = planes.main,
+    sub = planes.sub,
+    mosaic = copyValue(mainCompositor.mosaic or subCompositor.mosaic or {}, 1),
+    scanlines = rows,
+    scanlineBuffer = rowsCopy,
+    pictures = pictures,
+    particles = {},
+    stripe = stripe,
+    objWindowSilhouette = silhouette,
+    displayPolicy = {
+      suspendHealthbarUpdates = self._wrapperDisplayPolicy.suspendHealthbarUpdates == true,
+      updateBattlerG3 = self._wrapperDisplayPolicy.updateBattlerG3 == true,
+    },
+  }
 end
 
 -- Observes displayed battlers without advancing or starting controller tasks.
@@ -1356,8 +1700,38 @@ local function stepPaletteFade(fade)
   fade.delayCounter = fade.delayLength
 end
 
--- Advances entry and effect tasks by exactly one accepted source tick.
-function BattleScene:stepSourceTick()
+-- Advances the source picture phase exactly once: Pokepic palette,
+-- animation, and baked send-out motion for every activation, both saved
+-- and task-owned.
+-- Never runs from a draw or read; the native frame hook owns this call.
+---@param sourceTick table<string, unknown>? accepted source tick under advancement
+function BattleScene:stepAnimationPictures(sourceTick)
+  local _ = sourceTick
+  assert(not self._released, "released scenes step no picture phase")
+  for _, task in pairs(self._pictureAnimations) do
+    stepPictureTask(task)
+  end
+  for _, task in pairs(self._pictureMotions) do
+    stepPictureMotion(task)
+  end
+  for _, state in pairs(self._pictureStates) do
+    local fade = state.current.paletteFade
+    if fade ~= nil then
+      stepPaletteFade(fade)
+    end
+  end
+  for _, slot in pairs(self._taskPicturePatches) do
+    local fade = slot.patch.paletteFade
+    if fade ~= nil then
+      stepPaletteFade(fade)
+    end
+  end
+end
+
+-- Advances the host-owned scene state once: entry movement, effect age
+-- and gauges. Picture palette/animation phases belong to the source
+-- picture phase behind stepAnimationPictures and never run here.
+function BattleScene:stepHostTick()
   assert(not self._released, "released scenes step nothing")
   for _, entry in pairs(self._entries) do
     if entry.phase == "waiting" then
@@ -1382,26 +1756,13 @@ function BattleScene:stepSourceTick()
   for _, effect in pairs(self._effects) do
     effect.age = effect.age + 1
   end
-  for _, task in pairs(self._pictureAnimations) do
-    stepPictureTask(task)
-  end
-  for _, task in pairs(self._pictureMotions) do
-    stepPictureMotion(task)
-  end
-  for _, state in pairs(self._pictureStates) do
-    local fade = state.current.paletteFade
-    if fade ~= nil then
-      stepPaletteFade(fade)
-    end
-  end
-  for _, slot in pairs(self._taskPicturePatches) do
-    local fade = slot.patch.paletteFade
-    if fade ~= nil then
-      stepPaletteFade(fade)
-    end
-  end
   for _, task in pairs(self._gaugeTasks) do
-    if task.active then
+    -- The active wrapper suspends source healthbar updates while its
+    -- root runs; the HUD stays visible, only the interpolation holds.
+    -- Experience tasks keep their own source cadence beside it.
+    if
+      task.active and not (self._wrapperDisplayPolicy.suspendHealthbarUpdates == true and task.kind ~= "experience")
+    then
       local target = task.target --[[@as number]]
       local current = task.calc --[[@as number]]
       local amount = task.amount --[[@as number]]
@@ -1464,9 +1825,19 @@ function BattleScene:stepSourceTick()
   end
 end
 
+-- Advances the whole scene once: host state plus the source picture
+-- phase. Non-battle-screen callers keep this single entry point; the
+-- battle screen splits the two phases across its native frame hook and
+-- host tick instead.
+function BattleScene:stepSourceTick()
+  self:stepHostTick()
+  self:stepAnimationPictures()
+end
+
 ---@param key string stable task identity under installation
 ---@param spec { maximum: number, current: number, delta: number, tiles: integer, amount: integer? } source gauge task inputs
-function BattleScene:startGaugeTask(key, spec)
+---@param kind string? gauge family, health when absent
+function BattleScene:startGaugeTask(key, spec, kind)
   assert(not self._released, "released scenes start no gauge tasks")
   assert(type(key) == "string" and key ~= "", "gauge tasks have a stable identity")
   assert(type(spec) == "table", "gauge tasks read their source parameters")
@@ -1480,6 +1851,7 @@ function BattleScene:startGaugeTask(key, spec)
   local amount = spec.amount or 1
   assert(amount > 0 and amount == math.floor(amount), "gauge tick amount is a positive integer")
   self._gaugeTasks[key] = {
+    kind = kind or "health",
     maximum = spec.maximum,
     tiles = spec.tiles,
     delta = spec.delta,
@@ -1515,7 +1887,7 @@ function BattleScene:startExpGaugeTask(key, spec)
     delta = spec.delta,
     tiles = BattleScene.EXP_TILES,
     amount = amount,
-  })
+  }, "experience")
 end
 
 ---@param key string stable task identity under reading
@@ -1950,6 +2322,110 @@ function BattleScene:backgroundRaster()
   return self._backgroundRasterizer:render()
 end
 
+-- Installs the object-window stripe backdrop behind one panel-slide run:
+-- the scrolled stripe tilemap the object window reveals through the
+-- affected battler's silhouette (retail BattleAnimTask_ObjWindowBgScroll
+-- BG2). Unlike effect background layers it never replaces the
+-- persistent battlefield; the renderer draws it on the transition plane
+-- under the compositor window masks. Color index zero stays
+-- transparent like any effect plane.
+---@param payload { characters: string, colorMode: string, map: { width: integer, height: integer, entries: table[] }, palette: { colors: table[] } } decoded stripe slots
+function BattleScene:installStripeLayer(payload)
+  assert(not self._released, "released scenes install no stripes")
+  assert(self._stripe == nil, "stripe layers install once per panel run")
+  assert(type(payload) == "table", "stripe layers carry their decoded payload")
+  assert(type(payload.characters) == "string", "stripe layers carry packed tile bytes")
+  assert(payload.colorMode == "4bpp" or payload.colorMode == "8bpp", "stripe layers declare their encoding")
+  assert(type(payload.map) == "table", "stripe layers carry their tilemap")
+  local map = payload.map --[[@as table<string, unknown>]]
+  assert(
+    type(map.width) == "number" and type(map.height) == "number" and type(map.entries) == "table",
+    "stripe tilemaps carry their dimensions"
+  )
+  local entries = map.entries --[[@as table<integer, unknown>]]
+  assert(
+    type(payload.palette) == "table" and type(payload.palette.colors) == "table",
+    "stripe layers carry their palette"
+  )
+  -- The staged stripe palette carries only its own sixteen colors
+  -- while the stripe tilemap references higher banks (bank 8 in every
+  -- shipped graphic, matching the file's PMCP bank placement): the
+  -- colors ride the highest referenced bank and lower banks stay
+  -- transparent, so the isolated raster resolves exactly the texels
+  -- the window reveals.
+  local staged = payload.palette.colors --[[@as table<integer, unknown>]]
+  local topBank = 0
+  for _, entry in ipairs(entries) do
+    if type(entry) == "table" and type(entry.palette) == "number" and entry.palette > topBank then
+      topBank = math.floor(entry.palette)
+    end
+  end
+  local colors = {}
+  for index = 1, (topBank + 1) * 16 do
+    colors[index] = { r = 0, g = 0, b = 0 }
+  end
+  for index, color in ipairs(staged) do
+    if type(color) ~= "table" then
+      break
+    end
+    local slot = topBank * 16 + index
+    if slot > (topBank + 1) * 16 then
+      break
+    end
+    local typed = color --[[@as table<string, unknown>]]
+    colors[slot] = { r = typed.r or 0, g = typed.g or 0, b = typed.b or 0 }
+  end
+  self._stripe = {
+    rasterizer = NitroBg3.new({
+      characters = payload.characters,
+      map = { width = map.width, height = map.height, entries = entries },
+      palette = { colors = colors },
+      colorMode = payload.colorMode,
+      transparentZero = true,
+    }),
+    scrollX = 0,
+    scrollY = 0,
+  }
+end
+
+-- Moves the installed stripe backdrop by native pixels; the renderer
+-- draws the transition plane shifted by this offset with wrapping.
+---@param x number horizontal stripe scroll in native pixels
+---@param y number vertical stripe scroll in native pixels
+function BattleScene:setStripeScroll(x, y)
+  assert(not self._released, "released scenes scroll no stripes")
+  local stripe = assert(self._stripe, "stripe scroll requires an installed stripe layer")
+  assert(type(x) == "number" and type(y) == "number", "stripe scroll carries numeric offsets")
+  stripe.scrollX, stripe.scrollY = x, y
+end
+
+-- Removes the panel stripe backdrop without touching the persistent BG3.
+function BattleScene:removeStripeLayer()
+  assert(not self._released, "released scenes remove no stripes")
+  assert(self._stripe ~= nil, "stripe removal requires an installed stripe layer")
+  self._stripe = nil
+end
+
+---@return boolean true while a panel stripe layer is installed
+function BattleScene:hasStripeLayer()
+  return self._stripe ~= nil
+end
+
+-- Names the battler whose silhouette feeds the object-window coverage
+-- while a panel run owns it; the renderer draws the live portrait
+-- shape as window-mode coverage. Nil clears the request.
+---@param activation table<string, unknown>? combatant and activation behind the silhouette, absent to clear
+function BattleScene:setObjWindowSilhouette(activation)
+  assert(not self._released, "released scenes name no silhouette")
+  if activation == nil then
+    self._objWindowSilhouette = nil
+    return
+  end
+  assert(type(activation.combatant) == "number", "silhouettes retain their source combatant")
+  assert(type(activation.activation) == "number", "silhouettes retain their source activation")
+  self._objWindowSilhouette = { combatant = activation.combatant, activation = activation.activation }
+end
+
 ---@return boolean true when a staged BG3 layer is installed
 function BattleScene:hasBackground()
   return self._background ~= nil
@@ -2102,6 +2578,136 @@ function BattleScene:setEffectPicture(id, picture)
   record.picture = copy
 end
 
+-- Binds the immutable CPU picture source behind an activation: the two
+-- exact 80x80 index frames plus the sixteen untouched base RGB555 words
+-- the native copy operations snapshot. The binding is private scene
+-- state; the renderer and copy tasks read it, never the disk.
+---@param activation table<string, unknown> activation behind the binding
+---@param source table<string, unknown> immutable CPU source from the preparation boundary
+function BattleScene:setPictureSource(activation, source)
+  assert(not self._released, "released scenes bind no picture source")
+  assert(
+    type(activation) == "table" and type(activation.combatant) == "number",
+    "picture sources bind an activation identity"
+  )
+  assert(type(source) == "table", "picture sources carry the immutable CPU source")
+  assert(source.width == 80 and source.height == 80, "picture sources carry 80x80 index frames")
+  assert(
+    type(source.indexFrames) == "table" and #source.indexFrames[1] == 6400 and #source.indexFrames[2] == 6400,
+    "picture sources carry both exact index frames"
+  )
+  assert(
+    type(source.basePaletteRgb555) == "table" and #source.basePaletteRgb555 == 16,
+    "picture sources carry sixteen base palette words"
+  )
+  self._pictureSources[entryKey(activation)] = source
+end
+
+-- Returns the bound immutable CPU picture source behind an activation,
+-- if one was bound through the appearance boundary.
+---@param activation table<string, unknown> activation behind the lookup
+---@return table<string, unknown>? immutable CPU source, absent without a binding
+function BattleScene:pictureSource(activation)
+  assert(not self._released, "released scenes expose no picture source")
+  if type(activation) ~= "table" or type(activation.combatant) ~= "number" then
+    return nil
+  end
+  return self._pictureSources[entryKey(activation)]
+end
+
+-- Applies front-Spinda personalization to a private copy of one 80x80
+-- index plane: for spot i, personality byte floor(pid/256^i)%256 gives
+-- dx=(byte%16)-8 and dy=floor(byte/16)-8; unsigned-u8 x/y after
+-- addition; destination indices 1,2,3 become 6,7,8; already replaced
+-- pixels stay unchanged, including overlaps. Back planes pass through.
+---@param plane string 6400-byte index plane under personalization
+---@param pid integer battler personality behind the spots
+---@param secondFrame boolean true for the live second frame (-14 x shift)
+---@param spotRows table<integer, table<integer, integer>[]> four source row sets
+---@return string personalized 6400-byte index plane copy
+local function personalizeSpindaPlane(plane, pid, secondFrame, spotRows)
+  local bytes = { string.byte(plane, 1, 6400) }
+  local offset = secondFrame and -14 or 0
+  for spot = 0, 3 do
+    local personality = math.floor(pid / (256 ^ spot)) % 256
+    local dx = (personality % 16) - 8 + offset
+    local dy = math.floor(personality / 16) - 8
+    for _, row in ipairs(spotRows[spot + 1]) do
+      local y, firstX, lastX = row[1], row[2], row[3]
+      for x = firstX, lastX do
+        local px = (x + dx) % 256
+        local py = (y + dy) % 256
+        local at = py * 80 + px + 1
+        local index = bytes[at] or 0
+        if index >= 1 and index <= 3 then
+          bytes[at] = index + 5
+        end
+      end
+    end
+  end
+  local parts = {}
+  for position = 1, 6400 do
+    parts[position] = string.char(bytes[position] or 0)
+  end
+  return table.concat(parts)
+end
+
+-- Packs one personalized 80x80 index frame into the exact 3200-byte
+-- static OBJ char buffer: 8x8 4bpp tiles, row-major pixels with the low
+-- nibble first, emitted in the six native tile rectangles in order.
+---@param frame string 6400-byte personalized index frame
+---@return string 3200-byte static char buffer
+local function packCopyCharBuffer(frame)
+  local rectangles = { { 0, 0, 8, 8 }, { 8, 0, 2, 4 }, { 8, 4, 2, 4 }, { 0, 8, 4, 2 }, { 4, 8, 4, 2 }, { 8, 8, 2, 2 } }
+  local parts = {}
+  for _, rect in ipairs(rectangles) do
+    local ox, oy, tilesW, tilesH = rect[1], rect[2], rect[3], rect[4]
+    for tileY = 0, tilesH - 1 do
+      for tileX = 0, tilesW - 1 do
+        for py = 0, 7 do
+          local pair = {}
+          for px = 0, 7, 2 do
+            local x0 = ox * 8 + tileX * 8 + px
+            local y0 = oy * 8 + tileY * 8 + py
+            local lo = string.byte(frame, y0 * 80 + x0 + 1) or 0
+            local hi = string.byte(frame, y0 * 80 + x0 + 2) or 0
+            pair[#pair + 1] = string.char((lo % 16) + (hi % 16) * 16)
+          end
+          parts[#parts + 1] = table.concat(pair)
+        end
+      end
+    end
+  end
+  return table.concat(parts)
+end
+
+-- Materializes the native static copy behind an activation: the
+-- personalized first authored frame packed into the six-block char
+-- order plus a private copy of the fresh base palette. Live Pokepic
+-- animation frames, flips, mosaic and fades never leak into copies;
+-- later live mutations cannot change already materialized snapshots.
+---@param activation table<string, unknown> activation behind the copy
+---@param personalityPid integer? donor personality behind Spinda spots, defaulting to zero
+---@return table<string, unknown>? char buffer and base palette snapshot, absent without a binding
+function BattleScene:materializeCopyChar(activation, personalityPid)
+  local source = self:pictureSource(activation)
+  if source == nil then
+    return nil
+  end
+  local frame = source.indexFrames[1]
+  local personality = source.personalization
+  if type(personality) == "table" and personality.kind == "spinda" then
+    local pid = personalityPid or 0
+    assert(type(pid) == "number" and pid % 1 == 0, "copy personalization names its donor personality")
+    frame = personalizeSpindaPlane(frame, pid % 4294967296, false, personality.spotRows)
+  end
+  local palette = {}
+  for _, word in ipairs(source.basePaletteRgb555) do
+    palette[#palette + 1] = word
+  end
+  return { charBuffer = packCopyCharBuffer(frame), basePaletteRgb555 = palette }
+end
+
 -- Publishes a source battler picture copy into its managed sprite slot.
 -- The renderer resolves the copied pixels from the selected live battler;
 -- scene owns only source identity, follow mode, and slot lifetime.
@@ -2132,6 +2738,23 @@ function BattleScene:setBattlerSpriteSlot(ownerKey, spriteSlot, battlerActivatio
     },
     follow = follow,
   }
+  -- A bound CPU source snapshots the static first frame and fresh base
+  -- palette at creation; later live mutations cannot change the copy.
+  -- Unbound activations keep the established live-picture behavior.
+  local snapshot = self:materializeCopyChar(battlerActivation)
+  if snapshot ~= nil then
+    record.picture.sourceChar = snapshot.charBuffer
+    record.picture.sourcePalette = snapshot.basePaletteRgb555
+  end
+  -- The frozen portrait selector behind the immutable copy: the renderer
+  -- resolves the creation-time selector's first frame instead of the
+  -- live battler texture, so later frame, palette, form, or visibility
+  -- mutations move only the source-defined follow transform, never the
+  -- copy's pixels. Absent while the activation carries no appearance.
+  local appearance = self:pictureState(battlerActivation)
+  if type(appearance) == "table" and type(appearance.portraitSelector) == "string" then
+    record.picture.frozenSelector = appearance.portraitSelector
+  end
   slots[spriteSlot] = record.id
 end
 
@@ -2162,8 +2785,158 @@ function BattleScene:releaseBattlerSpriteSlots(ownerKey, spriteSlot)
   self._battlerSpriteSlots[ownerKey] = nil
 end
 
--- Publishes detached effect records in launch allocation order.
----@return table<integer, { id: integer, sourceKey: string, age: integer, picture?: table<string, unknown> }> renderable effect snapshot
+-- Records one source battler-sprite draw flag in the system-global slot
+-- registry the native battlerSprites array owns: slots start drawn and
+-- SetBattlerSpriteVisible/StopBattlerSpriteDraw clear or set them by
+-- source slot, independent of the occurrence that staged the sprite.
+---@param slot integer source battler-sprite slot under flagging
+---@param draw boolean visible while true, hidden while false
+function BattleScene:setAnimationSpriteDrawFlag(slot, draw)
+  assert(not self._released, "released scenes flag no battler sprites")
+  assert(type(slot) == "number" and slot % 1 == 0 and slot >= 0, "sprite draw flags name a source slot")
+  assert(type(draw) == "boolean", "sprite draw flags carry a draw flag")
+  local record = self._animationSprites[slot]
+  if record == nil then
+    record = { draw = true, followStopped = false }
+    self._animationSprites[slot] = record
+  end
+  record.draw = draw
+end
+
+-- Records one stopped sprite-follow binding: the native StopFollowTask
+-- frees the follow work of one battler-sprite slot while the sprite
+-- itself stays alive.
+---@param slot integer source battler-sprite slot whose follow stops
+function BattleScene:stopAnimationSpriteFollow(slot)
+  assert(not self._released, "released scenes stop no sprite follow")
+  assert(type(slot) == "number" and slot % 1 == 0 and slot >= 0, "stopped follows name a source slot")
+  local record = self._animationSprites[slot]
+  if record == nil then
+    record = { draw = true, followStopped = false }
+    self._animationSprites[slot] = record
+  end
+  record.followStopped = true
+end
+
+-- Records one native battler-sprite draw priority on its slot: the
+-- per-role writes of StartBattlerSpriteDraw select 1 or 255, and the
+-- port's OBJ layer maps the value onto its own 0..3 OAM priority range.
+---@param slot integer source battler-sprite slot under priority
+---@param priority integer native ManagedSprite_SetDrawPriority value
+function BattleScene:setAnimationSpritePriority(slot, priority)
+  assert(not self._released, "released scenes prioritize no battler sprites")
+  assert(type(slot) == "number" and slot % 1 == 0 and slot >= 0, "sprite draw priorities name a source slot")
+  assert(type(priority) == "number" and priority % 1 == 0, "sprite draw priorities carry a source value")
+  local record = self._animationSprites[slot]
+  if record == nil then
+    record = { draw = true, followStopped = false }
+    self._animationSprites[slot] = record
+  end
+  record.priority = priority
+end
+
+-- Starts one native battler-sprite draw loop: StartBattlerSpriteDraw
+-- creates a main-queue task that draws the shared battler sprite
+-- manager every frame, so copies stay invisible until a loop runs.
+-- The loop index is the native draw-task slot, independent of the
+-- sprite slot whose draw flag the opcode rewrites.
+---@param loopIndex integer source draw-task slot
+---@param spriteSlot integer source battler-sprite slot the loop draws
+function BattleScene:startAnimationSpriteDraw(loopIndex, spriteSlot)
+  assert(not self._released, "released scenes start no sprite draw")
+  assert(type(loopIndex) == "number" and loopIndex % 1 == 0 and loopIndex >= 0, "sprite draw loops name a source index")
+  assert(
+    type(spriteSlot) == "number" and spriteSlot % 1 == 0 and spriteSlot >= 0,
+    "sprite draw loops copy a source sprite slot"
+  )
+  self._animationSpriteDrawLoops[loopIndex] = { slot = spriteSlot }
+end
+
+-- Opens one manager draw window: BattleAnimFunc_AnimateSprites draws the
+-- shared battler sprite manager on every frame of its timer, independent
+-- of the StartBattlerSpriteDraw loops. The owning task closes the window
+-- exactly once on completion, cancellation, or disposal.
+---@param owner table<string, unknown>|integer owning task behind the window
+function BattleScene:openAnimationSpriteDrawWindow(owner)
+  assert(not self._released, "released scenes draw no sprite windows")
+  self._animationSpriteDrawWindows[owner] = true
+end
+
+-- Closes one manager draw window; unknown or repeated owners stay
+-- silent, and a released scene takes no further closes.
+---@param owner table<string, unknown>|integer owning task behind the window
+function BattleScene:closeAnimationSpriteDrawWindow(owner)
+  if self._released then
+    return
+  end
+  self._animationSpriteDrawWindows[owner] = nil
+end
+
+-- Stops one native battler-sprite draw loop: StopBattlerSpriteDraw only
+-- deactivates the draw task; the sprite and its draw flag stay alive.
+---@param loopIndex integer source draw-task slot
+function BattleScene:stopAnimationSpriteDraw(loopIndex)
+  assert(not self._released, "released scenes stop no sprite draw")
+  assert(type(loopIndex) == "number" and loopIndex % 1 == 0 and loopIndex >= 0, "sprite draw stops name a source index")
+  self._animationSpriteDrawLoops[loopIndex] = nil
+end
+
+-- Returns a detached copy of one active draw loop, absent when stopped.
+---@param loopIndex integer source draw-task slot under reading
+---@return { slot: integer }? detached loop record
+function BattleScene:animationSpriteDraw(loopIndex)
+  assert(not self._released, "released scenes expose no sprite draw")
+  local record = self._animationSpriteDrawLoops[loopIndex]
+  if record == nil then
+    return nil
+  end
+  return { slot = record.slot }
+end
+
+-- Returns a detached copy of one slot record, absent before any native
+-- draw or follow transition names the slot.
+---@param slot integer source battler-sprite slot under reading
+---@return { draw: boolean, followStopped: boolean, priority: integer? }? detached slot record
+function BattleScene:animationSprite(slot)
+  assert(not self._released, "released scenes expose no battler sprites")
+  local record = self._animationSprites[slot]
+  if record == nil then
+    return nil
+  end
+  return { draw = record.draw, followStopped = record.followStopped, priority = record.priority }
+end
+
+-- Records one sprite-manager lifetime transition by name: the battler
+-- manager and the indexed sprite managers allocate once and free once
+-- per native manager call, independent of occurrence journals.
+---@param name string manager identity behind the transition
+---@param present boolean allocated while true, freed while false
+function BattleScene:setAnimationSpriteManager(name, present)
+  assert(not self._released, "released scenes track no sprite managers")
+  assert(type(name) == "string" and name ~= "", "sprite managers carry their identity")
+  assert(type(present) == "boolean", "sprite managers carry their presence")
+  if present then
+    self._animationSpriteManagers[name] = true
+  else
+    self._animationSpriteManagers[name] = nil
+  end
+end
+
+-- Reports whether one sprite manager is currently allocated.
+---@param name string manager identity under reading
+---@return boolean present true while allocated
+function BattleScene:animationSpriteManagerPresent(name)
+  assert(not self._released, "released scenes expose no sprite managers")
+  return self._animationSpriteManagers[name] == true
+end
+
+-- Publishes detached effect records in launch allocation order. A battler
+-- sprite copy also carries the native draw flag and draw priority its
+-- source slot currently holds, plus the shared manager draw loop: copies
+-- stay hidden until StartBattlerSpriteDraw starts drawing and
+-- SetBattlerSpriteVisible/StopBattlerSpriteDraw clear or set their flag,
+-- so the renderer needs the flags, not just the slot.
+---@return table<integer, { id: integer, sourceKey: string, age: integer, draw?: boolean, priority?: integer, picture?: table<string, unknown> }> renderable effect snapshot
 function BattleScene:effectViews()
   local ids = {}
   for id in pairs(self._effects) do
@@ -2188,7 +2961,25 @@ function BattleScene:effectViews()
         end
       end
     end
-    views[#views + 1] = { id = record.id, sourceKey = record.sourceKey, age = record.age, picture = picture }
+    local draw, priority = nil, nil
+    if type(picture) == "table" and type(picture.spriteSlot) == "number" then
+      local slotRecord = self._animationSprites[picture.spriteSlot]
+      -- The native draw task paints the shared manager only while that
+      -- manager is allocated, so copies need both the manager and an
+      -- active draw loop or frame-loop window beside their own slot flag.
+      draw = self._animationSpriteManagers["battler-sprite-manager"] == true
+        and (next(self._animationSpriteDrawLoops) ~= nil or next(self._animationSpriteDrawWindows) ~= nil)
+        and (slotRecord == nil or slotRecord.draw ~= false)
+      priority = slotRecord ~= nil and slotRecord.priority or nil
+    end
+    views[#views + 1] = {
+      id = record.id,
+      sourceKey = record.sourceKey,
+      age = record.age,
+      draw = draw,
+      priority = priority,
+      picture = picture,
+    }
   end
   return views
 end
@@ -2196,15 +2987,51 @@ end
 -- Registers one live move particle system for drawing: its simulation and the
 -- drawable handles of its textures by source texture id. The owning task keeps
 -- stepping the simulation; the scene only carries it to the renderer.
+-- Native manager slots are first-free physical slots 0..15, not an append
+-- log: freeing a slot hands it back to the next loaded manager so capture
+-- and calculation walk ascending physical order.
 ---@param system { simulation: SplParticleSimulation, textures: table<integer, unknown> } live system to draw
----@return integer id registration identity for release
+---@return integer id physical manager slot for release
 function BattleScene:allocParticleSystem(system)
   assert(not self._released, "released scenes register no particle systems")
   assert(type(system) == "table" and type(system.simulation) == "table", "particle systems carry their simulation")
-  local id = self._nextParticleSystem
-  self._nextParticleSystem = id + 1
+  local used = {}
+  for _, entry in ipairs(self._particleSystems) do
+    used[entry.id] = true
+  end
+  local id = nil
+  for slot = 0, 15 do
+    if not used[slot] then
+      id = slot
+      break
+    end
+  end
+  assert(id ~= nil, "no free particle manager slot")
   self._particleSystems[#self._particleSystems + 1] = { id = id, system = system }
   return id
+end
+
+-- Publishes one native draw-phase particle frame: the pre-advance draw
+-- copies the draw phase captured, in ascending physical slot order with
+-- their texture handles and alpha classifications. The next capture
+-- replaces the frame; drawing never advances simulation or RNG.
+---@param frame { simulation: table<string, unknown>, textures: table<integer, unknown>?, textureAlphaUsage: table<integer, table<string, unknown>>? }[] published pre-advance systems
+function BattleScene:publishParticleDrawFrame(frame)
+  assert(not self._released, "released scenes publish no particle frames")
+  assert(type(frame) == "table", "particle draw phases publish their captured frame")
+  self._drawParticleSystems = frame
+end
+
+-- The published pre-advance move particle systems for drawing: the exact
+-- geometry the native draw phase submitted, stable across repeated draws
+-- until the next capture. Absent before the first draw phase, when
+-- drawing falls back to the live systems.
+---@return table<integer, table<string, unknown>> published or live systems in ascending physical slot order
+function BattleScene:drawParticleSystems()
+  if self._drawParticleSystems ~= nil then
+    return self._drawParticleSystems
+  end
+  return self:particleSystems()
 end
 
 -- Drops one registered particle system; unknown or repeated identities stay silent.
@@ -2218,11 +3045,19 @@ function BattleScene:releaseParticleSystem(id)
   end
 end
 
--- The live move particle systems in registration order, for drawing.
+-- The live move particle systems in ascending physical slot order, for
+-- drawing: capture and calculation walk first-free slots ascending.
 ---@return { simulation: SplParticleSimulation, textures: table<integer, unknown> }[]
 function BattleScene:particleSystems()
-  local systems = {}
+  local ordered = {}
   for _, entry in ipairs(self._particleSystems) do
+    ordered[#ordered + 1] = entry
+  end
+  table.sort(ordered, function(left, right)
+    return left.id < right.id
+  end)
+  local systems = {}
+  for _, entry in ipairs(ordered) do
     systems[#systems + 1] = entry.system
   end
   return systems
@@ -2246,18 +3081,31 @@ function BattleScene:release()
   self._entries = {}
   self._effects = {}
   self._particleSystems = {}
+  self._drawParticleSystems = nil
   self._battlerSpriteSlots = {}
   self._background = nil
   self._backgroundRasterizer = nil
   self._backgroundLayers = {}
   self._pictureAnimations = {}
   self._pictureStates = {}
+  self._pictureSources = {}
   self._taskPicturePatches = {}
   self._taskScalarPatches = {}
   self._taskScalarPatchClock = 0
   self._taskScalarPatchOrder = {}
   self._gaugeTasks = {}
   self._healthBoxModes = {}
+  self._animationPlanes = {}
+  self._animationCompositor = {}
+  self._animationJournals = {}
+  self._animationSprites = {}
+  self._animationSpriteDrawLoops = {}
+  self._animationSpriteDrawWindows = {}
+  self._animationSpriteManagers = {}
+  self._animationSystemBlend = nil
+  self._stripe = nil
+  self._objWindowSilhouette = nil
+  self._scanlineRows = nil
 end
 
 return BattleScene

@@ -6,8 +6,8 @@
 
 local Assert = require("tests.support.Assert")
 local ApplicationPresentation = require("libs.ui.src.ApplicationPresentation")
-local BattleMenuPresenter = require("game.hgss.src.battle.BattleMenuPresenter")
 local BattleMenuRegions = require("game.hgss.src.battle.BattleMenuRegions")
+local CompositionFrameDrain = require("tests.support.CompositionFrameDrain")
 local BattleRenderer = require("game.hgss.src.battle.BattleRenderer")
 local BattleChildText = require("game.hgss.src.battle.BattleChildText")
 local BattleScreenInterface = require("game.hgss.src.battle.BattleScreenInterface")
@@ -23,6 +23,7 @@ local Party = require("libs.mons.src.Party")
 local ScreenTopology = require("libs.ui.src.ScreenTopology")
 local BattlePresentationManifestFixture = require("tests.support.BattlePresentationManifestFixture")
 local BagPresentationFixture = require("tests.support.BagPresentationFixture")
+local PartyPresentationFixture = require("tests.support.PartyPresentationFixture")
 
 local T = {}
 local TICK = 1 / 60
@@ -292,6 +293,37 @@ function T.learn_confirmation_uses_the_native_two_option_scope_and_hit_regions()
   Assert.equal(bottom.control.id, "back", "the bottom Keep/No option returns to the learning list")
 end
 
+-- The held Shift and wild replacement offers answer through the source
+-- two-option menu on the interaction pane: the plan selects the source
+-- layout, and its Yes/No cells answer the prompt's own input scope.
+function T.shift_and_use_next_prompts_use_the_native_two_option_scope()
+  local session = ApplicationPresentation.new(BattleScreenInterface.defaults(), nil)
+  for _, case in ipairs({
+    { mode = "shift", route = "menu/switch-or-keep", top = "Switch Pokémon", bottom = "Keep battling" },
+    { mode = "use-next", route = "menu/switch-or-flee", top = "Use next Pokémon", bottom = "Flee" },
+  }) do
+    local tag = " (" .. case.mode .. ")"
+    local prompt = view(case.mode)
+    prompt.selection = "yes"
+    prompt.twoOption = { route = case.route, top = case.top, bottom = case.bottom }
+    local plan = session:resolve(dualMeasurement(), prompt)
+    Assert.equal(plan.content.layout, "two-option", "the prompt selects the source two-option menu" .. tag)
+    local yes = plan.mapInput({ type = "pointer_down", pointerId = "tap-yes", x = 8, y = 40 }, prompt, plan)
+    Assert.notNil(yes, "the top source cell answers the open prompt" .. tag)
+    Assert.equal(yes.type, "battle_press", "the top cell presses like a menu control" .. tag)
+    Assert.equal(yes.control.id, "confirm", "the top cell is the source confirm option" .. tag)
+    Assert.equal(yes.control.scope, case.mode, "the top cell answers this prompt's own scope" .. tag)
+    local no = plan.mapInput({ type = "pointer_down", pointerId = "tap-no", x = 8, y = 112 }, prompt, plan)
+    Assert.notNil(no, "the bottom source cell answers the open prompt" .. tag)
+    Assert.equal(no.control.id, "back", "the bottom cell is the source back option" .. tag)
+    Assert.equal(no.control.scope, case.mode, "the bottom cell answers this prompt's own scope" .. tag)
+    Assert.isNil(
+      plan.mapInput({ type = "pointer_down", pointerId = "tap-gutter", x = 8, y = 100 }, prompt, plan),
+      "the gutter between the two options claims nothing" .. tag
+    )
+  end
+end
+
 -- Move anchors map per slot with their cancel region; target anchors map
 -- per admitted target.
 function T.move_and_target_anchors_map()
@@ -485,11 +517,9 @@ function T.native_control_art_starts_at_the_hit_region_origin()
             end,
           }
         end,
-        menuBlendTargets = function(self, blendGraphics)
-          if self.menuBlend == nil then
-            self.menuBlend = BattleMenuPresenter.newBlendTargets(blendGraphics)
-          end
-          return self.menuBlend
+        renderPictures = function(_, drawGraphics, frame)
+          CompositionFrameDrain.drain(drawGraphics, frame)
+          return { handle = "interface-pass" }
         end,
       },
       frameKey = "default",
@@ -521,7 +551,6 @@ function T.native_control_art_starts_at_the_hit_region_origin()
         mode .. " art uses the source region origin"
       )
     end
-    resources.assets.menuBlend:release()
   end
 
   assertLayout("command", {
@@ -606,14 +635,9 @@ function T.render_restores_borrowed_state()
       drawable = function(_, key)
         return image(key)
       end,
-      renderPictures = function()
+      renderPictures = function(_, drawGraphics, frame)
+        CompositionFrameDrain.drain(drawGraphics, frame)
         return { handle = "picture-composite" }
-      end,
-      menuBlendTargets = function(self, blendGraphics)
-        if self.menuBlend == nil then
-          self.menuBlend = BattleMenuPresenter.newBlendTargets(blendGraphics)
-        end
-        return self.menuBlend
       end,
     },
     frameKey = "default",
@@ -648,6 +672,40 @@ local function interfaceDualMeasurement()
     ),
     pixelRatio = 1,
     signature = "battle-pointer-test:dual",
+  }
+end
+
+-- Headless composition runs without GPU targets: the seeded pass drains
+-- plane and OBJ content through the recording boundary and records each
+-- typed frame, so content assertions observe the same draws production
+-- composes. Real pixels stay in the graphics layer.
+---@param rig table live screen rig under test driving
+local function seedHeadlessPass(rig)
+  local screen = assert(rig.screen, "the rig carries its battle screen")
+  rig.frames = {}
+  screen._assets._picturePass = {
+    render = function(_, graphics, frame)
+      rig.frames[#rig.frames + 1] = frame
+      CompositionFrameDrain.drain(graphics, frame)
+      for _, primitive in ipairs(frame.primitives or {}) do
+        local handle = primitive.image or primitive.material
+        local image = type(handle) == "table" and (handle.image or handle) or handle
+        local minX, minY = nil, nil
+        for _, vertex in ipairs(primitive.vertices or {}) do
+          local x = math.floor((vertex.clipX / 4096 + 1) * 128 * 2 ^ 20 + 0.5) / 2 ^ 20
+          local y = math.floor((1 - vertex.clipY / 4096) * 96 * 2 ^ 20 + 0.5) / 2 ^ 20
+          if minX == nil or x < minX then
+            minX = x
+          end
+          if minY == nil or y < minY then
+            minY = y
+          end
+        end
+        graphics.draw(image, nil, minX or 0, minY or 0)
+      end
+      return { handle = "rig-picture-pass" }
+    end,
+    release = function() end,
   }
 end
 
@@ -718,14 +776,13 @@ local function openInterfaceRig(opts)
     end
     return stored
   end
-  function rig.assets.renderPictures()
-    return { handle = "picture-composite" }
-  end
+
   function rig.assets.release(key)
     rig.assets.released[key] = (rig.assets.released[key] or 0) + 1
   end
   local launchId = opts.launchId or "launch-pointer-cancel"
   local screen = BattleScreenState.new({
+    splRandomState = { state = 0 },
     launchId = launchId,
     manifest = BattlePresentationManifestFixture.launchView(
       { "back:PKMN_TRAINER_ETHAN", "front:YOUNGSTER" },
@@ -745,6 +802,7 @@ local function openInterfaceRig(opts)
     audio = rig.audio,
   })
   rig.screen = screen
+  seedHeadlessPass(rig)
   rig.port = screen:presentationPort()
   function rig.pump(ticks, dt)
     for _ = 1, ticks or 1 do
@@ -1061,9 +1119,7 @@ local function openChildRig(opts)
     end
     return stored
   end
-  function rig.assets.renderPictures()
-    return { handle = "picture-composite" }
-  end
+
   function rig.assets.release(key)
     rig.assets.released[key] = (rig.assets.released[key] or 0) + 1
   end
@@ -1105,6 +1161,7 @@ local function openChildRig(opts)
     return true
   end
   local screen = BattleScreenState.new({
+    splRandomState = { state = 0 },
     launchId = launchId,
     manifest = BattlePresentationManifestFixture.launchView(
       { "back:PKMN_TRAINER_ETHAN", "front:YOUNGSTER" },
@@ -1130,9 +1187,14 @@ local function openChildRig(opts)
         renderer = battleBagRenderer,
         icons = {},
       },
+      -- Production always lends the staged party manifest beside the
+      -- bag: target and party pickers compose through the same native
+      -- geometry instead of an invented fallback.
+      party = { manifest = PartyPresentationFixture.manifest() },
     },
   })
   rig.screen = screen
+  seedHeadlessPass(rig)
   rig.port = screen:presentationPort()
   holder.battle = BattleRuntime.new({
     request = launch,
@@ -1207,8 +1269,16 @@ end
 ---@param rig table live screen rig under test driving, resting on its command prompt
 local function openBagFromCommand(rig)
   driveToMode(rig, "command")
-  press(rig, { type = "navigate", direction = "down" })
-  press(rig, { type = "navigate", direction = "left" })
+  -- The paired grid reaches Bag down then left; the compact 2x2 grid
+  -- draws Bag right of Fight, so it takes right. The first edge only
+  -- reveals the cursor in both cases.
+  if rig.layout == "compact" then
+    press(rig, { type = "navigate", direction = "right" })
+    press(rig, { type = "navigate", direction = "right" })
+  else
+    press(rig, { type = "navigate", direction = "down" })
+    press(rig, { type = "navigate", direction = "left" })
+  end
   press(rig, { type = "confirm" })
   Assert.equal(rig.screen:status().mode, "child", "the Bag command opens the bag child (" .. rig.layout .. ")")
 end
@@ -1216,12 +1286,14 @@ end
 ---@param rig table live screen rig under test driving, resting on the open bag child
 local function walkToMedicineFirstCell(rig)
   press(rig, { type = "confirm" })
+  press(rig, { type = "confirm" })
   settlePress(rig)
   settlePress(rig)
 end
 
 ---@param rig table live screen rig under test driving, resting on the open bag child
 local function walkToBallsFirstCell(rig)
+  press(rig, { type = "navigate", direction = "right" })
   press(rig, { type = "navigate", direction = "right" })
   press(rig, { type = "confirm" })
   settlePress(rig)
@@ -1536,6 +1608,44 @@ function T.native_battle_party_waits_for_its_icon_pages()
     Assert.isTrue(BattleRenderer.drawNativeChild(resources, child, placement), "the ready " .. kind .. " is rendered")
     Assert.equal(draws, 1, "the " .. kind .. " picker draws once its icon pages are prepared")
     draws = 0
+  end
+end
+
+function T.native_battle_party_yields_while_its_summary_wrapper_owns_the_modal()
+  local draws = 0
+  local partyRenderer = {
+    draw = function()
+      draws = draws + 1
+    end,
+  }
+  local resources = {
+    assets = {
+      state = function()
+        return "ready"
+      end,
+    },
+    battleMenus = { party = { renderer = partyRenderer, icons = {} } },
+  }
+  local placement = {
+    frame = { x = 0, y = 192, width = 256, height = 192 },
+    origin = { x = 0, y = 192 },
+    scale = 1,
+    logicalWidth = 256,
+    logicalHeight = 192,
+    clipRect = { x = 0, y = 192, width = 256, height = 192 },
+  }
+  for _, page in ipairs({ "summary", "moves", "move_detail" }) do
+    draws = 0
+    local child = {
+      kind = "party",
+      partyPage = page,
+      native = { open = true, layout = {}, page = page },
+    }
+    Assert.isFalse(
+      BattleRenderer.drawNativeChild(resources, child, placement),
+      "the " .. page .. " wrapper paints instead of the native roster"
+    )
+    Assert.equal(draws, 0, "the " .. page .. " wrapper draws no native roster underneath")
   end
 end
 

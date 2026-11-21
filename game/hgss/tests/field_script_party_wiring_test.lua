@@ -72,7 +72,7 @@ local function stubRuntime()
     },
     fieldTerrainEffectController = {},
     scriptHosts = nil,
-    screenFade = nil,
+    screenFade = require("libs.hgss.src.transition.FieldScriptScreenFade").new(),
     auxiliaryFieldUi = {},
     contextChoiceProvider = {},
     menuHost = {},
@@ -84,6 +84,8 @@ local function stubRuntime()
     mapLoader = {},
     kurtBoxHost = {},
     fashionCase = require("libs.hgss.src.save.FashionCaseState").empty(),
+    sysInfo = require("libs.hgss.src.save.SysInfoState").empty(),
+    fieldPoison = require("libs.hgss.src.save.FieldPoisonSave").initial(),
     easyChatCatalog = {},
     easyChatState = {},
     pokegearRandom = {},
@@ -160,7 +162,7 @@ function T.compose_threads_the_script_mart_host()
   local double = {
     new = function(opts)
       seen.opts = opts
-      return { scheduler = {}, worldState = {}, blackoutFlow = {} }
+      return { scheduler = {}, worldState = {}, blackoutFlow = {}, moneyBox = {} }
     end,
   }
   local savedTarget = package.loaded[TARGET_MODULE]
@@ -184,7 +186,7 @@ function T.compose_threads_the_party_selection_host()
   local seen = {}  local double = {
     new = function(opts)
       seen.opts = opts
-      return { scheduler = {}, worldState = {}, blackoutFlow = {} }
+      return { scheduler = {}, worldState = {}, blackoutFlow = {}, moneyBox = {} }
     end,
   }
   local savedTarget = package.loaded[TARGET_MODULE]
@@ -217,7 +219,7 @@ local function drivePichuGift(dexStub, statsStub, monsStub)
   local double = {
     new = function(opts)
       seen.opts = opts
-      return { scheduler = {}, worldState = {}, blackoutFlow = {} }
+      return { scheduler = {}, worldState = {}, blackoutFlow = {}, moneyBox = {} }
     end,
   }
   local savedTarget = package.loaded[TARGET_MODULE]

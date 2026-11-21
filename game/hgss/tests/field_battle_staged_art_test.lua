@@ -241,6 +241,13 @@ function T.staged_keys_resolve_to_their_verified_manifest_paths()
     ["bag:screen:1"] = manifest.bag.pages[1].image,
     ["bag:screen:2"] = manifest.bag.pages[2].image,
     ["bag:screen:3"] = manifest.bag.pages[3].image,
+    -- The d-pad focus corners frame every bag and party-wrapper focus box
+    -- (BattleDpadCursor_SetRect); each corner name resolves its own staged
+    -- pulse art.
+    ["battle:cursor-tl"] = manifest.bag.cursor.tl.image,
+    ["battle:cursor-tr"] = manifest.bag.cursor.tr.image,
+    ["battle:cursor-bl"] = manifest.bag.cursor.bl.image,
+    ["battle:cursor-br"] = manifest.bag.cursor.br.image,
   }
   for key, path in pairs(expected) do
     Assert.equal(resolvedPath(envelope, pool, key), path, "staged key resolves its manifest path: " .. key)
@@ -263,6 +270,7 @@ function T.staged_keys_resolve_to_their_verified_manifest_paths()
     "bag:screen:1@general",
     "bag:bogus",
     "bag",
+    "battle:cursor",
   }) do
     Assert.isNil(resolvedPath(envelope, pool, key), "key without staged art resolves to nothing: " .. key)
   end
@@ -704,6 +712,81 @@ function T.tutorial_finger_resolves_its_staged_image()
   Assert.notNil(
     envelope._services.drawable(finger.key),
     "the auto-play finger demand resolves instead of nil-matching"
+  )
+  envelope:dispose()
+end
+
+-- Retail detail icons resolve through their staged manifests: the
+-- move-detail damage-category sprite rides the shared move-icon
+-- categories (MoveCategoryIcon_GetCharFile over NARC_a_0_0_8) and the
+-- wrapper status sprite rides the staged party visuals (ShowStatusIcon
+-- over NARC_a_0_3_9). Unknown keys in either family resolve to nothing.
+function T.battle_detail_icons_resolve_through_their_staged_manifests()
+  local manifest = stagedManifest()
+  local categoryVisual = {
+    image = ART .. "move-category-physical.png",
+    width = 32,
+    height = 16,
+    offset = { x = -16, y = -8 },
+  }
+  local statusVisual = { image = ART .. "party-status-poison.png", width = 24, height = 8 }
+  local partyManifest = { visuals = { status = { poison = statusVisual } } }
+  local cacheFs = { versionId = "staged-art-detail-icons-probe" }
+  function cacheFs:loadLua(path)
+    if path == BattlePresentationCache.manifestPath() then
+      return manifest
+    end
+    if path == MoveIconCache.manifestPath() then
+      return { schema = MoveIconCache.SCHEMA, types = {}, categories = { physical = categoryVisual } }
+    end
+    return nil
+  end
+  function cacheFs:read(path)
+    local source = findSourceIndices(manifest, path)
+    if source ~= nil then
+      return string.rep("\0", source.width * source.height * 4)
+    end
+    return "staged"
+  end
+  function cacheFs:exists(_, _)
+    return true
+  end
+  local pool = recordingPool()
+  local envelope = FieldBattlePresentation.new({
+    cacheFs = cacheFs,
+    windows = {},
+    text = {},
+    measureDisplay = function()
+      return {}
+    end,
+    graphics = {},
+    imagePool = pool,
+    battleMenus = { party = { manifest = partyManifest } },
+  })
+  Assert.equal(
+    resolvedPath(envelope, pool, "battle:move-category-icon:physical"),
+    categoryVisual.image,
+    "the physical category icon resolves its staged image"
+  )
+  Assert.isNil(
+    resolvedPath(envelope, pool, "battle:move-category-icon:bogus"),
+    "an unknown category resolves to nothing"
+  )
+  Assert.equal(
+    resolvedPath(envelope, pool, "battle:status-icon:poison"),
+    statusVisual.image,
+    "the poison status icon resolves its staged party image"
+  )
+  local handle = assert(
+    envelope._services.drawable("battle:status-icon:poison"),
+    "the status icon hands out its drawable"
+  )
+  local width, height = handle:getDimensions()
+  Assert.equal(width, 24, "status icons keep their staged width")
+  Assert.equal(height, 8, "status icons keep their staged height")
+  Assert.isNil(
+    resolvedPath(envelope, pool, "battle:status-icon:bogus"),
+    "an unknown status resolves to nothing"
   )
   envelope:dispose()
 end

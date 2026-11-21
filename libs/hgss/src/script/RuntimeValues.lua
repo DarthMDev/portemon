@@ -9,6 +9,15 @@ local RuntimeValues = {}
 local PLAYER_GENDER_MALE = 0
 local SPRITE_HERO = 0
 local SPRITE_HEROINE = 97
+-- Retail `include/constants/flags.h::TRAINER_FLAG_BASE`: a defeated trainer
+-- persists as the ordinary numeric event flag above this offset. The source
+-- reads a 16-bit trainer number, but the flag store keys are unsigned 16-bit
+-- too, so only numbers whose computed flag id stays in that domain are
+-- referenceable; a larger number faults at the reference instead of naming a
+-- flag the store would reject later.
+local TRAINER_FLAG_BASE = 0x550
+local FLAG_ID_MAX = 0xFFFF
+local MAX_SOURCE_TRAINER = FLAG_ID_MAX - TRAINER_FLAG_BASE
 
 local SEMANTIC_STYLES = {
   sign = "hgss.signpost",
@@ -41,6 +50,41 @@ function RuntimeValues.encodePlayerFacing(facing, run)
     )
   end
   return assert(code, "player facing code resolved")
+end
+
+-- The source direction code a script variable carries for an object facing
+-- write (0 north, 1 south, 2 west, 3 east). One authoritative conversion: the
+-- script runtime decodes facing operands through it and the maps service uses
+-- it for the dynamic-warp direction.
+local DIRECTION_BY_CODE = { [0] = "north", [1] = "south", [2] = "west", [3] = "east" }
+
+-- Decode an evaluated direction operand to its cardinal direction: a lowered
+-- literal already carries the name, a source variable carries the code. An
+-- unknown value answers nil so each caller can raise its own attributed error.
+---@param value unknown
+---@return string|nil
+function RuntimeValues.sourceDirection(value)
+  if type(value) == "string" and PLAYER_FACING_CODES[value] ~= nil then
+    return value
+  end
+  if type(value) == "number" then
+    return DIRECTION_BY_CODE[value]
+  end
+  return nil
+end
+
+---@param value unknown
+---@param run table<string, unknown>
+---@return string
+function RuntimeValues.decodeDirection(value, run)
+  local direction = RuntimeValues.sourceDirection(value)
+  if direction == nil then
+    Errors.raise(ScriptErrors.SCRIPT_INVALID_REFERENCE, "unknown source direction " .. tostring(value), {
+      scriptId = run.instance.scriptId,
+      direction = tostring(value),
+    })
+  end
+  return assert(direction)
 end
 
 -- Write a value reference: locals and vars are writable; args are read-only
@@ -109,6 +153,26 @@ function RuntimeValues.evaluateValue(v, run)
   elseif kind == "flag_value" then
     local flagId = RuntimeValues.resolveIdOperand(v.flag, run)
     return run.services.world:isFlagSet(flagId) and 1 or 0
+  elseif kind == "trainer_flag_id" then
+    -- ScriptGetVar semantics: the trainer number is a literal or a live
+    -- variable. A number whose computed flag id would leave the event-flag
+    -- domain is an attributed reference fault instead of a wrapped or
+    -- clamped flag.
+    local trainer = RuntimeValues.evaluateValue(v.trainer, run)
+    if
+      type(trainer) ~= "number"
+      or trainer ~= trainer
+      or trainer % 1 ~= 0
+      or trainer < 0
+      or trainer > MAX_SOURCE_TRAINER
+    then
+      Errors.raise(
+        ScriptErrors.SCRIPT_INVALID_REFERENCE,
+        "trainer number must resolve to an event flag id",
+        { scriptId = run.instance.scriptId, trainer = tostring(trainer) }
+      )
+    end
+    return TRAINER_FLAG_BASE + trainer
   elseif kind == "player_gender_value" then
     return run.services.player:gender()
   elseif kind == "friend_sprite_value" then
@@ -450,6 +514,47 @@ function RuntimeValues.requireActor(ref, run)
     )
   end
   return actorId
+end
+
+-- Resolve an actor reference that is allowed to name nothing: a numeric map
+-- object index the current map does not carry and a special reference with no
+-- trigger target answer nil instead of faulting, exactly as the source commands
+-- that treat an absent object as a no-op require.
+---@param ref unknown
+---@param run table<string, unknown>
+---@return string|nil actorId
+function RuntimeValues.findActor(ref, run)
+  if type(ref) == "string" then
+    return ref
+  end
+  if ref.ref ~= "actor" then
+    Errors.raise(
+      ScriptErrors.SCRIPT_INVALID_REFERENCE,
+      "expected an actor reference",
+      { scriptId = run.instance.scriptId }
+    )
+  end
+  if ref.mapIndex ~= nil then
+    return run.services.actors:actorIdForMapIndex(RuntimeValues.evaluateMapIndex(ref, run))
+  end
+  if ref.id ~= nil then
+    return ref.id
+  end
+  local trigger = run.instance.trigger
+  if ref.special == "player" then
+    return "player"
+  elseif ref.special == "self" or ref.special == "last_talked" then
+    return trigger and trigger.selfActor or nil
+  elseif ref.special == "partner" then
+    return run.services.actors:partnerId()
+  elseif ref.special == "camera_target" then
+    return run.services.actors:cameraTargetId()
+  end
+  Errors.raise(
+    ScriptErrors.SCRIPT_INVALID_REFERENCE,
+    "expected an actor reference",
+    { scriptId = run.instance.scriptId, special = ref.special }
+  )
 end
 
 -- ShowPerson target: a numeric map-object index names an object that may be

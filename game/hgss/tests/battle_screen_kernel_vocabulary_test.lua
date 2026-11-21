@@ -2,8 +2,9 @@
 -- kernel event kind the native session actually emits receives an
 -- intentional presentation (narration, health motion, or an explicit
 -- silent accounting treatment) instead of the unknown-effect placeholder.
--- Synthetic packets use the real kernel payload shapes; the closing
--- scenario drives a real runtime and screen through an ordinary turn.
+-- Synthetic packets use the real kernel payload shapes through the real
+-- cue player; end-to-end production delivery is owned by the live screen
+-- suite with its real completion.
 
 local Assert = require("tests.support.Assert")
 local BattleTimeline = require("game.hgss.tests.support.BattleTimelineFixture")
@@ -88,11 +89,18 @@ local function event(kind, payload, afterHp)
     combatants[combatant] = checkpoint(combatant, health, combatant == 1 and 52 or 57)
     hp[combatant] = health
   end
+  -- Synthetic emissions carry the same identity facts production
+  -- does: the actor behind the cause and the targeted battler resolve
+  -- through the event-time views at selection.
+  local user = payload.user or payload.combatant
+  local target = payload.target or payload.combatant
   return {
     sequence = 1,
     kind = kind,
     cause = { key = "TACKLE" },
     audience = "public",
+    actors = { { combatant = type(user) == "number" and user or 1 } },
+    targets = { { combatant = type(target) == "number" and target or 3 } },
     payload = payload,
     after = { hp = hp, combatants = combatants },
   }
@@ -351,181 +359,28 @@ function T.move_use_announces_its_user()
   assertNoPlaceholder(timeline, "move-used")
 end
 
----@param record table<string, unknown> full mon-domain record under test preparation
----@return table<string, unknown> the same record striking with the requested moves
-local function movesOnly(record, moves)
-  record.moves = moves
-  return record --[[@as table<string, unknown>]]
-end
-
----@param species string catalog species key under test preparation
----@param level integer battle level under test preparation
----@param seed integer fixed generator state under test preparation
----@return table full mon-domain record
-local function vocabularyFoe(species, level, seed)
-  local CatalogFixture = require("libs.mons.tests.catalog_fixture")
-  local catalog = CatalogFixture.makeCatalog()
-  local factory = CatalogFixture.makeFactory(seed, catalog)
-  return movesOnly(factory:createNormal(CatalogFixture.normalRequest({ species = species, level = level })), {
-    { move = "TAIL_WHIP", pp = 30, ppUps = 0 },
-  })
-end
-
----@param spec table lead/reserve description under test preparation
----@return table live party owner holding the described pair
-local function vocabularyParty(leadSpec, reserveSpec)
-  local CatalogFixture = require("libs.mons.tests.catalog_fixture")
-  local HgssMonService = require("libs.hgss.src.mons.HgssMonService")
-  local Lcrng = require("libs.mons.src.gen4.Lcrng")
-  local MonsSave = require("libs.mons.src.MonsSave")
-  local Party = require("libs.mons.src.Party")
-  local catalog = CatalogFixture.makeCatalog()
-  local owner = HgssMonService.new({
-    catalog = catalog,
-    bucket = MonsSave.capture(Party.new():capture(), Lcrng.new(0x22222222):capture()),
-    profile = CatalogFixture.profile(),
-    game = "heartgold",
-    language = "english",
-    charmap = CatalogFixture.CHARMAP,
-    games = CatalogFixture.GAMES,
-    languages = CatalogFixture.LANGUAGES,
-    items = CatalogFixture.ITEMS,
-    balls = CatalogFixture.BALLS,
-    mapSection = 7,
-    date = CatalogFixture.metDate(),
-  })
-  for _, member in ipairs({ leadSpec, reserveSpec }) do
-    local factory = CatalogFixture.makeFactory(member.seed, catalog)
-    local record = movesOnly(
-      factory:createNormal(CatalogFixture.normalRequest({ species = member.species, level = member.level })),
-      {
-        { move = "TACKLE", pp = 35, ppUps = 0 },
-      }
-    )
-    Assert.isTrue(owner:addMon(record), "the vocabulary path needs its live party member")
-  end
-  return owner
-end
-
--- A real wild battle end to end through the real cue player: every
--- kernel event kind the turn actually emits receives an intentional
--- presentation, so ordinary play never types out the placeholder.
-function T.ordinary_production_turns_never_show_the_placeholder()
-  local HgssBagService = require("libs.hgss.src.items.HgssBagService")
-  local ItemFixture = require("libs.items.tests.item_fixture")
-  local ScenarioFactory = require("libs.hgss.src.battle.HgssBattleScenarioFactory")
-  local SessionFixture = require("libs.battle.tests.session_fixture")
-  local BattleRuntime = require("game.hgss.src.battle.BattleRuntime")
-  local party = vocabularyParty(
-    { species = "EEVEE", level = 12, seed = 0x11111111 },
-    { species = "EEVEE", level = 12, seed = 0x22222222 }
-  )
-  local bag = HgssBagService.new({ catalog = ItemFixture.makeCatalog() })
-  local launch = {
-    id = "launch-kernel-vocabulary",
-    kind = "wild",
-    payload = {
-      attemptId = "launch-kernel-vocabulary-attempt",
-      species = "EEVEE",
-      form = 0,
-      level = 5,
-      personality = 1,
-      ability = "RUN_AWAY",
-    },
-  }
-  local scenario = ScenarioFactory.fromEncounter(
-    { attemptId = launch.id .. "-attempt", mon = vocabularyFoe("EEVEE", 5, 0x33333333) },
-    { party = party, bag = bag, player = { trainerId = 99, trainerName = "MINT", language = "french", trainerClassKey = "PKMN_TRAINER_ETHAN" } }
-  )
-  local record = { packets = {} }
-  local port = {
-    enter = function(_plan)
-      return true
-    end,
-    present = function(packet)
-      record.packets[#record.packets + 1] = packet
-    end,
-    ready = function()
-      return true
-    end,
-    leave = function(_plan)
-      return true
-    end,
-    dispose = function() end,
-  }
-  local battle = BattleRuntime.new({
-    request = launch,
-    scenario = scenario,
-    party = party,
-    bag = bag,
-    presentation = port,
-    seed = 0x12345678,
-  })
-  for _ = 1, 1200 do
-    battle:update()
-    local current = battle:status()
-    Assert.isTrue(current.phase ~= "failed", "the vocabulary battle never fails")
-    if current.phase == "running" and current.request ~= nil then
-      local addressed = assert(current.request.actors[1], "every vocabulary decision addresses its combatant")
-      local ok, err = battle:submit(SessionFixture.replyFor(current.request, {
-        SessionFixture.attackChoice(addressed, 0, SessionFixture.positionTarget(2)),
-      }))
-      Assert.isTrue(ok, "the vocabulary lead keeps striking: " .. tostring(err))
-    end
-    if current.phase == "complete" then
-      break
-    end
-  end
-  Assert.isTrue(#record.packets > 0, "the vocabulary battle delivers packets")
-  local seenKinds = {}
-  for _, packetRecord in ipairs(record.packets) do
-    for _, event in ipairs(packetRecord.events) do
-      seenKinds[event.kind] = true
-    end
-  end
-  Assert.isTrue(seenKinds["struck"] == true, "the vocabulary battle really strikes")
-  Assert.isTrue(seenKinds["move-used"] == true, "the foe really uses its stage move")
-  Assert.isTrue(seenKinds["stage"] == true, "the stage move really stages")
-  -- The closing production packets carry selected native effects, so the
-  -- cue player requires its animation collaborator. This vocabulary
-  -- scenario owns message wording rather than native playback, so effects
-  -- settle at once here; the live screen suite owns real completion.
-  local settledEffects = {}
-  function settledEffects.start(cue)
-    assert(type(cue) == "table" and cue.effectKey ~= nil, "native cues carry their selected key")
-    return { effectKey = cue.effectKey }
-  end
-  function settledEffects.status(_handle)
-    return "complete"
-  end
-  function settledEffects.cancel(_handle) end
-  local timeline = BattleTimeline.new({ effects = settledEffects })
-  timeline:reset(record.packets[1].before)
-  local messages = {}
-  local last = nil
-  for _, packetRecord in ipairs(record.packets) do
-    Assert.isTrue(timeline:present(packetRecord), "every production packet plays once")
-    for _ = 1, 3600 do
-      local current = timeline:message()
-      if current ~= "" and current ~= last then
-        messages[#messages + 1] = current
-        last = current
-      end
-      if timeline:settled() then
-        break
-      end
-      timeline:update(TICK, function(_)
-        return true
-      end)
-    end
-    Assert.isTrue(timeline:settled(), "every production packet drains")
-  end
-  local shown = table.concat(messages, "\n")
+-- Marking moves voice their subscript lines behind the use announcement:
+-- Foresight, Odor Sleuth, and Miracle Eye voice the identification line
+-- (subscript_0100_Foresight and subscript_0158_MiracleEye msg 432) while
+-- Lock-On and Mind Reader voice the aim line (subscript_0079_LockOn
+-- msg 378); both name the attacker and the defender.
+function T.marking_moves_narrate_both_battlers()
+  local timeline = BattleTimeline.new({})
+  timeline:reset(openingView())
+  local identified = event("identified", { user = 1, target = 3 }, { [1] = 52, [3] = 57 })
+  identified.cause = { key = "FORESIGHT" }
+  local aimed = event("aimed", { user = 1, target = 3 }, { [1] = 52, [3] = 57 })
+  aimed.cause = { key = "LOCK_ON" }
+  timeline:present(packet(1, { identified, aimed }))
+  local messages = collectMessages(timeline)
+  Assert.isTrue(messages:find("LEAD", 1, true) ~= nil, "the marking lines name the attacker: " .. messages)
+  Assert.isTrue(messages:find("FOE", 1, true) ~= nil, "the marking lines name the defender: " .. messages)
   Assert.isTrue(
-    shown:find("unrepresentable", 1, true) == nil,
-    "ordinary production narration never shows the placeholder: " .. shown
+    messages:find("unrepresentable", 1, true) == nil,
+    "marking moves never show the placeholder: " .. messages
   )
-  Assert.equal(#timeline:diagnostics(), 0, "ordinary production events record no diagnostics")
+  assertNoPlaceholder(timeline, "identified")
+  assertNoPlaceholder(timeline, "aimed")
 end
 
 return { tests = T }

@@ -148,13 +148,14 @@ function T.move_power_picture_transition_requires_a_typed_event_input_and_fixed_
     },
   }
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "move-power-picture-transition",
     catalogIdentity = "synthetic-catalog",
     program = program(instruction),
     dependencies = {},
     resources = {},
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   Assert.isTrue(schema().assertProgram(effect.program))
   effect.requiredContext.battlerTopology = { type = "battle-animation-battler-topology" }
@@ -358,13 +359,14 @@ function T.sprite_priority_appearance_requires_topology_and_registered_sprite_co
     },
   }
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "sprite-priority-appearance-effect",
     catalogIdentity = "synthetic-catalog",
     program = program(instruction),
     dependencies = {},
     resources = {},
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   Assert.isFalse(pcall(schema().assertEffect, effect))
   effect.requiredContext.battlerTopology = { type = "battle-animation-battler-topology" }
@@ -376,7 +378,7 @@ end
 
 function T.cyclic_picture_position_transition_requires_battler_topology()
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "cyclic-picture-position-effect",
     catalogIdentity = "synthetic-catalog",
     program = program({
@@ -400,6 +402,7 @@ function T.cyclic_picture_position_transition_requires_battler_topology()
     dependencies = {},
     resources = {},
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   Assert.isFalse(pcall(schema().assertEffect, effect))
   effect.requiredContext.battlerTopology = { type = "battle-animation-battler-topology" }
@@ -427,13 +430,14 @@ function T.battler_blend_alpha_callback_has_typed_sprite_and_coefficient_fields(
 
   instruction.parameters.oamModeSpriteSlots = { "sprite-context-slot-0" }
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "blend-alpha-effect",
     catalogIdentity = "synthetic-catalog",
     program = program(instruction),
     dependencies = {},
     resources = {},
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   Assert.isFalse(pcall(schema().assertEffect, effect), "selected managed sprites require their semantic context table")
   effect.requiredContext.spriteContextTable = { type = "battle-animation-sprite-context-table" }
@@ -453,13 +457,14 @@ function T.selected_picture_pair_callback_requires_a_closed_topology_context()
   Assert.isFalse(pcall(schema().assertProgram, program(instruction)))
   instruction.parameters.pictureSets = { "active-battler" }
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "selected-picture-pair-effect",
     catalogIdentity = "synthetic-catalog",
     program = program(instruction),
     dependencies = {},
     resources = {},
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   Assert.isFalse(pcall(schema().assertEffect, effect), "pair selection requires battler topology")
   effect.requiredContext.battlerTopology = { type = "battle-animation-battler-topology" }
@@ -468,7 +473,7 @@ end
 
 function T.picture_affine_blend_callback_requires_registered_sprite_context()
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "picture-affine-blend-effect",
     catalogIdentity = "synthetic-catalog",
     program = program({
@@ -481,6 +486,7 @@ function T.picture_affine_blend_callback_requires_registered_sprite_context()
     dependencies = {},
     resources = {},
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   Assert.isFalse(pcall(schema().assertEffect, effect))
   effect.requiredContext.spriteContextTable = { type = "battle-animation-sprite-context-table" }
@@ -565,16 +571,6 @@ function T.reciprocal_position_palette_callback_has_a_closed_task_contract()
     callback = "pokemon-picture-reciprocal-position-palette-transition",
     taskKind = "pokemon-picture-reciprocal-position-palette-transition",
     taskContext = "pokemon-picture",
-    parameters = {},
-  })))
-end
-
-function T.battle_palette_callback_schema_names_pokemon_picture_fades()
-  Assert.isTrue(schema().assertProgram(program({
-    op = "invoke-battle-animation-callback",
-    callback = "pokemon-picture-and-battle-palette-fade-cycle",
-    taskKind = "pokemon-picture-and-battle-palette-fade-cycle",
-    taskContext = "battle-palette",
     parameters = {},
   })))
 end
@@ -698,24 +694,16 @@ function T.picture_palette_fade_position_schema_bounds_its_typed_parameters()
 end
 
 function T.background_picture_scroll_callback_schema_closes_its_mode_parameters()
-  for _, instruction in ipairs({
-    {
+  Assert.isTrue(
+    schema().assertProgram(program({
       op = "invoke-battle-animation-callback",
       callback = "battle-background-picture-scroll-oscillation",
       taskKind = "battle-background-picture-scroll-oscillation",
       taskContext = "battle-display",
-      parameters = { directionState = 1, phaseIndex = 4 },
-    },
-    {
-      op = "invoke-battle-animation-callback",
-      callback = "battle-background-picture-coordinate-sweep",
-      taskKind = "battle-background-picture-coordinate-sweep",
-      taskContext = "battle-display",
-      parameters = { startX = -2, startY = 3, deltaX = -4, deltaY = 7 },
-    },
-  }) do
-    Assert.isTrue(schema().assertProgram(program(instruction)), "selector 27 mode has its closed semantic profile")
-  end
+      parameters = { shake = 1, shakeAmpX = -2, shakeAmpY = 3, shakeInterval = -4, shakeCount = 7, shakeExtra = 0 },
+    })),
+    "selector 27 has its closed semantic profile"
+  )
 end
 
 function T.picture_affine_sprite_pair_callback_schema_requires_its_named_task()
@@ -785,6 +773,12 @@ function T.animation_callback_schema_keeps_randomized_motion_target_typed()
 end
 
 function T.animation_callback_schema_closes_panel_slide_profiles_and_offsets()
+  local resourceKeys = {}
+  for graphic = 0, 3 do
+    resourceKeys["stripeGraphic" .. graphic .. "Char"] = "stripe-graphic-" .. graphic .. "-char"
+    resourceKeys["stripeGraphic" .. graphic .. "Palette"] = "stripe-graphic-" .. graphic .. "-palette"
+    resourceKeys["stripeGraphic" .. graphic .. "Screen"] = "stripe-graphic-" .. graphic .. "-screen"
+  end
   for _, callback in ipairs({
     "battle-sprite-panel-slide-down",
     "battle-sprite-panel-slide-up",
@@ -795,6 +789,8 @@ function T.animation_callback_schema_closes_panel_slide_profiles_and_offsets()
       callback = callback,
       taskKind = "battle-sprite-panel-slide",
       taskContext = "sprite-system",
+      runtimeSelection = "object-window-stripe-selection",
+      resourceKeys = resourceKeys,
       parameters = {
         firstPanelOffsetX = 0,
         firstPanelOffsetY = -6,
@@ -871,12 +867,27 @@ function T.animation_callback_schema_accepts_battle_picture_palette_fade_cycle()
   Assert.isTrue(
     schema().assertProgram(program({
       op = "invoke-battle-animation-callback",
-      callback = "pokemon-picture-battle-palette-fade-cycle",
-      taskKind = "pokemon-picture-battle-palette-fade-cycle",
+      callback = "pokemon-picture-and-battle-palette-fade-cycle",
+      taskKind = "pokemon-picture-and-battle-palette-fade-cycle",
       taskContext = "battle-palette",
+      battlerTarget = "attacker",
       parameters = {},
     })),
     "the callback owns both battle palette and picture fade state"
+  )
+end
+
+function T.animation_callback_schema_accepts_attacker_leap_offscreen()
+  Assert.isTrue(
+    schema().assertProgram(program({
+      op = "invoke-battle-animation-callback",
+      callback = "pokemon-picture-leap-offscreen-transition",
+      taskKind = "pokemon-picture-leap-offscreen-transition",
+      taskContext = "pokemon-picture",
+      battlerTarget = "attacker",
+      parameters = {},
+    })),
+    "the leap callback owns the attacker picture's scale legs"
   )
 end
 
@@ -1247,7 +1258,7 @@ function T.configured_sprite_parameters_are_named_and_task_specific()
   local instruction = {
     op = "create-configured-sprite",
     parameters = { offsetX = -12, offsetY = 8 },
-    taskKind = "sprite-position-offset",
+    taskKind = "sprite-offset-animate",
     taskContext = "battle-sprite",
     resourceKeys = {
       character = "battle/sprite/example/character",
@@ -1453,7 +1464,7 @@ end
 
 function T.effect_resources_require_semantic_payload_identity()
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "synthetic-effect",
     catalogIdentity = "synthetic-catalog",
     program = program({ op = "set-parameter", values = { 0, 1 } }),
@@ -1476,6 +1487,7 @@ function T.effect_resources_require_semantic_payload_identity()
       },
     },
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   Assert.isTrue(schema().assertEffect(effect), "typed payload with a SHA-1 content identity validates")
   effect.resources["battle/palette/test"].contentIdentity = nil
@@ -1489,7 +1501,7 @@ end
 function T.effect_context_is_a_closed_typed_layout_and_resources_cover_instruction_keys()
   local resourceKey = "battle/particle/test"
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "typed-context-effect",
     catalogIdentity = "synthetic-catalog",
     program = program({
@@ -1507,6 +1519,7 @@ function T.effect_context_is_a_closed_typed_layout_and_resources_cover_instructi
       },
     },
     requiredContext = { attackerPosition = { type = "battler-position" } },
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   Assert.isTrue(schema().assertEffect(effect))
   effect.requiredContext.attackerPosition.type = "native-battler-type"
@@ -1525,13 +1538,14 @@ end
 -- provider cannot resolve never validates.
 function T.effect_sounds_name_shared_sequence_symbols_without_staged_payloads()
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "voiced-effect",
     catalogIdentity = "synthetic-catalog",
     program = program({ op = "play-sound", sound = "SEQ_SE_DP_050" }),
     dependencies = {},
     resources = {},
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   Assert.isTrue(schema().assertEffect(effect), "a shared sequence symbol needs no staged effect resource")
   effect.program = program({ op = "play-sound", sound = "audio/sequence/SEQ_SE_DP_050" })
@@ -1551,7 +1565,7 @@ end
 function T.particle_system_instructions_are_closed_over_their_staged_particle_resource()
   local resourceKey = "battle/particle/closure"
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "particle-system-closure",
     catalogIdentity = "synthetic-catalog",
     program = program({
@@ -1569,6 +1583,7 @@ function T.particle_system_instructions_are_closed_over_their_staged_particle_re
       },
     },
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   Assert.isTrue(schema().assertEffect(effect), "a system load resolves to its staged particle resource")
   effect.resources[resourceKey].kind = "texture"
@@ -1588,7 +1603,7 @@ end
 
 function T.vanished_picture_operation_requires_source_battler_topology()
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "vanished-picture-effect",
     catalogIdentity = "synthetic-catalog",
     program = program({
@@ -1599,6 +1614,7 @@ function T.vanished_picture_operation_requires_source_battler_topology()
     dependencies = {},
     resources = {},
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   local ok = pcall(schema().assertEffect, effect)
   Assert.isFalse(ok, "the operation requires declared battler topology context")
@@ -1611,7 +1627,7 @@ end
 
 function T.position_offset_callback_declares_its_battler_topology()
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "position-offset-effect",
     catalogIdentity = "synthetic-catalog",
     program = program({
@@ -1628,6 +1644,7 @@ function T.position_offset_callback_declares_its_battler_topology()
     dependencies = {},
     resources = {},
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   local ok = pcall(schema().assertEffect, effect)
   Assert.isFalse(ok, "the callback needs declared battler topology")
@@ -1652,13 +1669,14 @@ function T.interpolated_picture_effect_declares_its_sprite_context_table()
     },
   }
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "sprite-context-effect",
     catalogIdentity = "synthetic-catalog",
     program = program(instruction),
     dependencies = {},
     resources = {},
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   local ok = pcall(schema().assertEffect, effect)
   Assert.isFalse(ok, "interpolation requires the declared sprite-context table")
@@ -1671,7 +1689,7 @@ end
 
 function T.effect_resource_descriptors_accept_typed_multicell_formats()
   local effect = {
-    schema = "g4-battle-effect-v4",
+    schema = "g4-battle-effect-v6",
     key = "synthetic-multicell-effect",
     catalogIdentity = "synthetic-catalog",
     program = program({ op = "set-parameter", values = { 0, 1 } }),
@@ -1689,6 +1707,7 @@ function T.effect_resource_descriptors_accept_typed_multicell_formats()
       },
     },
     requiredContext = {},
+    displayPolicy = { suspendHealthbarUpdates = false, updateBattlerG3 = false },
   }
   Assert.isTrue(schema().assertEffect(effect))
   effect.resources["battle/sprite/example/multi-cell"].kind = "sprite-template"

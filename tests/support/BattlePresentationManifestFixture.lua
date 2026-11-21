@@ -340,7 +340,7 @@ local function fullManifest()
     evolutionEmitters[#evolutionEmitters + 1] = emitter
   end
   local old = {
-    schema = "g4-battle-presentation-v13",
+    schema = "g4-battle-presentation-v17",
     version = { id = "soulsilver", language = "en" },
     scenes = {
       { key = "general/grass/day", background = "general", terrain = "grass", time = "day" },
@@ -411,7 +411,7 @@ local function fullManifest()
       hud = { font = "data/generated/field/font/font-0.lua", palette = printerPalette(1) },
       menu = { font = "data/generated/field/font/font-4.lua", palette = printerPalette(7) },
       bag = { font = "data/generated/field/font/font-4.lua", palette = printerPalette(12) },
-      party = { font = "data/generated/field/font/font-4.lua", palette = printerPalette(1) },
+      party = { font = "data/generated/field/font/font-4.lua", palette = printerPalette(16) },
       bugContest = { font = "data/generated/field/font/font-0.lua" },
       recorderFeedback = { font = "data/generated/field/font/font-0.lua" },
     },
@@ -613,6 +613,24 @@ local function fullManifest()
   old.images["assets/generated/battle/bag-page-1.png"] = { width = 256, height = 192 }
   old.images["assets/generated/battle/bag-page-2.png"] = { width = 256, height = 192 }
   old.images["assets/generated/battle/bag-page-3.png"] = { width = 256, height = 192 }
+  for _, slug in ipairs({
+    "party-list",
+    "mon-menu",
+    "summary",
+    "check-moves",
+    "move-detail",
+    "restore-pp",
+    "learn-move",
+    "forget-move",
+    "learn-move-contest",
+    "forget-move-contest",
+  }) do
+    old.images["assets/generated/battle/party-page-" .. slug .. "-1.png"] = { width = 256, height = 192 }
+    old.images["assets/generated/battle/party-page-" .. slug .. "-2.png"] = { width = 256, height = 192 }
+  end
+  for level = 0, 8 do
+    old.images["assets/generated/battle/party-exp-" .. tostring(level) .. ".png"] = { width = 8, height = 8 }
+  end
   old.images["assets/generated/battle/battle-finger.png"] = { width = 16, height = 16 }
   for _, corner in ipairs({ "tl", "tr", "bl", "br" }) do
     old.images["assets/generated/battle/battle-cursor-" .. corner .. ".png"] = { width = 16, height = 16 }
@@ -664,13 +682,14 @@ local function fullManifest()
     local function addFrameSourceIndices(frame)
       local image = assert(old.images[frame.image], "trainer frame images are inventoried")
       local variants = {}
-      local slots = selector:match("^front:")
-        and { 96, 112, 128, 144, 160, 176 }
-        or { 48, 64, 80, 96, 112 }
+      local slots = selector:match("^front:") and { 96, 112, 128, 144, 160, 176 } or { 48, 64, 80, 96, 112 }
       for _, firstSlot in ipairs(slots) do
         local slotKey = "slot:" .. tostring(firstSlot)
         variants[slotKey] = {
-          path = frame.image:gsub("%.png$", "-" .. selector:gsub("[^%w]+", "-") .. "-" .. slotKey:gsub(":", "-") .. ".rgba8"),
+          path = frame.image:gsub(
+            "%.png$",
+            "-" .. selector:gsub("[^%w]+", "-") .. "-" .. slotKey:gsub(":", "-") .. ".rgba8"
+          ),
           firstSlot = firstSlot,
         }
       end
@@ -693,7 +712,17 @@ local function fullManifest()
   end
   local pictureSelectors = { exemplar = "pokemon/CHIKORITA/form-0/male/back" }
   local pictureAttribute = old.pictureAttributes["pokemon/CHIKORITA/form-0/male/back"]
-  for _, species in ipairs({ "EEVEE", "TOTODILE", "PICHU", "NINCADA", "NINJASK", "SHEDINJA", "SENTRET", "FURRET" }) do
+  for _, species in ipairs({
+    "CHIKORITA",
+    "EEVEE",
+    "TOTODILE",
+    "PICHU",
+    "NINCADA",
+    "NINJASK",
+    "SHEDINJA",
+    "SENTRET",
+    "FURRET",
+  }) do
     for _, gender in ipairs({ "male", "female" }) do
       for _, facing in ipairs({ "front", "back" }) do
         local key = "pokemon/" .. species .. "/form-0/" .. gender .. "/" .. facing
@@ -914,15 +943,53 @@ local function fullManifest()
               image = "assets/generated/battle/battle-ball-POKE_BALL-0.png",
               width = 16,
               height = 16,
+              durationTicks = 2,
+            },
+          },
+          -- The ball's source opening animation (NANR sequence 1): the
+          -- closed cell, the open cell, then the 32x32 burst cell.
+          opening = {
+            playMode = "forward",
+            loopStartFrameIdx = 0,
+            frames = {
+              {
+                drawableKey = "battle-ball-open:POKE_BALL:0",
+                image = "assets/generated/battle/balls/POKE_BALL-open-0.png",
+                width = 16,
+                height = 16,
+                durationTicks = 10,
+              },
+              {
+                drawableKey = "battle-ball-open:POKE_BALL:1",
+                image = "assets/generated/battle/balls/POKE_BALL-open-1.png",
+                width = 16,
+                height = 16,
+                durationTicks = 10,
+              },
+              {
+                drawableKey = "battle-ball-open:POKE_BALL:2",
+                image = "assets/generated/battle/balls/POKE_BALL-open-2.png",
+                width = 32,
+                height = 32,
+                durationTicks = 50,
+              },
             },
           },
         },
       },
     },
     evolutionParticles = {
-      seed = 0,
       emitters = evolutionEmitters,
-      textures = { { id = 0, width = 32, height = 32, image = evolutionTexture } },
+      textures = {
+        {
+          id = 0,
+          width = 32,
+          height = 32,
+          image = evolutionTexture,
+          sampler = { minFilter = "nearest", magFilter = "nearest", wrapX = "clamp", wrapY = "clamp" },
+          alphaUsage = { hasZero = false, hasPartial = false, hasOpaque = true },
+        },
+      },
     },
     evolutionGraphics = {
       main = { image = "assets/generated/battle/evolution-main.png", width = 256, height = 192 },
@@ -1048,6 +1115,28 @@ local function fullManifest()
           screenGroup = "two-option",
           textSet = "keep-forget",
           messageEntries = { "label/keep-move", "label/forget-move" },
+          messageRoutes = {},
+          fontRoles = { "menu" },
+          assetRoles = {},
+          assetBindings = {},
+          requiredContext = {},
+          resources = {},
+        },
+        ["menu/switch-or-flee"] = {
+          screenGroup = "two-option",
+          textSet = "switch-or-flee",
+          messageEntries = { "label/switch", "label/use-next-mon", "label/flee" },
+          messageRoutes = {},
+          fontRoles = { "menu" },
+          assetRoles = {},
+          assetBindings = {},
+          requiredContext = {},
+          resources = {},
+        },
+        ["menu/switch-or-keep"] = {
+          screenGroup = "two-option",
+          textSet = "switch-or-keep",
+          messageEntries = { "label/switch", "label/keep-battling-switch" },
           messageRoutes = {},
           fontRoles = { "menu" },
           assetRoles = {},
@@ -1190,8 +1279,7 @@ local function fullManifest()
         itemList = (function()
           local windows = {}
           for _ = 1, 26 do
-            windows[#windows + 1] =
-              { bgId = 0, left = 0, top = 0, width = 1, height = 1, palette = 0, baseTile = 0 }
+            windows[#windows + 1] = { bgId = 0, left = 0, top = 0, width = 1, height = 1, palette = 0, baseTile = 0 }
           end
           return windows
         end)(),
@@ -1287,6 +1375,156 @@ local function fullManifest()
       },
       buttons = {},
     },
+    party = (function()
+      local pages = {}
+      for _, slug in ipairs({
+        "party-list",
+        "mon-menu",
+        "summary",
+        "check-moves",
+        "move-detail",
+        "restore-pp",
+        "learn-move",
+        "forget-move",
+        "learn-move-contest",
+        "forget-move-contest",
+      }) do
+        pages[#pages + 1] = {
+          key = "party:page/" .. slug,
+          layers = {
+            {
+              image = "assets/generated/battle/party-page-" .. slug .. "-1.png",
+              x = 0,
+              y = 0,
+              width = 256,
+              height = 192,
+            },
+            {
+              image = "assets/generated/battle/party-page-" .. slug .. "-2.png",
+              x = 0,
+              y = 0,
+              width = 256,
+              height = 192,
+            },
+          },
+        }
+      end
+      local function windows(count)
+        local rows = {}
+        for _ = 1, count do
+          rows[#rows + 1] = { bg = 0, left = 0, top = 0, width = 1, height = 1, palette = 0, baseTile = 0 }
+        end
+        return rows
+      end
+      local function boxes(count)
+        local rows = {}
+        for _ = 1, count do
+          rows[#rows + 1] = {
+            top = 0,
+            bottom = 1,
+            left = 0,
+            right = 1,
+          }
+        end
+        return rows
+      end
+      local function cursors(count)
+        local rows = {}
+        for _ = 1, count do
+          rows[#rows + 1] = {
+            left = 0,
+            top = 0,
+            right = 1,
+            bottom = 1,
+            up = 0,
+            down = 0,
+            leftNeighbor = 0,
+            rightNeighbor = 0,
+          }
+        end
+        return rows
+      end
+      local function spots(count)
+        local rows = {}
+        for _ = 1, count do
+          rows[#rows + 1] = { x = 0, y = 0 }
+        end
+        return rows
+      end
+      local rects = {}
+      for _ = 1, 34 do
+        rects[#rects + 1] = { x = 0, y = 0, w = 1, h = 1 }
+      end
+      local expTiles = {}
+      for level = 0, 8 do
+        expTiles[#expTiles + 1] = {
+          level = level,
+          image = "assets/generated/battle/party-exp-" .. tostring(level) .. ".png",
+        }
+      end
+      return {
+        pages = pages,
+        windows = {
+          base = windows(2),
+          partyList = windows(6),
+          monMenu = windows(4),
+          summary = windows(35),
+          checkMoves = windows(11),
+          moveDetail = windows(17),
+          restorePP = windows(5),
+          learnMove = windows(6),
+          forgetMove = windows(12),
+          contestForgetMove = windows(7),
+        },
+        hitboxes = {
+          partyList = boxes(6),
+          monMenu = boxes(3),
+          summary = boxes(3),
+          checkMoves = boxes(7),
+          moveDetail = boxes(4),
+          restorePP = boxes(4),
+          learnMove = boxes(6),
+          forgetMove = boxes(2),
+        },
+        buttonRects = rects,
+        cursorBoxes = {
+          partyList = cursors(7),
+          monMenu = cursors(4),
+          summary = cursors(4),
+          checkMoves = cursors(8),
+          moveDetail = cursors(5),
+          restorePP = cursors(5),
+          learnMove = cursors(7),
+          forgetMove = cursors(3),
+          learnMoveContest = cursors(7),
+          forgetMoveContest = cursors(3),
+        },
+        spritePositions = {
+          listIcons = spots(6),
+          listStatusIcons = spots(6),
+          summaryTypes = spots(2),
+          checkMovesTypes = spots(2),
+          checkMovesMoves = spots(4),
+          moveDetailTypes = spots(2),
+          learnMoveTypes = spots(2),
+          learnMoveMoves = spots(5),
+          forgetMoveTypes = spots(2),
+          fixed = {
+            monIcon = { x = 0, y = 0 },
+            statusIcon = { x = 0, y = 0 },
+            monMenuIcon = { x = 0, y = 0 },
+            summaryHeldItem = { x = 0, y = 0 },
+            moveDetailMoveIcon = { x = 0, y = 0 },
+            contestMoveIcon = { x = 0, y = 0 },
+            categoryIcon = { x = 0, y = 0 },
+            heldItemDelta = { x = 0, y = 0 },
+            capsuleDelta = { x = 0, y = 0 },
+          },
+        },
+        buttons = {},
+        expTiles = expTiles,
+      }
+    end)(),
     messages = {
       roles = old.textRoles,
       banks = {
@@ -1388,8 +1626,7 @@ local function fullManifest()
       templateExpansion = { input = "tagSelectedBuffers" },
       entries = {
         ["battle/narration/wild-appeared"] = messageRecord({ "A wild ", false, " appeared!" }),
-        ["battle/narration/wild-appeared-doubles"] =
-          messageRecord({ "A wild ", false, " and\n", false, " appeared!" }),
+        ["battle/narration/wild-appeared-doubles"] = messageRecord({ "A wild ", false, " and\n", false, " appeared!" }),
         ["battle/narration/trainer-challenged"] = messageRecord({ false, " ", false, " wants to battle!" }),
         ["battle/narration/trainer-victory"] = messageRecord({ "Player defeated ", false, " ", false, "!" }),
         ["battle/narration/won-money"] = messageRecord({ false, " got $", false, " for winning!" }),
@@ -1398,9 +1635,16 @@ local function fullManifest()
           "Trainer reacts to defeat.",
         }),
         ["battle/narration/trainer-sent-out"] = messageRecord({ false, " ", false, " sent out ", false, "!" }),
-        ["battle/narration/trainer-sent-out-doubles"] = messageRecord(
-          { false, " ", false, " sent\nout ", false, " and ", false, "!" }
-        ),
+        ["battle/narration/trainer-sent-out-doubles"] = messageRecord({
+          false,
+          " ",
+          false,
+          " sent\nout ",
+          false,
+          " and ",
+          false,
+          "!",
+        }),
         ["battle/narration/trainer-used-item"] = messageRecord({ false, " ", false, " used one ", false, "!" }),
         ["battle/narration/player-sent-out"] = messageRecord({ "Go! ", false, "!" }),
         ["battle/narration/player-sent-out-doubles"] = messageRecord({ "Go! ", false, " and\n", false, "!" }),
@@ -1464,6 +1708,7 @@ local function fullManifest()
           false,
           ". Will you switch your Pokémon?",
         }),
+        ["battle/prompt/use-next"] = messageRecord({ "Use next Pokémon?" }),
         ["battle/narration/experience"] = messageRecord({ false, " gained ", false, " Exp. Points!" }),
         ["battle/narration/experience/boosted"] = messageRecord({ false, " gained a boosted ", false, " Exp. Points!" }),
         ["battle/narration/level-up"] = messageRecord({ false, " grew to Lv. ", false, "!" }),
@@ -1511,7 +1756,12 @@ local function fullManifest()
           "It’s no good! It’s impossible to aim\nwhen there are two Pokémon!",
         }),
         ["battle/bag/message/no-room"] = messageRecord({ "There is no room left in the PC!" }),
-        ["battle/bag/message/embargo"] = messageRecord({ false, "’s effect prevents\nthe item’s use on ", false, "!" }),
+        ["battle/bag/message/embargo"] = messageRecord({
+          false,
+          "’s effect prevents\nthe item’s use on ",
+          false,
+          "!",
+        }),
         ["battle/bag/message/no-aim-hidden"] = messageRecord({
           "It’s no good! It’s impossible to aim\nat a Pokémon that’s not in sight!",
         }),
@@ -1543,7 +1793,12 @@ local function fullManifest()
         }),
         ["battle/party/message/no-effect"] = messageRecord({ "It won’t have any effect." }),
         ["battle/party/message/already-selected"] = messageRecord({ false, " has already been\nselected." }),
-        ["battle/party/message/embargo"] = messageRecord({ false, "’s effect prevents\nthe item’s use on ", false, "!" }),
+        ["battle/party/message/embargo"] = messageRecord({
+          false,
+          "’s effect prevents\nthe item’s use on ",
+          false,
+          "!",
+        }),
         -- Retail party summary/move words painted on the wrapper rows.
         ["battle/party/stat/hp"] = messageRecord({ "HP" }),
         ["battle/party/stat/hp-current"] = messageRecord({ false }),
@@ -1603,6 +1858,8 @@ local function fullManifest()
         ["battle/narration/bag-guard-spec"] = messageRecord({ "Your team became shrouded in a white mist!" }),
         ["battle/narration/bag-getting-pumped"] = messageRecord({ false, " is getting pumped!" }),
         ["battle/narration/transformed"] = messageRecord({ false, " transformed into ", false, "!" }),
+        ["battle/narration/identified"] = messageRecord({ false, " identified ", false, "!" }),
+        ["battle/narration/aimed"] = messageRecord({ false, " took aim at ", false, "!" }),
         ["battle/narration/foretold/own"] = messageRecord({ false, " foresaw an attack!" }),
         ["battle/narration/foretold/wild"] = messageRecord({ "The wild ", false, " foresaw an attack!" }),
         ["battle/narration/foretold/foe"] = messageRecord({ "The foe’s ", false, " foresaw an attack!" }),
@@ -1701,6 +1958,10 @@ local function fullManifest()
         ["label/target-cancel"] = menuLabel("CANCEL"),
         ["label/yes"] = menuLabel("Yes"),
         ["label/no"] = menuLabel("No"),
+        ["label/switch"] = menuLabel("Switch Pokémon"),
+        ["label/keep-battling-switch"] = menuLabel("Keep battling"),
+        ["label/use-next-mon"] = menuLabel("Use next Pokémon"),
+        ["label/flee"] = menuLabel("Flee"),
         ["label/keep-move"] = menuLabel("Keep old moves!"),
         ["evolution/4"] = messageRecord({ false, " learned ", false, "!" }),
         ["evolution/915"] = messageRecord({ false, " is evolving!" }),
@@ -1856,7 +2117,7 @@ local function fullManifest()
   end
   for _, entry in pairs(manifest.battleBalls.entries) do
     entry.paletteSource = { words = mainObjPaletteWords }
-    for _, frame in ipairs(entry.frames) do
+    local function stageFrame(frame)
       local variants = {}
       for _, firstSlot in ipairs({ 48, 64, 80, 96 }) do
         local slotKey = "slot:" .. tostring(firstSlot)
@@ -1872,6 +2133,12 @@ local function fullManifest()
         height = frame.height,
         variants = variants,
       }
+    end
+    for _, frame in ipairs(entry.frames) do
+      stageFrame(frame)
+    end
+    for _, frame in ipairs(assert(entry.opening, "fixture balls stage their opening animation").frames) do
+      stageFrame(frame)
     end
   end
   return manifest
@@ -2034,13 +2301,13 @@ local function ballRecord(selector)
   local source = fullManifest().battleBalls.entries[selector]
   assert(source ~= nil, "fixture covers ball selector " .. tostring(selector))
   local prefix = "assets/generated/battle/balls/" .. selector:sub(6)
-  local frames = {}
-  for index, frame in ipairs(source.frames) do
-    frames[index] = {
+  local function restage(frame, suffix)
+    return {
       drawableKey = frame.drawableKey,
-      image = prefix .. "-" .. (index - 1) .. ".png",
+      image = prefix .. suffix .. ".png",
       width = frame.width,
       height = frame.height,
+      durationTicks = frame.durationTicks,
       sourceIndices = {
         format = frame.sourceIndices.format,
         plane = frame.sourceIndices.plane,
@@ -2050,14 +2317,27 @@ local function ballRecord(selector)
       },
     }
   end
+  local frames = {}
+  for index, frame in ipairs(source.frames) do
+    frames[index] = restage(frame, "-" .. (index - 1))
+  end
+  local openingFrames = {}
+  for index, frame in ipairs(source.opening.frames) do
+    openingFrames[index] = restage(frame, "-open-" .. (index - 1))
+  end
   return {
-    schema = "g4-battle-ball-v1",
+    schema = "g4-battle-ball-v4",
     selector = selector,
     catalogIdentity = "synthetic-catalog",
     entry = {
       fadeColor = source.fadeColor,
       paletteSource = { words = source.paletteSource.words },
       frames = frames,
+      opening = {
+        playMode = source.opening.playMode,
+        loopStartFrameIdx = source.opening.loopStartFrameIdx,
+        frames = openingFrames,
+      },
       particles = source.particles,
     },
   }
@@ -2093,7 +2373,7 @@ end
 local function evolutionRecord()
   local full = fullManifest()
   return {
-    schema = "g4-battle-evolution-v1",
+    schema = "g4-battle-evolution-v2",
     kind = "evolution",
     catalogIdentity = "synthetic-catalog",
     particles = full.evolutionParticles,

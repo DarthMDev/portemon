@@ -18,6 +18,28 @@ local function u32(value)
   )
 end
 
+-- Headless lowering has no staged archive: map each physical source
+-- slot to a fake content key so the program shape (offsets, runtime
+-- selection, slot closure) still validates.
+local function stageTestResourceKeys(resolved)
+  if type(resolved) ~= "table" or type(resolved.sourceSelections) ~= "table" then
+    return resolved
+  end
+  local resourceKeys = {}
+  for slot in pairs(resolved.sourceSelections) do
+    resourceKeys[slot] = "test/" .. slot
+  end
+  return {
+    callback = resolved.callback,
+    taskKind = resolved.taskKind,
+    context = resolved.context,
+    runtimeSelection = resolved.runtimeSelection,
+    parameters = resolved.parameters,
+    resourceKeys = resourceKeys,
+    args = resolved.args,
+  }
+end
+
 function T.dispatch_labels_cover_the_native_table_without_the_guard_overrun()
   local Sources = require("romdump.src.config.BattleAnimationSources")
   Assert.equal(Sources.DISPATCH_EXTENT_BYTES, 0x160, "pinned table byte extent stays explicit")
@@ -515,30 +537,26 @@ function T.picture_affine_blend_callback_has_its_contextual_task_contract()
   })
 end
 
-function T.background_picture_scroll_callback_preserves_its_two_source_modes()
+function T.background_picture_scroll_callback_lowers_the_rock_and_shake_words()
   local Sources = require("romdump.src.config.BattleAnimationSources")
   local plans = {
     {
       operands = { 27, 6, 0, 1, 4, 99, 88, 77 },
-      callback = "battle-background-picture-scroll-oscillation",
-      taskKind = "battle-background-picture-scroll-oscillation",
-      parameters = { directionState = 1, phaseIndex = 4 },
+      parameters = { shake = 0, shakeAmpX = 1, shakeAmpY = 4, shakeInterval = 99, shakeCount = 88, shakeExtra = 77 },
     },
     {
       operands = { 27, 6, 1, 0xfffe, 3, 0xfffc, 7, 77 },
-      callback = "battle-background-picture-coordinate-sweep",
-      taskKind = "battle-background-picture-coordinate-sweep",
-      parameters = { startX = -2, startY = 3, deltaX = -4, deltaY = 7 },
+      parameters = { shake = 1, shakeAmpX = -2, shakeAmpY = 3, shakeInterval = -4, shakeCount = 7, shakeExtra = 77 },
     },
   }
   for _, expected in ipairs(plans) do
     local plan = Sources.resolveSourceSelection("battle-animation-callback", expected.operands)
     Assert.deepEqual(plan, {
-      callback = expected.callback,
-      taskKind = expected.taskKind,
+      callback = "battle-background-picture-scroll-oscillation",
+      taskKind = "battle-background-picture-scroll-oscillation",
       context = "battle-display",
       parameters = expected.parameters,
-    }, "selector 27 normalizes only the fields used by the selected continuation")
+    }, "selector 27 lowers the rock/shake words that follow its selector")
   end
   local program = compiler().compile({
     key = "background-picture-scroll-callback",
@@ -547,8 +565,7 @@ function T.background_picture_scroll_callback_preserves_its_two_source_modes()
       return Sources.resolveSourceSelection(role, operands)
     end,
   })
-  Assert.equal(program.instructions[1].callback, "battle-background-picture-coordinate-sweep")
-  Assert.equal(program.instructions[1].taskKind, "battle-background-picture-coordinate-sweep")
+  Assert.equal(program.instructions[1].taskKind, "battle-background-picture-scroll-oscillation")
   Assert.deepEqual(program.instructions[1].parameters, plans[2].parameters)
   Assert.isNil(program.instructions[1].selector, "native callback selector remains producer-only")
 end
@@ -613,12 +630,13 @@ end
 
 function T.palette_and_picture_fade_callback_has_its_own_semantic_task()
   local Sources = require("romdump.src.config.BattleAnimationSources")
-  local plan, reason = Sources.resolveSourceSelection("battle-animation-callback", { 15, 0 })
+  local plan, reason = Sources.resolveSourceSelection("battle-animation-callback", { 16, 0 })
   Assert.isNil(reason)
   Assert.deepEqual(plan, {
     callback = "pokemon-picture-and-battle-palette-fade-cycle",
     taskKind = "pokemon-picture-and-battle-palette-fade-cycle",
     context = "battle-palette",
+    battlerTarget = "attacker",
     parameters = {},
   })
 end
@@ -1017,16 +1035,35 @@ end
 function T.battle_sprite_panel_callbacks_lower_to_typed_offsets()
   local Sources = require("romdump.src.config.BattleAnimationSources")
   local cases = {
-    { selector = 80, callback = "battle-sprite-panel-slide-down", offsetY = 3 },
-    { selector = 81, callback = "battle-sprite-panel-slide-up", offsetY = -3 },
-    { selector = 82, callback = "battle-sprite-panel-slide-down", offsetY = 3 },
-    { selector = 83, callback = "battle-sprite-panel-slide-far-up", offsetY = -6 },
+    { selector = 80, callback = "battle-sprite-panel-slide-down", offsetY = 3, args = { 0, 0 } },
+    { selector = 81, callback = "battle-sprite-panel-slide-up", offsetY = -3, args = { 1, 0 } },
+    { selector = 82, callback = "battle-sprite-panel-slide-down", offsetY = 3, args = { 2, 0 } },
+    { selector = 83, callback = "battle-sprite-panel-slide-far-up", offsetY = -6, args = { 3, 0 } },
   }
   for _, expected in ipairs(cases) do
-    local plan = Sources.resolveSourceSelection("battle-animation-callback", { expected.selector, 0 })
+    local plan = Sources.resolveSourceSelection(
+      "battle-animation-callback",
+      { expected.selector, 2, expected.args[1], expected.args[2] }
+    )
     Assert.equal(plan.callback, expected.callback)
     Assert.equal(plan.taskKind, "battle-sprite-panel-slide")
     Assert.equal(plan.context, "sprite-system")
+    Assert.equal(plan.runtimeSelection, "object-window-stripe-selection")
+    Assert.deepEqual(plan.args, expected.args, "the script words lower onto the invocation")
+    local stripeSlots = 0
+    for slot in pairs(assert(plan.sourceSelections, "panel slides stage their stripe sources")) do
+      local graphic, kind = string.match(slot, "^stripeGraphic(%d)(%a+)$")
+      Assert.isTrue(
+        graphic ~= nil and tonumber(graphic) >= 0 and tonumber(graphic) <= 3,
+        "stripe slot names its graphic: " .. tostring(slot)
+      )
+      Assert.isTrue(
+        kind == "Char" or kind == "Palette" or kind == "Screen",
+        "stripe slot names its kind: " .. tostring(slot)
+      )
+      stripeSlots = stripeSlots + 1
+    end
+    Assert.equal(stripeSlots, 12, "panel slides stage all four stripe graphics")
     Assert.deepEqual(plan.parameters, {
       firstPanelOffsetX = 0,
       firstPanelOffsetY = expected.offsetY,
@@ -1036,16 +1073,18 @@ function T.battle_sprite_panel_callbacks_lower_to_typed_offsets()
     })
   end
 
-  local stream = table.concat({ u32(45), u32(80), u32(0), u32(45), u32(82), u32(0) })
+  local stream = table.concat({ u32(45), u32(80), u32(2), u32(0), u32(0), u32(45), u32(82), u32(2), u32(2), u32(1) })
   local program = compiler().compile({
     key = "battle-sprite-panel-callbacks",
     stream = stream,
     resolveSourceInput = function(role, operands)
-      return Sources.resolveSourceSelection(role, operands)
+      return stageTestResourceKeys(Sources.resolveSourceSelection(role, operands))
     end,
   })
   Assert.equal(program.instructions[1].callback, "battle-sprite-panel-slide-down")
   Assert.equal(program.instructions[2].callback, "battle-sprite-panel-slide-down")
+  Assert.deepEqual(program.instructions[1].args, { 0, 0 }, "the boost words lower onto the invocation")
+  Assert.deepEqual(program.instructions[2].args, { 2, 1 }, "the script words lower onto the invocation")
   Assert.deepEqual(program.instructions[1].parameters, {
     firstPanelOffsetX = 0,
     firstPanelOffsetY = 3,
@@ -1053,6 +1092,7 @@ function T.battle_sprite_panel_callbacks_lower_to_typed_offsets()
     secondPanelOffsetY = 4,
     durationTicks = 37,
   })
+  Assert.equal(program.instructions[1].runtimeSelection, "object-window-stripe-selection")
   Assert.isNil(program.instructions[1].selector, "callback selectors stay producer-only")
 end
 
@@ -1107,12 +1147,13 @@ function T.picture_palette_pulse_callbacks_have_named_tasks()
   end
 end
 
-function T.picture_and_battle_palette_fade_callback_has_a_named_task()
+function T.attacker_leap_offscreen_callback_has_a_named_task()
   local Sources = require("romdump.src.config.BattleAnimationSources")
-  local plan = Sources.resolveSourceSelection("battle-animation-callback", { 16, 0 })
-  Assert.equal(plan.callback, "pokemon-picture-battle-palette-fade-cycle")
-  Assert.equal(plan.taskKind, "pokemon-picture-battle-palette-fade-cycle")
-  Assert.equal(plan.context, "battle-palette")
+  local plan = Sources.resolveSourceSelection("battle-animation-callback", { 15, 0 })
+  Assert.equal(plan.callback, "pokemon-picture-leap-offscreen-transition")
+  Assert.equal(plan.taskKind, "pokemon-picture-leap-offscreen-transition")
+  Assert.equal(plan.context, "pokemon-picture")
+  Assert.equal(plan.battlerTarget, "attacker")
   Assert.deepEqual(plan.parameters, {})
 end
 
@@ -1363,6 +1404,59 @@ function T.picture_palette_pulse_callback_maps_picture_and_timing_operands()
   Assert.equal(shortProgram.instructions[2].op, "reset-blend-alpha", "five values preserve the callback cursor")
 end
 
+function T.sprite_palette_blend_callback_maps_blend_operands()
+  local Sources = require("romdump.src.config.BattleAnimationSources")
+  -- DISABLE's shipped frame blends the attacker once: start and end
+  -- meet, so the compiled duration is a single tick.
+  local plan = Sources.resolveSourceSelection("battle-animation-callback", { 63, 6, 2, 0, 1, 14, 14, 6342 })
+  Assert.equal(plan.callback, "pokemon-picture-blend-sprite-palette")
+  Assert.equal(plan.taskKind, "pokemon-picture-blend-sprite-palette")
+  Assert.equal(plan.context, "pokemon-picture")
+  Assert.deepEqual(plan.parameters, {
+    pictureTarget = "attacker",
+    wait = 0,
+    startCoefficient = 14,
+    endCoefficient = 14,
+    nextColor = 6342,
+    blendStep = 1,
+    durationTicks = 1,
+  })
+  Assert.isNil(plan.selector, "native callback selector remains producer-only")
+  -- TOXIC's shipped frame walks the defender from zero to ten in unit
+  -- steps, retiring after eleven ticks.
+  local toxic = Sources.resolveSourceSelection("battle-animation-callback", { 63, 6, 8, 0, 1, 0, 10, 31764 })
+  Assert.equal(toxic.parameters.pictureTarget, "target")
+  Assert.equal(toxic.parameters.durationTicks, 11)
+  Assert.equal(toxic.parameters.nextColor, 31764)
+  local program = compiler().compile({
+    key = "sprite-palette-blend",
+    stream = table.concat({
+      u32(45),
+      u32(63),
+      u32(6),
+      u32(2),
+      u32(0),
+      u32(1),
+      u32(14),
+      u32(14),
+      u32(6342),
+      u32(9),
+    }),
+    resolveSourceInput = function(role, operands)
+      return Sources.resolveSourceSelection(role, operands)
+    end,
+  })
+  Assert.equal(program.instructions[1].taskKind, "pokemon-picture-blend-sprite-palette")
+  Assert.equal(program.instructions[1].parameters.pictureTarget, "attacker")
+  Assert.isNil(program.instructions[1].selector, "runtime instruction has no native callback selector")
+  local invalid, reason = Sources.resolveSourceSelection("battle-animation-callback", { 63, 6, 0, 0, 1, 14, 14, 6342 })
+  Assert.isNil(invalid, "a flag word selecting no sprite is rejected")
+  Assert.isTrue(reason:find("assertion", 1, true) ~= nil, "invalid sprite selection keeps the source reason")
+  local badCount, countReason = Sources.resolveSourceSelection("battle-animation-callback", { 63, 5, 2, 0, 1, 14, 14 })
+  Assert.isNil(badCount, "a short blend frame is rejected")
+  Assert.isTrue(countReason:find("six source operands", 1, true) ~= nil, "short frames name their shape")
+end
+
 function T.particle_emitter_curved_path_callback_normalizes_all_source_fields()
   local Sources = require("romdump.src.config.BattleAnimationSources")
   local plan =
@@ -1428,7 +1522,7 @@ end
 function T.semantic_animation_roots_include_native_move_and_named_category_routes()
   local Sources = require("romdump.src.config.BattleAnimationSources")
   local roots = Sources.listSemanticRoots()
-  Assert.equal(#roots, 505, "source roots are the 467 move IDs and 38 named non-move categories")
+  Assert.equal(#roots, 507, "source roots are the 467 move IDs and 40 named non-move categories")
   local move = Sources.resolveSemanticRoute("TACKLE")
   Assert.equal(move.kind, "move")
   Assert.equal(move.archiveSymbol, "NARC_a_0_1_0")
@@ -1761,10 +1855,10 @@ function T.configure_from_script_position_modes_with_offsets_carry_their_block()
     cameraMode = 0,
   }, "the six config words ride the instruction in native field order")
   Assert.deepEqual(instruction.emitterOffset, {
-    x = 0,
-    y = -4128,
-    z = 0,
     ignoreSide = 0,
+    x = -4128,
+    y = 0,
+    z = 0,
   }, "position modes with script offsets carry their offset block signed")
   Assert.equal(#program.instructions, 2, "the offset trailer never decodes as opcodes")
   Assert.equal(
@@ -1886,11 +1980,7 @@ function T.particle_initializer_table_resolves_all_profiles_without_native_selec
     Assert.isNil(plan.selector, "source callback selector stays out of the action plan")
   end
   local destination = assert(Sources.resolveBattlerParticleAction(47, { 2, 5, 0x66, 4 }))
-  Assert.equal(
-    destination.sourceEmitterSelections.emitter,
-    0x66,
-    "opcode47 selects its APS ordinal from operand three"
-  )
+  Assert.equal(destination.sourceEmitterSelections.emitter, 0x66, "opcode47 selects its APS ordinal from operand three")
   Assert.equal(
     profileBySelector[0],
     "particle-emitter-default",
@@ -2072,16 +2162,16 @@ function T.configured_sprite_callbacks_resolve_to_closed_semantic_tasks()
   local Sources = require("romdump.src.config.BattleAnimationSources")
   local taskKinds = {}
   local threeSpriteAnimation = Sources.resolveConfiguredSpriteAction(0)
-  Assert.equal(threeSpriteAnimation.taskKind, "multi-sprite-position-tick")
+  Assert.equal(threeSpriteAnimation.taskKind, "sprite-spread-copies")
   Assert.equal(threeSpriteAnimation.context, "sprite-system")
   local pokemonPictureAffineAnimation = Sources.resolveConfiguredSpriteAction(14)
-  Assert.equal(pokemonPictureAffineAnimation.taskKind, "sprite-affine-animation")
+  Assert.equal(pokemonPictureAffineAnimation.taskKind, "sprite-scale-over-defender")
   Assert.equal(pokemonPictureAffineAnimation.context, "pokemon-picture")
   local pokemonPictureBlend = Sources.resolveConfiguredSpriteAction(7)
-  Assert.equal(pokemonPictureBlend.taskKind, "sprite-alpha-transition")
+  Assert.equal(pokemonPictureBlend.taskKind, "sprite-rise-stretch")
   Assert.equal(pokemonPictureBlend.context, "pokemon-picture")
   local pokemonPictureSpritePath = Sources.resolveConfiguredSpriteAction(10)
-  Assert.equal(pokemonPictureSpritePath.taskKind, "pokemon-picture-relative-sprite-path-transition")
+  Assert.equal(pokemonPictureSpritePath.taskKind, "sprite-pops")
   Assert.equal(pokemonPictureSpritePath.context, "pokemon-picture")
   local offsetTask = Sources.resolveConfiguredSpriteAction(25, { 0xffff8001, 0x00010002 })
   Assert.deepEqual(offsetTask.parameters, { offsetX = -32767, offsetY = 2 })
@@ -2094,10 +2184,10 @@ function T.configured_sprite_callbacks_resolve_to_closed_semantic_tasks()
     0x87654321,
   })
   Assert.deepEqual(rotationTransition.parameters, {
-    spriteSpacingX = -32767,
-    spriteSpacingY = 32767,
-    positionTransitionTicks = 0x5678,
-    rotationAngle = 0x87654321,
+    offsetX = -32767,
+    offsetY = 32767,
+    durationTicks = 0x5678,
+    arcHeight = -2023406815,
   }, "selector 17 narrows only spacing and duration before the affine transition")
   local callbackCount = Sources.configuredSpriteCallbackCount()
   for selector = 0, callbackCount - 1 do
@@ -2173,8 +2263,8 @@ function T.configured_sprite_callbacks_resolve_to_closed_semantic_tasks()
     )
     Assert.equal(decoded.instructions[2].op, "noop", "all source frames land on the following instruction")
   end
-  Assert.isTrue(taskKinds["sprite-animation-lifecycle"], "animation lifecycle has a named task")
-  Assert.isTrue(taskKinds["pokemon-picture-palette-fade"], "picture palette fades have a named task")
+  Assert.isTrue(taskKinds["sprite-above-defender"], "above-defender sprite has a named task")
+  Assert.isTrue(taskKinds["pokemon-picture-zigzag-slash"], "the ZigzagSlash sprite func has a named task")
   local plan, reason = Sources.resolveConfiguredSpriteAction(callbackCount)
   Assert.isNil(plan, "selector beyond the pinned callback table is rejected")
   Assert.isTrue(reason:find("outside", 1, true) ~= nil, "invalid callback selector has a precise reason")
@@ -2220,7 +2310,11 @@ function T.configured_sprite_dispatch_lowers_resources_task_context_and_script_p
   }))
   local instruction = program.instructions[1]
   Assert.equal(instruction.op, "create-configured-sprite", "callback creates and configures its sprite")
-  Assert.equal(instruction.taskKind, "pokemon-picture-palette-fade", "callback resolves to a semantic task")
+  Assert.equal(
+    instruction.taskKind,
+    "pokemon-picture-zigzag-slash",
+    "opcode-78 selector 8 is the native ZigzagSlash sprite func, not a palette fade"
+  )
   Assert.equal(instruction.taskContext, "pokemon-picture", "callback declares its typed task context")
   Assert.deepEqual(instruction.parameters, {}, "unused source parameters are cursor-validated but not published")
   Assert.equal(instruction.resourceKeys.character, "battle/sprite/character", "character resource is semantic")
@@ -2533,6 +2627,10 @@ function T.selector_57_maps_its_source_battler_and_offset_interpolation()
   }))
   Assert.deepEqual(program.instructions[1].parameters, plan.parameters)
   Assert.equal(program.instructions[2].op, "noop", "the four operands preserve the following cursor")
+  -- DARK_VOID's shipped opposing-pair word resolves like its sibling
+  -- selector-51 table; the corpus carries no 276 for this callback.
+  local pair = assert(Sources.resolveBattleAnimationCallback({ 57, 4, 1, 0, 4, 272 }))
+  Assert.equal(pair.parameters.pictureTarget, "opposing-battler-pair-when-enabled")
 end
 
 function T.selector_36_maps_source_position_mask_and_transition_modes()
@@ -2938,10 +3036,10 @@ function T.configured_sprite_rotation_frame_lowers_used_words_and_skips_unused_w
     end,
   }))
   Assert.deepEqual(program.instructions[1].parameters, {
-    spriteSpacingX = -32767,
-    spriteSpacingY = 32767,
-    positionTransitionTicks = 0x5678,
-    rotationAngle = 0x87654321,
+    offsetX = -32767,
+    offsetY = 32767,
+    durationTicks = 0x5678,
+    arcHeight = -2023406815,
   }, "only the four values used by the callback enter its typed task parameters")
   Assert.equal(program.instructions[2].op, "noop", "all declared parameter words advance the source cursor")
 end
@@ -3116,24 +3214,23 @@ function T.configure_from_script_callbacks_consume_their_inline_config()
 end
 
 function T.clear_background_plane_with_trailing_45_keeps_cursor_aligned()
-  -- ClearBattlerBg normally takes one source word, but a trailing 45
-  -- extends the frame by one word (observed once: EXTRASENSORY member 326
-  -- lowers [32,0,45] with the third word consumed). Without consuming it
-  -- the decoder misreads the 45 as an opcode and desyncs into its
-  -- operands; the following interpreter-state branch (JumpIfContextField01
-  -- reads an uninitialized field, so its taken arm is never evaluated and
-  -- discovery follows only the fall-through) then queues a garbage target
-  -- and the member fails to compile.
-  local words = { u32(32), u32(0), u32(45), u32(33), u32(5), u32(4) }
-  local program = assert(compiler().compile({ key = "clear-plane-trailing-45", stream = table.concat(words) }))
-  Assert.equal(#program.instructions, 3, "every word lands on an instruction boundary")
+  -- ClearBattlerBg consumes exactly one operand word: the word after it
+  -- is the next command, never a second operand. A trailing CallFunc
+  -- therefore decodes in place with its own selector, count and values.
+  local words = { u32(32), u32(7), u32(45), u32(6), u32(1), u32(100) }
+  local program = assert(compiler().compile({
+    key = "clear-plane-trailing-45",
+    stream = table.concat(words),
+    callbacks = { [6] = "probe-callback" },
+  }))
+  Assert.equal(#program.instructions, 2, "every word lands on an instruction boundary")
   Assert.equal(program.instructions[1].op, "clear-background-plane", "the plane word keeps its operation")
-  Assert.equal(program.instructions[2].op, "branch-on-interpreter-state", "the following branch decodes in place")
   Assert.equal(
-    program.instructions[3].op,
-    "reset-battle-presentation",
-    "the continuation past the branch stays reachable"
+    program.instructions[2].op,
+    "replace-parameters-and-call",
+    "the word after the single operand decodes as a callback"
   )
+  Assert.deepEqual(program.sourceOffsets, { 0, 8 }, "the command after one operand starts at byte 8")
 end
 
 function T.every_dispatch_entry_has_a_source_framed_decode_or_a_source_failure()
@@ -3572,12 +3669,12 @@ function T.side_equality_and_battle_flag_branches_keep_distinct_cursor_destinati
 
   local flagProgram = assert(compiler().compile({
     key = "battle-state-flag-cursor-branch",
-    stream = table.concat({ u32(87), u32(0), u32(2), u32(54), u32(54), u32(54) }),
+    stream = table.concat({ u32(87), u32(1), u32(0), u32(4) }),
   }))
   Assert.equal(flagProgram.instructions[1].op, "branch-on-battle-flag", "opcode 87 tests battle-state bit 1")
   Assert.deepEqual(flagProgram.instructions[1].values, { 2 }, "state flag mask remains semantic")
-  Assert.equal(flagProgram.instructions[1].alternateTarget, 2, "clear flag consumes the branch count word")
-  Assert.equal(flagProgram.instructions[1].branchTarget, 3, "set flag follows the count-derived destination")
+  Assert.equal(flagProgram.instructions[1].alternateTarget, 2, "clear flag falls through past one offset word")
+  Assert.equal(flagProgram.instructions[1].branchTarget, 2, "the offset word bases the taken destination")
 end
 
 function T.cry_wait_preserves_the_finished_and_unfinished_cursor_paths()
@@ -3708,18 +3805,18 @@ end
 function T.side_mask_branch_preserves_each_source_table_destination()
   local program = assert(compiler().compile({
     key = "side-mask-cursor-branches",
-    stream = table.concat({ u32(70), u32(1), u32(1), u32(1), u32(1), u32(1), u32(1), u32(54) }),
+    stream = table.concat({ u32(70), u32(1), u32(1), u32(1), u32(1), u32(1), u32(1), u32(0), u32(9) }),
   }))
   local branch = program.instructions[1]
-  Assert.equal(branch.op, "branch-on-side-mask", "opcode 70 branches from its active-side mask")
+  Assert.equal(branch.op, "branch-on-weather-condition", "opcode 70 branches on its named weather selection")
   Assert.deepEqual(branch.branchCases, {
-    { sideMask = 0, target = 2 },
-    { sideMask = 3, target = 3 },
-    { sideMask = 12, target = 4 },
-    { sideMask = 48, target = 5 },
-    { sideMask = 192, target = 6 },
-    { otherwise = true, target = 7 },
-  }, "each source mask-table match retains its count-derived destination")
+    { condition = "clear", target = 2 },
+    { condition = "rain", target = 3 },
+    { condition = "sand", target = 4 },
+    { condition = "sun", target = 5 },
+    { condition = "hail", target = 6 },
+    { condition = "other", target = 7 },
+  }, "each source weather match names its condition and retains its own-word destination")
   Assert.isTrue(
     require("libs.assets.src.battle.BattleAnimationSchema").assertProgram({
       entry = program.entry,
@@ -3863,7 +3960,7 @@ end
 function T.effect_and_cry_handlers_lower_their_source_side_effects()
   local program = assert(compiler().compile({
     key = "effect-and-cry-lifecycle",
-    stream = table.concat({ u32(53), u32(2), u32(65), u32(0x1234), u32(0xfffffffe), u32(7), u32(67), u32(0) }),
+    stream = table.concat({ u32(53), u32(2), u32(65), u32(0x1234), u32(0xfffffffe), u32(7), u32(67) }),
   }))
   Assert.equal(program.instructions[1].op, "destroy-battler-effect", "opcode 53 destroys its indexed effect")
   Assert.deepEqual(program.instructions[1].values, { 2 }, "effect index remains the semantic operand")
@@ -4195,13 +4292,14 @@ function T.computed_callback_durations_pass_the_normalized_callback_schema()
   assertSchema(mosaic, "mosaic")
   local panel = assert(compiler().compile({
     key = "panel-with-computed-duration",
-    stream = table.concat({ u32(45), u32(80), u32(0) }),
+    stream = table.concat({ u32(45), u32(80), u32(2), u32(0), u32(0) }),
     resolveSourceInput = function(role, operands)
-      return Sources.resolveSourceSelection(role, operands)
+      return stageTestResourceKeys(Sources.resolveSourceSelection(role, operands))
     end,
   }))
   Assert.equal(panel.instructions[1].callback, "battle-sprite-panel-slide-down")
   Assert.equal(panel.instructions[1].parameters.durationTicks, 37)
+  Assert.deepEqual(panel.instructions[1].args, { 0, 0 }, "the script words lower onto the invocation")
   assertSchema(panel, "panel")
 end
 

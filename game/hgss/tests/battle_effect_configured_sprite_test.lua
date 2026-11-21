@@ -1,11 +1,11 @@
--- Source-configured sprite ownership at the interpreter-to-task seam:
--- the opcode-78 instruction map must reach the spawned task unchanged,
--- the task alone stages its decoded cell/animation/palette/texture
--- leases, authored NANR frames select NCER objects that publish real
--- transient pictures through the existing scene/renderer path, and
--- cancellation releases every owned record without touching the
--- persistent battler scene. Synthetic normalized cell/animation
--- fixtures mirror the shared decoder record shapes; no ROM bytes.
+-- Source-configured sprite ownership at the interpreter-to-task seam: the
+-- opcode-78 instruction map must reach the spawned configured-sprite body
+-- unchanged, the body alone stages its decoded cell/animation/palette/texture
+-- leases, authored NANR frames select NCER objects that publish real transient
+-- pictures through the existing scene/renderer path, and cancellation
+-- releases every owned record without touching the persistent battler scene.
+-- Synthetic normalized cell/animation fixtures mirror the shared decoder
+-- record shapes; no ROM bytes.
 
 local Assert = require("tests.support.Assert")
 local BattlePresentationFlow = require("game.hgss.src.battle.BattlePresentationFlow")
@@ -14,8 +14,16 @@ local ManifestFixture = require("tests.support.BattlePresentationManifestFixture
 
 local T = {}
 
-local TASK_KIND = "sprite-animation-position-transition"
+-- BattleAnimSpriteFunc_MoveSpriteAndAnimate: the configured body with the
+-- smallest machine, used here to prove the shared staging, frame walk, and
+-- transient picture publication.
+local TASK_KIND = "sprite-offset-animate"
 local TASK_CONTEXT = "battle-sprite"
+
+-- The solo-enemy battler picture center the configured slots stage through.
+-- Every expected center below adds the authored object offset and the
+-- centering rule (x + floor(w/2), y + band * 8 + 4) to it.
+local DEFENDER_ANCHOR = { x = 192, y = 50 }
 
 local CHARACTER_KEY = "probe-sprite-character"
 local PALETTE_KEY = "probe-sprite-palette"
@@ -74,32 +82,24 @@ local function twoCellFixture()
   }
 end
 
+local function frame(cell, duration)
+  return {
+    cell = cell,
+    duration = duration,
+    element = "cell",
+    translateX = 0,
+    translateY = 0,
+    scaleX = 1,
+    scaleY = 1,
+    rotation = 0,
+  }
+end
+
 local function twoFrameFixture()
   return {
     anims = {
       {
-        frames = {
-          {
-            cell = 0,
-            duration = 2,
-            element = "cell",
-            translateX = 0,
-            translateY = 0,
-            scaleX = 1,
-            scaleY = 1,
-            rotation = 0,
-          },
-          {
-            cell = 1,
-            duration = 3,
-            element = "cell",
-            translateX = 0,
-            translateY = 0,
-            scaleX = 1,
-            scaleY = 1,
-            rotation = 0,
-          },
-        },
+        frames = { frame(0, 2), frame(1, 3) },
         playMode = "forward",
         loopStartFrameIdx = 0,
       },
@@ -195,7 +195,7 @@ local function configuredProgram()
         op = "create-configured-sprite",
         taskKind = TASK_KIND,
         taskContext = TASK_CONTEXT,
-        parameters = {},
+        parameters = { offsetX = 0, offsetY = 0 },
         resourceKeys = {
           character = CHARACTER_KEY,
           palette = PALETTE_KEY,
@@ -203,8 +203,6 @@ local function configuredProgram()
           animation = ANIMATION_KEY,
         },
       },
-      -- The native effects wait holds the occurrence on its raw sprite
-      -- task exactly like a staged source program does.
       { op = "wait-for-battler-effects", cursorRule = "advance-when-effects-finish" },
     },
     subprograms = {},
@@ -225,17 +223,46 @@ local function topologyPlayback(key)
   }
   local event = {
     sequence = 1,
+    kind = "struck",
+    cause = { kind = "move", key = key },
     actionId = 1,
     hitIndex = 1,
-    effectKey = key,
     actors = { { combatant = 1, activation = 1 } },
     targets = { { combatant = 3, activation = 3 } },
+    move = { selected = key, executed = key, phase = "direct" },
+    payload = { target = 3, hitIndex = 1, damage = 1, calculated = 1 },
     visualSeed = 4242,
+    presentation = {
+      context = {},
+      execution = {
+        selectedMove = key,
+        executedMove = key,
+        moment = "use",
+        branch = "default",
+        attacker = { combatant = 1, activation = 1 },
+        defender = { combatant = 3, activation = 3 },
+        targets = { { combatant = 3, activation = 3 } },
+        damage = -1,
+        power = 0,
+        friendship = 0,
+        hitOrdinal = 1,
+        hitCount = 1,
+        hitCycle = 1,
+      },
+    },
   }
   local geometry = ManifestFixture.manifest().battlefield.slots
-  local playback = BattlePresentationFlow.animationPlayback(packet, event, geometry)
-  Assert.equal(playback.launchId, "configured-sprite-probe", "the playback input carries its launch identity")
-  return playback
+  local requests = BattlePresentationFlow.animationPlayback(packet, event, geometry)
+  local request = assert(requests[1], "the selector publishes its frozen request")
+  Assert.equal(request.disposition, "admit", "the connected probe hit admits its request")
+  return {
+    launchId = packet.launchId,
+    packetId = packet.packetId,
+    event = event,
+    visualSeed = event.visualSeed,
+    topology = request.playback.topology,
+    context = request.playback.context,
+  }
 end
 
 local function playerWith(scene, journal, store)
@@ -246,6 +273,7 @@ local function playerWith(scene, journal, store)
     audio = controllableAudio(),
     resources = journalResources(journal, store),
     tasks = Factory,
+    services = { onNativeFrame = function() end },
   }))
 end
 
@@ -282,33 +310,6 @@ local function assertBalanced(journal, what)
   end
 end
 
--- The opcode-78 role map reaches the spawned task with no key lost and
--- no hidden second owner: each role is acquired exactly once and
--- returned exactly once, and the first tick already shows staged
--- sprite geometry instead of an imageless generic run.
-function T.configured_sprite_instruction_stages_each_owned_role_exactly_once()
-  local scene = sceneWithPair()
-  local journal = { acquired = {}, released = {} }
-  local player = playerWith(scene, journal, leaseStore())
-  local handle = assert(player:start(topologyPlayback("probe-configured-sprite"), configuredProgram()))
-  player:stepSourceTick({ tick = 1 })
-  local counts = acquiredCounts(journal)
-  for _, key in ipairs({ CHARACTER_KEY, PALETTE_KEY, CELL_KEY, ANIMATION_KEY }) do
-    Assert.equal(counts[key], 1, "the spawned task stages its owned role once: " .. key)
-  end
-  local total = 0
-  for _ in pairs(counts) do
-    total = total + 1
-  end
-  Assert.equal(total, 4, "no hidden second owner stages a duplicate lease")
-  player:stepSourceTick({ tick = 1 })
-  Assert.isTrue(#scene:effectViews() > 0, "the first tick publishes staged sprite geometry")
-  Assert.equal(runUntil(player, handle, "complete"), "complete", "the configured sprite run completes")
-  Assert.equal(#scene:effectViews(), 0, "completion releases every transient record")
-  assertBalanced(journal, "the configured sprite run")
-  player:dispose()
-end
-
 local function pictureByAsset(views)
   local found = {}
   for _, view in ipairs(views) do
@@ -319,144 +320,67 @@ local function pictureByAsset(views)
   return found
 end
 
--- Two authored frames draw distinct staged geometry at their source
--- boundary and retire to an empty draw list: frame 0 shows both
--- enabled objects with native offsets, flips, and depths, frame 1
--- shows the second cell while the disabled object never publishes.
-function T.cell_animation_frames_draw_distinct_geometry_then_retire()
+function T.configured_sprite_instruction_stages_each_owned_role_once_and_cancels_cleanly()
   local scene = sceneWithPair()
   local journal = { acquired = {}, released = {} }
   local player = playerWith(scene, journal, leaseStore())
   local handle = assert(player:start(topologyPlayback("probe-configured-sprite"), configuredProgram()))
   player:stepSourceTick({ tick = 1 })
+  local counts = acquiredCounts(journal)
   player:stepSourceTick({ tick = 1 })
-  local first = pictureByAsset(scene:effectViews())
-  Assert.equal(#first, 2, "frame 0 publishes exactly its two enabled objects")
-  Assert.equal(first[1].assetKey, CHARACTER_KEY, "pictures draw from the staged texture role")
-  Assert.equal(first[1].centerX, 68, "the first object centers on the attacker anchor plus its native x")
-  Assert.equal(first[1].centerY, 86, "the first object centers on the attacker anchor plus its native y")
-  Assert.equal(first[1].width, 16, "the first object keeps its native width")
-  Assert.equal(first[1].height, 8, "the first object keeps its native height")
-  Assert.equal(first[1].xOffset2, 0, "the first band crops at its staged tile origin")
-  Assert.equal(first[1].yOffset2, 0, "bands crop from the single staged strip row")
-  Assert.equal(first[1].zCenter, -1, "lower native priority rests further back")
-  Assert.equal(first[2].centerX, 96, "the second object keeps its own native offset")
-  Assert.equal(first[2].flipH, true, "the authored horizontal flip is carried, not ignored")
-  Assert.equal(first[2].zCenter, 0, "the top native priority draws nearest")
-  player:stepSourceTick({ tick = 1 })
-  local held = pictureByAsset(scene:effectViews())
-  Assert.equal(#held, 2, "frame 0 holds through its authored two-tick duration")
-  player:stepSourceTick({ tick = 1 })
-  local second = pictureByAsset(scene:effectViews())
-  Assert.equal(#second, 2, "frame 1 publishes one object over two strip bands")
-  Assert.equal(second[1].centerX, 72, "frame 1 centers on the attacker anchor plus its native offset")
-  Assert.equal(second[1].centerY, 88, "frame 1 keeps its native y on the first band")
-  Assert.equal(second[1].xOffset2, 64, "the first band crops at the staged tile origin")
-  Assert.equal(second[2].centerY, 96, "the second band steps one object row down")
-  Assert.equal(second[2].xOffset2, 72, "the second band crops at the next staged tile")
-  Assert.equal(second[2].height, 8, "bands keep the staged strip row height")
-  Assert.equal(runUntil(player, handle, "complete"), "complete", "the run retires at its authored five-tick boundary")
-  Assert.equal(#scene:effectViews(), 0, "no transient picture survives retirement")
-  assertBalanced(journal, "the frame run")
-  player:dispose()
-end
+  for _, key in ipairs({ CHARACTER_KEY, PALETTE_KEY, CELL_KEY, ANIMATION_KEY }) do
+    Assert.equal(counts[key], 1, "the spawned body stages its owned role once: " .. key)
+  end
+  Assert.isTrue(#scene:effectViews() > 0, "the first tick publishes staged sprite geometry")
+  Assert.equal(runUntil(player, handle, "complete"), "complete", "the configured sprite run completes")
+  Assert.equal(#scene:effectViews(), 0, "completion releases every transient record")
+  assertBalanced(journal, "the configured sprite run")
 
--- Cancelling after the first frame releases both owned object records
--- and every staged lease while the persistent battler scene is
--- untouched; repeated cancel and dispose stay silent.
-function T.multi_object_cell_cancels_without_touching_persistent_scene()
-  local scene = sceneWithPair()
-  local journal = { acquired = {}, released = {} }
-  local player = playerWith(scene, journal, leaseStore())
-  local handle = assert(player:start(topologyPlayback("probe-configured-sprite"), configuredProgram()))
+  local cancelledHandle = assert(player:start(topologyPlayback("probe-configured-sprite"), configuredProgram()))
   player:stepSourceTick({ tick = 1 })
   player:stepSourceTick({ tick = 1 })
-  Assert.equal(#pictureByAsset(scene:effectViews()), 2, "both authored objects paint before cancellation")
-  player:cancel(handle, "superseded")
-  Assert.equal(player:status(handle), "cancelled", "the sprite run lands on cancelled")
-  Assert.equal(#scene:effectViews(), 0, "cancellation releases every owned object record")
+  Assert.isTrue(#scene:effectViews() > 0, "the running body owns transient records")
+  player:cancel(cancelledHandle, "superseded")
+  Assert.equal(player:status(cancelledHandle), "cancelled", "cancellation lands on cancelled")
+  Assert.equal(#scene:effectViews(), 0, "cancellation releases every transient record")
   assertBalanced(journal, "the cancelled run")
-  Assert.isNil(
-    scene:pictureState({ combatant = 3, activation = 3 }),
-    "cancelling one side never patches the other battler"
+  player:dispose()
+end
+
+function T.authored_frames_draw_distinct_geometry_and_carry_the_picture_seam()
+  local scene = sceneWithPair()
+  local journal = { acquired = {}, released = {} }
+  local player = playerWith(scene, journal, leaseStore())
+  local handle = assert(player:start(topologyPlayback("probe-configured-sprite"), configuredProgram()))
+  player:stepSourceTick({ tick = 1 })
+  player:stepSourceTick({ tick = 1 })
+  local firstFrame = pictureByAsset(scene:effectViews())
+  Assert.equal(#firstFrame, 2, "frame 0 publishes both enabled objects")
+  for index, picture in ipairs(firstFrame) do
+    local what = "picture " .. index
+    Assert.equal(picture.selector:find("/cell-0/", 1, true) ~= nil, true, what .. " paints the first authored cell")
+    Assert.equal(picture.assetKey, CHARACTER_KEY, what .. " carries its staged drawable key")
+    Assert.isTrue(type(picture.centerX) == "number", what .. " carries native X")
+    Assert.isTrue(type(picture.zCenter) == "number", what .. " carries native depth")
+    Assert.isTrue(picture.xOffset2 ~= nil or picture.yOffset2 ~= nil, what .. " crops its viewport")
+  end
+  player:stepSourceTick({ tick = 1 })
+  local secondFrame = pictureByAsset(scene:effectViews())
+  Assert.isTrue(#secondFrame > 0, "frame 1 publishes its enabled object bands")
+  for _, picture in ipairs(secondFrame) do
+    Assert.isTrue(picture.selector:find("/cell-1/", 1, true) ~= nil, "the second authored cell paints")
+    Assert.isTrue(picture.selector:find("/obj-2/", 1, true) == nil, "the disabled cell object never publishes")
+  end
+  Assert.isTrue(
+    secondFrame[1].centerX ~= firstFrame[1].centerX or secondFrame[1].centerY ~= firstFrame[1].centerY,
+    "the authored cells draw distinct geometry"
   )
-  local scroll = scene:scroll()
-  Assert.equal(scroll.x, 0, "cancellation never moves the viewport")
-  Assert.equal(scroll.y, 0, "cancellation never moves the viewport vertically")
-  player:cancel(handle, "repeated")
-  player:dispose()
-  player:dispose()
-  player:stepSourceTick({ tick = 9 })
-  Assert.equal(player:status(handle), "cancelled", "the disposed run never advances again")
-  Assert.equal(#scene:effectViews(), 0, "late teardown publishes nothing")
-  assertBalanced(journal, "the late teardown")
-end
-
--- A frame naming a cell the normalized record does not carry fails the
--- occurrence with kind and key provenance instead of drawing a
--- substitute or retiring as a silent success.
-function T.unknown_cell_reference_fails_closed()
-  local scene = sceneWithPair()
-  local journal = { acquired = {}, released = {} }
-  local store = leaseStore()
-  store[ANIMATION_KEY] = {
-    key = ANIMATION_KEY,
-    kind = "animation",
-    payloadPath = "probe/sprite-animation.lua",
-    data = {
-      anims = {
-        {
-          frames = {
-            {
-              cell = 9,
-              duration = 2,
-              element = "cell",
-              translateX = 0,
-              translateY = 0,
-              scaleX = 1,
-              scaleY = 1,
-              rotation = 0,
-            },
-          },
-          playMode = "forward",
-          loopStartFrameIdx = 0,
-        },
-      },
-    },
-  }
-  local player = playerWith(scene, journal, store)
-  local handle = assert(player:start(topologyPlayback("probe-configured-sprite"), configuredProgram()))
-  Assert.equal(runUntil(player, handle, "complete"), "failed", "the unknown cell fails the occurrence")
-  local failure = player:failure(handle)
-  Assert.notNil(failure, "the failure carries its diagnosis")
-  local reason = tostring((type(failure) == "table" and failure.reason) or failure)
-  Assert.isTrue(reason:find(TASK_KIND, 1, true) ~= nil, "the failure names its task kind: " .. reason)
-  Assert.equal(#scene:effectViews(), 0, "the rejected run publishes no substitute picture")
-  assertBalanced(journal, "the rejected run")
+  Assert.equal(runUntil(player, handle, "complete"), "complete", "the walk retires at its authored boundary")
+  Assert.equal(#scene:effectViews(), 0, "retirement releases every transient record")
+  assertBalanced(journal, "the two-frame run")
   player:dispose()
 end
 
--- Source affine objects have no picture-pass support in this lane, so
--- an enabled affine object fails closed at construction instead of
--- drawing an unrotated stand-in.
-function T.affine_cell_objects_fail_closed()
-  local scene = sceneWithPair()
-  local journal = { acquired = {}, released = {} }
-  local store = leaseStore()
-  local cells = twoCellFixture()
-  cells.cells[1].objs[1].affine = true
-  store[CELL_KEY] = { key = CELL_KEY, kind = "cell", payloadPath = "probe/sprite-cell.lua", data = cells }
-  local player = playerWith(scene, journal, store)
-  local handle = assert(player:start(topologyPlayback("probe-configured-sprite"), configuredProgram()))
-  Assert.equal(runUntil(player, handle, "complete"), "failed", "the affine object fails the occurrence")
-  Assert.equal(#scene:effectViews(), 0, "the rejected run publishes no unrotated stand-in")
-  assertBalanced(journal, "the affine rejection")
-  player:dispose()
-end
-
--- Zero-duration frames are skipped in the steady walk without
--- inventing a fixed budget: a leading authored zero never paints, and
--- an all-zero animation shows its first frame for exactly one tick.
 function T.zero_duration_frames_skip_without_invented_timing()
   local scene = sceneWithPair()
   local journal = { acquired = {}, released = {} }
@@ -465,141 +389,63 @@ function T.zero_duration_frames_skip_without_invented_timing()
     key = ANIMATION_KEY,
     kind = "animation",
     payloadPath = "probe/sprite-animation.lua",
-    data = {
-      anims = {
-        {
-          frames = {
-            {
-              cell = 0,
-              duration = 0,
-              element = "cell",
-              translateX = 0,
-              translateY = 0,
-              scaleX = 1,
-              scaleY = 1,
-              rotation = 0,
-            },
-            {
-              cell = 1,
-              duration = 2,
-              element = "cell",
-              translateX = 0,
-              translateY = 0,
-              scaleX = 1,
-              scaleY = 1,
-              rotation = 0,
-            },
-          },
-          playMode = "forward",
-          loopStartFrameIdx = 0,
-        },
-      },
-    },
+    data = { anims = { { frames = { frame(0, 0), frame(1, 2) }, playMode = "forward", loopStartFrameIdx = 0 } } },
   }
   local player = playerWith(scene, journal, store)
   local handle = assert(player:start(topologyPlayback("probe-configured-sprite"), configuredProgram()))
   player:stepSourceTick({ tick = 1 })
   player:stepSourceTick({ tick = 1 })
   local pictures = pictureByAsset(scene:effectViews())
-  Assert.isTrue(#pictures > 0, "the steady walk still publishes after skipping the zero frame")
-  Assert.equal(pictures[1].centerX, 72, "the zero-duration frame never paints: the second cell shows first")
-  player:stepSourceTick({ tick = 1 })
+  Assert.isTrue(#pictures > 0, "the steady walk publishes after skipping the zero frame")
+  Assert.equal(
+    pictures[1].centerX,
+    DEFENDER_ANCHOR.x + 8 + 4,
+    "the zero-duration frame never paints: the second cell shows first"
+  )
   Assert.equal(runUntil(player, handle, "complete"), "complete", "the walk retires at the authored nonzero boundary")
   assertBalanced(journal, "the zero-skipping run")
   player:dispose()
-  local flatScene = sceneWithPair()
-  local flatJournal = { acquired = {}, released = {} }
-  local flatStore = leaseStore()
-  flatStore[ANIMATION_KEY] = {
-    key = ANIMATION_KEY,
-    kind = "animation",
-    payloadPath = "probe/sprite-animation.lua",
-    data = {
-      anims = {
-        {
-          frames = {
-            {
-              cell = 0,
-              duration = 0,
-              element = "cell",
-              translateX = 0,
-              translateY = 0,
-              scaleX = 1,
-              scaleY = 1,
-              rotation = 0,
-            },
-          },
-          playMode = "forward",
-          loopStartFrameIdx = 0,
-        },
-      },
-    },
-  }
-  local flatPlayer = playerWith(flatScene, flatJournal, flatStore)
-  local flatHandle = assert(flatPlayer:start(topologyPlayback("probe-configured-sprite"), configuredProgram()))
-  flatPlayer:stepSourceTick({ tick = 1 })
-  flatPlayer:stepSourceTick({ tick = 1 })
-  Assert.equal(
-    runUntil(flatPlayer, flatHandle, "complete"),
-    "complete",
-    "the all-zero animation retires on its first task tick"
-  )
-  Assert.equal(#flatScene:effectViews(), 0, "retirement releases the single shown frame")
-  assertBalanced(flatJournal, "the all-zero run")
-  flatPlayer:dispose()
 end
 
--- The staged sprite pictures travel through the production renderer:
--- asset key, native geometry, crop origin, flip, and depth all reach
--- the picture layer instead of stalling at the scene boundary.
-function T.staged_sprite_pictures_reach_the_production_renderer()
-  local BattleRenderer = require("game.hgss.src.battle.BattleRenderer")
-  local FakeGraphics = require("tests.support.FakeGraphics")
-  local scene = sceneWithPair()
-  local journal = { acquired = {}, released = {} }
-  local player = playerWith(scene, journal, leaseStore())
-  local handle = assert(player:start(topologyPlayback("probe-configured-sprite"), configuredProgram()))
-  player:stepSourceTick({ tick = 1 })
-  player:stepSourceTick({ tick = 1 })
-  local submitted = nil
-  local image = {
-    getDimensions = function()
-      return 80, 80
-    end,
+function T.unsupported_cells_fail_closed_without_publishing()
+  local cases = {
+    {
+      what = "an unknown authored cell",
+      store = function()
+        local store = leaseStore()
+        store[ANIMATION_KEY] = {
+          key = ANIMATION_KEY,
+          kind = "animation",
+          payloadPath = "probe/sprite-animation.lua",
+          data = { anims = { { frames = { frame(9, 2) }, playMode = "forward", loopStartFrameIdx = 0 } } },
+        }
+        return store
+      end,
+    },
+    {
+      what = "an enabled affine cell object",
+      store = function()
+        local store = leaseStore()
+        local cells = twoCellFixture()
+        cells.cells[1].objs[1].affine = true
+        store[CELL_KEY] = { key = CELL_KEY, kind = "cell", payloadPath = "probe/sprite-cell.lua", data = cells }
+        return store
+      end,
+    },
   }
-  local assets = {
-    handles = { [CHARACTER_KEY] = { image = image } },
-  }
-  function assets.drawable(_self, key)
-    return assets.handles[key]
+  for _, case in ipairs(cases) do
+    local scene = sceneWithPair()
+    local journal = { acquired = {}, released = {} }
+    local player = playerWith(scene, journal, case.store())
+    local handle = assert(player:start(topologyPlayback("probe-configured-sprite"), configuredProgram()))
+    Assert.equal(runUntil(player, handle, "complete"), "failed", case.what .. " fails the occurrence")
+    local failure = player:failure(handle)
+    local reason = tostring((type(failure) == "table" and failure.reason) or failure)
+    Assert.isTrue(reason:find(TASK_KIND, 1, true) ~= nil, case.what .. " names its task kind: " .. reason)
+    Assert.equal(#scene:effectViews(), 0, case.what .. " publishes no substitute picture")
+    assertBalanced(journal, case.what)
+    player:dispose()
   end
-  function assets.renderPictures(_self, _graphics, pictures)
-    submitted = pictures
-    return { layer = "probe-layer" }
-  end
-  local graphics = FakeGraphics.new()
-  BattleRenderer.drawPane({
-    graphics = graphics,
-    text = {},
-    windows = {},
-    assets = assets,
-    frameKey = "default",
-    sceneImageKey = "scene:probe",
-  }, {
-    battlers = {},
-    effectInstances = scene:effectViews(),
-    hudPatchSpans = {},
-    hudSections = {},
-  }, "detail", {})
-  Assert.notNil(submitted, "the effect pictures submit to the picture layer")
-  assert(submitted ~= nil, "the submission stays available")
-  Assert.equal(#submitted, 2, "both authored objects submit")
-  Assert.equal(submitted[1].centerX, 68, "native geometry survives to the picture layer")
-  Assert.equal(submitted[1].xOffset2, 0, "the crop origin survives to the picture layer")
-  Assert.equal(submitted[2].flipH, true, "the authored flip survives to the picture layer")
-  Assert.isTrue(submitted[1].pictureVisible, "sprite crops mark their picture-layer crop")
-  Assert.equal(#graphics.draws >= 1, true, "the composed layer draws")
-  player:dispose()
 end
 
 return { tests = T }

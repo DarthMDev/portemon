@@ -330,19 +330,50 @@ end
 
 function T.configured_sprite_task_runs_from_typed_parameters()
   local Sources = require("romdump.src.config.BattleAnimationSources")
-  local resolved = assert(Sources.resolveConfiguredSpriteAction(17, { 10, 20, 4, 0x100 }))
-  Assert.equal(resolved.taskKind, "sprite-affine-rotation-transition", "the probe selects its source task kind")
+  local resolved = assert(Sources.resolveConfiguredSpriteAction(17, { 10, 20, 10, 0x100 }))
+  Assert.equal(resolved.taskKind, "sprite-throw-arc", "the probe selects its source task kind")
+  Assert.deepEqual(resolved.parameters, {
+    offsetX = 10,
+    offsetY = 20,
+    durationTicks = 10,
+    arcHeight = 0x100,
+  }, "the thrown arc reads its four script words")
   local scene = sceneWithPair()
-  local services, journal = journalServices(scene)
-  local task = assert(
-    BattleEffectTasks.create(
-      resolved.taskKind,
-      { taskContext = resolved.context, parameters = resolved.parameters },
-      occurrenceContext(),
-      services
-    )
-  )
-  Assert.equal(task:status(), "pending", "configured sprite tasks open pending")
+  local journal = { acquired = {}, released = {} }
+  local leases = {
+    ["probe/character"] = { key = "probe/character", kind = "texture", width = 512 },
+    ["probe/palette"] = { key = "probe/palette", kind = "palette", data = { colors = { 0, 1, 2 } } },
+    ["probe/cell"] = {
+      key = "probe/cell",
+      kind = "cell",
+      data = { cells = { { objs = { { x = 0, y = 0, tile = 0, width = 8, height = 8, priority = 0 } } } } },
+    },
+    ["probe/animation"] = {
+      key = "probe/animation",
+      kind = "animation",
+      data = { anims = { { frames = { { cell = 0, duration = 32 } } } } },
+    },
+  }
+  local resources = {}
+  function resources.resolve(key)
+    journal.acquired[#journal.acquired + 1] = key
+    return assert(leases[key], "configured roles stage " .. key)
+  end
+  function resources.release(lease)
+    journal.released[#journal.released + 1] = lease
+  end
+  local services = { scene = scene, audio = {}, resources = resources }
+  local args = {
+    taskContext = resolved.context,
+    parameters = resolved.parameters,
+    resourceKeys = {
+      character = "probe/character",
+      palette = "probe/palette",
+      cell = "probe/cell",
+      animation = "probe/animation",
+    },
+  }
+  local task = assert(BattleEffectTasks.create(resolved.taskKind, args, occurrenceContext(), services))
   for _ = 1, 300 do
     task:stepSourceTick({ tick = 1 })
     if task:status() == "complete" then
@@ -353,14 +384,7 @@ function T.configured_sprite_task_runs_from_typed_parameters()
   Assert.equal(#scene:effectViews(), 0, "completion releases every transient record")
   Assert.equal(#journal.released, #journal.acquired, "completion releases every staged lease once")
   task:dispose()
-  local cancelling = assert(
-    BattleEffectTasks.create(
-      resolved.taskKind,
-      { taskContext = resolved.context, parameters = resolved.parameters },
-      occurrenceContext(77),
-      services
-    )
-  )
+  local cancelling = assert(BattleEffectTasks.create(resolved.taskKind, args, occurrenceContext(77), services))
   cancelling:stepSourceTick({ tick = 1 })
   cancelling:cancel("superseded")
   Assert.equal(cancelling:status(), "cancelled", "cancellation lands on cancelled")
@@ -368,36 +392,90 @@ function T.configured_sprite_task_runs_from_typed_parameters()
   Assert.equal(#journal.released, #journal.acquired, "cancellation releases every holding once")
 end
 
-function T.palette_fade_task_steps_source_coefficients()
+function T.palette_fade_interpolates_holds_and_clears_on_return()
+  -- Selector 33 lowers the battle-background fade (retail
+  -- BattleAnimFunc_FadeBgPalette over MAIN_BG): the compiled start/end
+  -- coefficients interpolate the battlefield toward the target color,
+  -- never a battler picture, so no activation is pictured and no lease
+  -- stages. Completion holds the faded palette like hardware until the
+  -- next fade overwrites it; the scripted return fade clears it and
+  -- cancellation restores the journaled compositor instead.
   local scene = sceneWithPair()
   local services, journal = journalServices(scene)
-  local activation = { combatant = 1, activation = 1 }
-  local task = assert(BattleEffectTasks.create("pokemon-picture-and-battle-palette-fade", {
-    callback = "pokemon-picture-and-battle-palette-fade",
-    taskContext = "battle-palette",
-    parameters = {
-      paletteTarget = "battle-animation-palette-target",
-      wait = 4,
-      startCoefficient = 10,
-      endCoefficient = 200,
-      nextColor = 300,
-    },
-    activation = activation,
-  }, occurrenceContext(), services))
+  local function compositorOf()
+    return assert(scene:animationFrame().main, "the fade publishes its main-engine state").compositor
+  end
+  local function fadeArgs(startCoefficient, endCoefficient, nextColor)
+    return {
+      callback = "pokemon-picture-and-battle-palette-fade",
+      taskContext = "battle-palette",
+      parameters = {
+        paletteTarget = "battle-animation-palette-target",
+        wait = 4,
+        startCoefficient = startCoefficient,
+        endCoefficient = endCoefficient,
+        nextColor = nextColor,
+      },
+    }
+  end
+  local function runToCompletion(task)
+    for _ = 1, 300 do
+      task:stepSourceTick({ tick = 1 })
+      if task:status() == "complete" then
+        return true
+      end
+    end
+    return task:status() == "complete"
+  end
+  local task = assert(
+    BattleEffectTasks.create("pokemon-picture-and-battle-palette-fade", fadeArgs(10, 200, 300), occurrenceContext(), services)
+  )
   Assert.equal(task:status(), "pending", "palette fades open pending")
   task:stepSourceTick({ tick = 1 })
-  local changed = #scene:effectViews() > 0 or scene:pictureState(activation) ~= nil
-  Assert.isTrue(changed, "the fade stages an observable change instead of idling on a timer")
-  for _ = 1, 300 do
-    task:stepSourceTick({ tick = 1 })
-    if task:status() == "complete" then
-      break
-    end
-  end
-  Assert.equal(task:status(), "complete", "the fade reaches its source-defined completion")
-  Assert.equal(#scene:effectViews(), 0, "completion releases every transient record")
+  local early = compositorOf().battlefieldFade
+  Assert.notNil(early, "the fade stages its battlefield fade instead of idling on a timer")
+  Assert.equal(early.amount, 10, "the first tick carries the compiled start coefficient")
+  Assert.equal(early.color.r, 300 % 32, "the fade decodes the target red channel")
+  task:stepSourceTick({ tick = 1 })
+  task:stepSourceTick({ tick = 1 })
+  local late = compositorOf().battlefieldFade
+  Assert.notNil(late, "the fade keeps publishing its battlefield fade across ticks")
+  Assert.isTrue(
+    (early.amount or 0) ~= (late.amount or 0),
+    "the working fade advances toward its requested strength instead of idling"
+  )
+  Assert.isTrue(runToCompletion(task), "the fade reaches its source-defined completion")
+  Assert.equal(
+    compositorOf().battlefieldFade.amount,
+    16,
+    "completion holds the clipped end coefficient like hardware holds its palette"
+  )
   Assert.equal(#journal.released, #journal.acquired, "completion releases every staged lease once")
   task:dispose()
+  -- A Leer-style darken holds its own end coefficient the same way.
+  local darken = assert(
+    BattleEffectTasks.create("pokemon-picture-and-battle-palette-fade", fadeArgs(0, 12, 0), occurrenceContext(), services)
+  )
+  Assert.isTrue(runToCompletion(darken), "the darken reaches its own completion")
+  Assert.equal(compositorOf().battlefieldFade.amount, 12, "the darken holds its compiled end coefficient")
+  darken:dispose()
+  -- The scripted return fade clears the held palette.
+  local back = assert(
+    BattleEffectTasks.create("pokemon-picture-and-battle-palette-fade", fadeArgs(12, 0, 0), occurrenceContext(), services)
+  )
+  Assert.isTrue(runToCompletion(back), "the return fade reaches its own completion")
+  local settled = compositorOf()
+  Assert.isTrue(
+    settled.battlefieldFade == nil or (settled.battlefieldFade.amount or 0) == 0,
+    "the return fade leaves no battlefield darkening behind"
+  )
+  back:dispose()
+  Assert.equal(#journal.released, #journal.acquired, "the fade legs release every staged lease once")
+end
+
+function T.palette_fade_cancel_restores_the_compositor_and_malformed_stays_loud()
+  local scene = sceneWithPair()
+  local services, journal = journalServices(scene)
   local cancelling = assert(BattleEffectTasks.create("pokemon-picture-and-battle-palette-fade", {
     callback = "pokemon-picture-and-battle-palette-fade",
     taskContext = "battle-palette",
@@ -408,14 +486,103 @@ function T.palette_fade_task_steps_source_coefficients()
       endCoefficient = 200,
       nextColor = 300,
     },
-    activation = activation,
   }, occurrenceContext(55), services))
   cancelling:stepSourceTick({ tick = 1 })
   cancelling:cancel("superseded")
   Assert.equal(cancelling:status(), "cancelled", "cancellation lands on cancelled")
   cancelling:dispose()
-  Assert.isTrue(scene:pictureState(activation) == nil, "cancelling the fade leaves no patch behind")
+  Assert.isTrue(
+    scene:animationFrame().main.compositor.battlefieldFade == nil,
+    "cancelling the fade leaves no compositor fade behind"
+  )
   Assert.equal(#journal.released, #journal.acquired, "cancellation releases every holding once")
+  local ok, failure = pcall(BattleEffectTasks.create, "pokemon-picture-and-battle-palette-fade", {
+    callback = "pokemon-picture-and-battle-palette-fade",
+    taskContext = "battle-palette",
+    parameters = {
+      paletteTarget = "battle-animation-palette-target",
+    },
+  }, occurrenceContext(), services)
+  Assert.isFalse(ok, "a fade without compiled timing never yields a runnable task")
+  Assert.isTrue(
+    string.find(tostring(failure), "pokemon-picture-and-battle-palette-fade", 1, true) ~= nil,
+    "the timing-less fade fails closed naming itself: " .. tostring(failure)
+  )
+  Assert.equal(#journal.released, #journal.acquired, "the rejected construction leaks no lease")
+end
+
+function T.attacker_obj_window_task_drives_the_compositor_window_seam()
+  -- Selector 21 (BattleAnimFunc_ShowAttackerObjWindowSprites) owns the
+  -- native OBJ window across its delay/show/hold phasing: the show tick
+  -- publishes the connected windows record where the compositor reader
+  -- resolves it (windows.objWindow/outside, never the dead objectWindow
+  -- top-level field), and the destroy tick restores the journaled
+  -- compositor instead of stranding the window. Masks mirror the native
+  -- register state through the plane mapping in the composite contract
+  -- (world3d is BG0, window is BG1, transition is BG2, battlefield is
+  -- BG3): outside shows every plane while the attacker silhouette keeps
+  -- the world3d picture the native OBJ gate shows, hiding only the
+  -- background transition and battlefield planes the native inside mask
+  -- clears.
+  local scene = sceneWithPair()
+  local services, _ = journalServices(scene)
+  local function windowsOf()
+    return assert(scene:animationFrame().main, "the window task publishes its main-engine state").compositor.windows
+  end
+  local task = assert(
+    BattleEffectTasks.create("battle-visual-show-attacker-obj-window-sprites", {}, occurrenceContext(), services)
+  )
+  Assert.equal(task:status(), "pending", "object-window tasks open pending")
+  for _ = 1, 10 do
+    task:stepSourceTick({ tick = 1 })
+  end
+  Assert.equal(task:status(), "running", "the delay never completes the window")
+  Assert.isNil(windowsOf(), "the delay publishes no window")
+  task:stepSourceTick({ tick = 1 })
+  local shown = windowsOf()
+  Assert.notNil(shown, "the show tick publishes the connected windows record")
+  local objWindow = assert(shown.objWindow, "the show tick names the object window")
+  local outside = assert(shown.outside, "the show tick names the outside window")
+  Assert.deepEqual(
+    objWindow.mask,
+    { world3d = true, window = true, transition = false, battlefield = false },
+    "the inside mask keeps the attacker picture while clearing the background planes"
+  )
+  Assert.deepEqual(
+    outside.mask,
+    { world3d = true, window = true, transition = true, battlefield = true },
+    "the outside mask keeps every plane visible"
+  )
+  for _ = 1, 9 do
+    task:stepSourceTick({ tick = 1 })
+    Assert.equal(task:status(), "running", "the hold keeps the window owned")
+    Assert.notNil(windowsOf(), "the hold keeps the window published")
+  end
+  task:stepSourceTick({ tick = 1 })
+  Assert.equal(task:status(), "complete", "the hold boundary completes the window")
+  Assert.isNil(windowsOf(), "the destroy tick restores the journaled compositor")
+  task:dispose()
+  Assert.isNil(windowsOf(), "disposal after completion restores nothing twice")
+  local cancelScene = sceneWithPair()
+  local cancelServices, _ = journalServices(cancelScene)
+  local cancelling = assert(
+    BattleEffectTasks.create(
+      "battle-visual-show-attacker-obj-window-sprites",
+      {},
+      occurrenceContext(),
+      cancelServices
+    )
+  )
+  for _ = 1, 11 do
+    cancelling:stepSourceTick({ tick = 1 })
+  end
+  cancelling:cancel("superseded")
+  Assert.equal(cancelling:status(), "cancelled", "cancellation lands on cancelled")
+  cancelling:dispose()
+  Assert.isNil(
+    cancelScene:animationFrame().main.compositor.windows,
+    "cancelling the window leaves no compositor window behind"
+  )
 end
 
 local function horizontalOffsetArgs(pictureTarget, durationTicks, signedOffset, activation)
@@ -711,6 +878,48 @@ function T.battler_sprite_active_position_roles_follow_attacker_and_defender_par
   scene:release()
 end
 
+function T.sprite_palette_blend_retires_on_its_compiled_duration()
+  local scene = sceneWithPair()
+  local services = journalServices(scene)
+  -- DISABLE's shipped single-tick flash: start meets end, so one tick retires it.
+  local task = assert(BattleEffectTasks.create("pokemon-picture-blend-sprite-palette", {
+    battlerTarget = "attacker",
+    parameters = {
+      pictureTarget = "attacker",
+      wait = 0,
+      startCoefficient = 14,
+      endCoefficient = 14,
+      nextColor = 6342,
+      blendStep = 1,
+      durationTicks = 1,
+    },
+  }, occurrenceContext(), services))
+  task:stepSourceTick({ tick = 1 })
+  Assert.equal(task:status(), "complete", "a single-tick blend retires after its compiled tick")
+  task:dispose()
+  -- TOXIC's shipped eleven-tick walk: the blend stays live through
+  -- its compiled duration and retires exactly at its end.
+  local long = assert(BattleEffectTasks.create("pokemon-picture-blend-sprite-palette", {
+    battlerTarget = "target",
+    parameters = {
+      pictureTarget = "target",
+      wait = 0,
+      startCoefficient = 0,
+      endCoefficient = 10,
+      nextColor = 31764,
+      blendStep = 1,
+      durationTicks = 11,
+    },
+  }, occurrenceContext(), services))
+  for _ = 1, 10 do
+    long:stepSourceTick({ tick = 1 })
+    Assert.isTrue(long:status() ~= "complete", "the walk has not completed early")
+  end
+  long:stepSourceTick({ tick = 1 })
+  Assert.equal(long:status(), "complete", "the walk retires on its compiled duration")
+  long:dispose()
+end
+
 function T.palette_pulse_accepts_a_compiled_zero_frame_interval()
   local scene = sceneWithPair()
   local services = journalServices(scene)
@@ -738,16 +947,17 @@ function T.operand_less_visual_without_a_marker_citation_fails_closed()
   -- Only verified synchronous-marker kinds retire without compiled timing
   -- operands; every other timing-less spawn fails closed with its kind
   -- identity instead of retiring silently with zero writes. The
-  -- four-sprite wave below carries no marker citation, so its
+  -- selected-position kind below carries no marker citation, so its
   -- operand-less spawn never yields a runnable task, publishes nothing,
   -- and stages nothing.
   local scene = sceneWithPair()
   local services, journal = journalServices(scene)
-  local ok, failure =
-    pcall(BattleEffectTasks.create, "pokemon-picture-four-sprite-wave-transition", {}, occurrenceContext(), services)
+  local ok, failure = pcall(BattleEffectTasks.create, "pokemon-picture-selected-position-transition", {
+    parameters = {},
+  }, occurrenceContext(), services)
   Assert.isFalse(ok, "a timing-less spawn outside the marker set never yields a runnable task")
   Assert.isTrue(
-    string.find(tostring(failure), "pokemon-picture-four-sprite-wave-transition", 1, true) ~= nil
+    string.find(tostring(failure), "pokemon-picture-selected-position-transition", 1, true) ~= nil
       and string.find(tostring(failure), "BATTLE_EFFECT_TASK_MALFORMED", 1, true) ~= nil,
     "the timing-less spawn fails closed naming itself: " .. tostring(failure)
   )
@@ -781,33 +991,6 @@ function T.borrowed_player_leases_are_never_reacquired()
   Assert.equal(#journal.acquired, 0, "player-held dependencies are borrowed, never reacquired")
   Assert.equal(#journal.released, 0, "borrowed runs release nothing they do not own")
   task:dispose()
-end
-
-function T.palette_overlay_stages_a_visible_fade_while_running()
-  local scene = sceneWithPair()
-  local services, journal = journalServices(scene)
-  local activation = { combatant = 1, activation = 1 }
-  local task = assert(BattleEffectTasks.create("pokemon-picture-and-battle-palette-fade", {
-    parameters = {
-      paletteTarget = "battle-animation-palette-target",
-      wait = 4,
-      startCoefficient = 0,
-      endCoefficient = 16,
-      nextColor = 300,
-    },
-    activation = activation,
-  }, occurrenceContext(), services))
-  task:stepSourceTick({ tick = 1 })
-  local running = scene:pictureState(activation)
-  Assert.isTrue(
-    running ~= nil and running.paletteFade ~= nil,
-    "the running fade stages its clipped source coefficients"
-  )
-  Assert.equal(running.paletteFade.finish, 16, "the extreme end coefficient survives clipping")
-  task:cancel("superseded")
-  Assert.isNil(scene:pictureState(activation), "cancelling the fade leaves no patch behind")
-  task:dispose()
-  Assert.equal(#journal.released, #journal.acquired, "the fade releases every holding once")
 end
 
 function T.negative_offsets_wrap_without_leaking()
@@ -879,9 +1062,9 @@ function T.admission_predicate_covers_only_implemented_kinds()
   end
   for _, kind in ipairs({
     "pokemon-picture-selected-horizontal-offset-transition",
-    "battle-background-picture-coordinate-sweep",
+    "battle-background-picture-scroll-oscillation",
     "battle-sprite-sinusoidal-position-animation",
-    "sprite-affine-rotation-transition",
+    "sprite-throw-arc",
   }) do
     Assert.isTrue(BattleEffectTasks.supportsKind(kind), "the visual body is admitted: " .. kind)
   end
@@ -1330,7 +1513,9 @@ function T.alternating_scroll_without_compiled_phases_stays_loud()
   )
 end
 
-function T.scanline_sine_sweep_moves_the_viewport_and_restores()
+function T.scanline_sine_sweep_writes_per_row_offsets_and_cleans_up()
+  -- Source wave offsets are per scanline, never a whole-screen sine
+  -- shift: the viewport stays untouched while rows carry the wave.
   local scene = sceneWithPair()
   local services, journal = journalServices(scene)
   local task = assert(BattleEffectTasks.create("battle-background-scanline-sine-wave-transition", {
@@ -1349,16 +1534,14 @@ function T.scanline_sine_sweep_moves_the_viewport_and_restores()
   end
   Assert.equal(task:status(), "complete", "the sine sweep completes at its compiled duration")
   Assert.equal(#seen, 12, "the sine sweep spans its twelve compiled ticks")
-  local moved = false
-  for _, frame in ipairs(seen) do
-    if frame ~= "0,0" then
-      moved = true
-    end
+  for index, frame in ipairs(seen) do
+    Assert.equal(frame, "0,0", "a scanline wave never shifts the whole viewport on tick " .. index)
   end
-  Assert.isTrue(moved, "the sine sweep owns a viewport change instead of idling on a timer")
   local settled = scene:scroll()
-  Assert.equal(settled.x, 0, "completion restores the saved horizontal viewport")
-  Assert.equal(settled.y, 0, "completion restores the saved vertical viewport")
+  Assert.equal(settled.x, 0, "the untouched horizontal viewport stays saved")
+  Assert.equal(settled.y, 0, "the untouched vertical viewport stays saved")
+  local cleared = scene:animationFrame()
+  Assert.equal(#cleared.scanlines, 192, "completion frees the wave back to a full zeroed buffer")
   task:dispose()
   task:cancel("late")
   Assert.equal(task:status(), "complete", "completion survives late cancellation")
@@ -1434,8 +1617,18 @@ function T.overlapping_background_sweeps_restore_only_owned_viewport()
       verticalOffset = 0,
     },
   }, occurrenceContext(), firstServices))
-  local second = assert(BattleEffectTasks.create("battle-background-scanline-sine-wave-transition", {
-    parameters = { backgroundLayer = "battle-background-layer-3", durationTicks = 4 },
+  -- The surviving sweep below must own viewport writes for the overlap
+  -- to be observable: the scanline wave writes per-row offsets instead
+  -- of the viewport, so the overlap pair uses two viewport sweeps with
+  -- distinct reaches.
+  local second = assert(BattleEffectTasks.create("battle-background-alternating-scroll-transition", {
+    parameters = {
+      backgroundLayer = "battle-background-layer-3",
+      ticksPerDirection = 2,
+      directionChanges = 2,
+      horizontalOffset = 12,
+      verticalOffset = 0,
+    },
   }, occurrenceContext(), secondServices))
   first:stepSourceTick({ tick = 1 })
   second:stepSourceTick({ tick = 1 })
@@ -1562,6 +1755,7 @@ local function backgroundPlayback(scene, journal, attackerSide, defenderSide, ar
         return BattleEffectTasks.create(kind, args, context, collaborators)
       end,
     },
+    services = { onNativeFrame = function() end },
   }))
   local program = {
     entry = "main",
@@ -1581,8 +1775,16 @@ local function backgroundPlayback(scene, journal, attackerSide, defenderSide, ar
       targets = { { combatant = 2, activation = 2, sideType = defenderSide } },
     },
   }, program))
-  player:stepSourceTick({ tick = 1 })
-  player:stepSourceTick({ tick = 2 })
+  -- The stream end drains the uncounted background load before
+  -- completing, so playback steps until the occurrence settles instead
+  -- of assuming a fixed tick count.
+  for _ = 1, 600 do
+    local phase = player:status(handle)
+    if phase ~= "running" and phase ~= "waiting" and phase ~= "preparing" then
+      break
+    end
+    player:stepSourceTick({ tick = 1 })
+  end
   return player, handle
 end
 
@@ -1678,6 +1880,7 @@ function T.native_background_selection_persists_until_cleanup_and_rejects_missin
         return BattleEffectTasks.create(kind, args, context, collaborators)
       end,
     },
+    services = { onNativeFrame = function() end },
   }))
   local malformedHandle = assert(malformedPlayer:start({
     launchId = "background-missing-defender",
@@ -1903,6 +2106,395 @@ function T.background_resource_failures_stay_closed()
   )
   cancelled:dispose()
   Assert.equal(#cancelJournal.released, #cancelJournal.acquired, "cancelled loads release every staged lease")
+end
+
+local function moveBattlerByArgs(offsetX, offsetY)
+  return {
+    callback = "pokemon-picture-offset-transition",
+    taskContext = "pokemon-picture",
+    parameters = {
+      pictureTarget = "active-battler",
+      durationTicks = 2,
+      offsetX = offsetX,
+      offsetY = offsetY,
+    },
+  }
+end
+
+local function enemyAttackerContext(seed)
+  local context = occurrenceContext(seed)
+  context.topology.attacker.sideType = 1
+  context.topology.attacker.slot = "solo-enemy"
+  return context
+end
+
+function T.move_battler_lunge_persists_chains_and_mirrors()
+  -- Tackle (MoveBattlerBy, selector 57) expresses its lunge as two
+  -- absolute repositionings: the out-leg endpoint persists through the
+  -- impact wait and the return leg starts from the displaced position
+  -- (battle_anim_funcs.c MoveBattlerBy leaves the absolute pic
+  -- position in place). Enemy-side lunges mirror both axes.
+  local scene = sceneWithPair()
+  local services, _ = journalServices(scene)
+  local activation = { combatant = 1, activation = 1 }
+  local outLeg = assert(
+    BattleEffectTasks.create(
+      "pokemon-picture-position-offset-transition",
+      moveBattlerByArgs(14, -8),
+      occurrenceContext(),
+      services
+    )
+  )
+  outLeg:stepSourceTick({ tick = 1 })
+  local mid = assert(scene:pictureState(activation), "the lunge owns its patch while running")
+  Assert.equal(mid.pictureXOffset, 7, "the out-leg interpolates from base on its first tick")
+  outLeg:stepSourceTick({ tick = 1 })
+  Assert.equal(outLeg:status(), "complete", "the out-leg completes on its compiled duration")
+  local held =
+    assert(scene:pictureState(activation), "the out-leg endpoint persists past completion for the impact wait")
+  Assert.equal(held.pictureXOffset, 14, "the persisted endpoint keeps the full lunge distance")
+  Assert.equal(held.pictureYOffset, -8, "the persisted endpoint keeps the full lunge rise")
+  outLeg:dispose()
+  local backLeg = assert(
+    BattleEffectTasks.create(
+      "pokemon-picture-position-offset-transition",
+      moveBattlerByArgs(-14, 8),
+      occurrenceContext(),
+      services
+    )
+  )
+  backLeg:stepSourceTick({ tick = 1 })
+  local chained = assert(scene:pictureState(activation), "the return leg owns its patch while running")
+  Assert.equal(chained.pictureXOffset, 7, "the return leg chains from the displaced position")
+  Assert.equal(chained.pictureYOffset, -4, "the return leg chains both axes from the displaced position")
+  backLeg:stepSourceTick({ tick = 1 })
+  Assert.equal(backLeg:status(), "complete", "the return leg completes on its compiled duration")
+  local home = assert(scene:pictureState(activation), "the return endpoint persists like the out-leg")
+  Assert.equal(home.pictureXOffset, 0, "the chained return lands back on base")
+  Assert.equal(home.pictureYOffset, 0, "the chained return lands back on base on both axes")
+  backLeg:dispose()
+  local cancelled = assert(
+    BattleEffectTasks.create(
+      "pokemon-picture-position-offset-transition",
+      moveBattlerByArgs(14, -8),
+      occurrenceContext(),
+      services
+    )
+  )
+  cancelled:stepSourceTick({ tick = 1 })
+  cancelled:cancel("superseded")
+  Assert.isNil(scene:pictureState(activation), "cancelling a lunge still drops its owned patch")
+  cancelled:dispose()
+  local foeScene = sceneWithPair()
+  local foeServices, _ = journalServices(foeScene)
+  local foeActivation = { combatant = 1, activation = 1 }
+  local foeLunge = assert(
+    BattleEffectTasks.create(
+      "pokemon-picture-position-offset-transition",
+      moveBattlerByArgs(14, -8),
+      enemyAttackerContext(),
+      foeServices
+    )
+  )
+  foeLunge:stepSourceTick({ tick = 1 })
+  foeLunge:stepSourceTick({ tick = 1 })
+  Assert.equal(foeLunge:status(), "complete", "the foe lunge completes on its compiled duration")
+  local mirrored = assert(foeScene:pictureState(foeActivation), "the foe lunge persists its endpoint")
+  Assert.equal(mirrored.pictureXOffset, -14, "the foe lunge mirrors X away from the player")
+  Assert.equal(mirrored.pictureYOffset, 8, "the foe lunge mirrors Y away from the player")
+  foeLunge:dispose()
+end
+
+local ZIGZAG_SLASH_KIND = "pokemon-picture-zigzag-slash"
+
+local function zigzagBank()
+  return {
+    ["zigzag/character"] = { key = "zigzag/character", kind = "texture", width = 128 },
+    ["zigzag/palette"] = { key = "zigzag/palette", kind = "palette", data = { colors = { 0, 1, 2 } } },
+    ["zigzag/cell"] = {
+      key = "zigzag/cell",
+      kind = "cell",
+      data = {
+        cells = {
+          {
+            objs = {
+              { x = -16, y = -16, tile = 0, width = 32, height = 32, priority = 1 },
+            },
+          },
+        },
+      },
+    },
+    ["zigzag/animation"] = {
+      key = "zigzag/animation",
+      kind = "animation",
+      data = { anims = { { frames = { { cell = 0, duration = 4 } } } } },
+    },
+  }
+end
+
+local function zigzagServices()
+  local scene = sceneWithPair()
+  local journal = { acquired = {}, released = {} }
+  local leases = zigzagBank()
+  local resources = {}
+  function resources.resolve(key)
+    journal.acquired[#journal.acquired + 1] = key
+    return assert(leases[key], "staged bank carries " .. tostring(key))
+  end
+  function resources.release(lease)
+    journal.released[#journal.released + 1] = lease
+  end
+  return { scene = scene, audio = {}, resources = resources }, journal
+end
+
+local function zigzagArgs()
+  return {
+    taskContext = "pokemon-picture",
+    parameters = {},
+    resourceKeys = {
+      character = "zigzag/character",
+      palette = "zigzag/palette",
+      cell = "zigzag/cell",
+      animation = "zigzag/animation",
+    },
+  }
+end
+
+local function zigzagCenter(services)
+  local views = services.scene:effectViews()
+  Assert.isTrue(#views >= 1, "the zigzag sprite stays published while it runs")
+  local first = assert(views[1].picture, "the zigzag sprite publishes staged picture state")
+  return first.centerX, first.centerY, first.alpha
+end
+
+function T.zigzag_slash_drives_the_native_six_leg_assault()
+  -- Foresight's magnifier is opcode-78 selector 8, the native
+  -- BattleAnimSpriteFunc_ZigzagSlash: six zigzag legs from the defender
+  -- anchor (battle_anim_effects.c), a 16-tick sprite fade, and a defender
+  -- white flash. The generic static cell walk retires after the 4-tick
+  -- authored frame with no motion; the dedicated body walks the pinned
+  -- leg table over its ~111-tick native lifetime instead.
+  Assert.isTrue(BattleEffectTasks.supportsKind(ZIGZAG_SLASH_KIND), "the zigzag assault is an admitted task kind")
+  local services, journal = zigzagServices()
+  local defender = { combatant = 3, activation = 3 }
+  local task = assert(BattleEffectTasks.create(ZIGZAG_SLASH_KIND, zigzagArgs(), occurrenceContext(), services))
+  Assert.equal(task:status(), "pending", "zigzag assaults open pending")
+  -- The solo-enemy battler picture center the legs depart from (mirrors
+  -- the defender slot in BattleEffectTasks). The native leg table below
+  -- rides it as offsets, so a settled-geometry move touches one line.
+  local anchor = { x = 192, y = 50 }
+  local legs = {
+    [4] = { 0, -12 },
+    [5] = { 0, -12 },
+    [13] = { 40, 28 },
+    [27] = { 40, -52 },
+    [41] = { -40, 28 },
+    [55] = { -40, -52 },
+    [69] = { 40, 28 },
+    [83] = { 0, -12 },
+    [84] = { 0, -12 },
+  }
+  for tick = 1, 84 do
+    task:stepSourceTick({ tick = 1 })
+    Assert.isTrue(task:status() ~= "complete", "the assault outlives tick " .. tick)
+    if legs[tick] ~= nil then
+      local x, y = zigzagCenter(services)
+      Assert.equal(x, anchor.x + legs[tick][1], "leg waypoint X at tick " .. tick)
+      Assert.equal(y, anchor.y + legs[tick][2], "leg waypoint Y at tick " .. tick)
+    end
+  end
+  local flash = services.scene:pictureState(defender)
+  Assert.isTrue(flash ~= nil, "the fade stages a defender flash patch")
+  Assert.equal(flash.paletteFade.finish, 10, "the defender flashes toward full white")
+  Assert.equal(flash.paletteFade.targetColor, 32767, "the defender flash targets native white")
+  local _, _, openAlpha = zigzagCenter(services)
+  Assert.equal(openAlpha, 1, "the sprite stays opaque through the legs")
+  task:stepSourceTick({ tick = 1 })
+  local _, _, fadeAlpha = zigzagCenter(services)
+  Assert.equal(fadeAlpha, 15 / 16, "the sprite fades over the native 16 ticks")
+  for _ = 1, 15 do
+    task:stepSourceTick({ tick = 1 })
+  end
+  Assert.equal(#services.scene:effectViews(), 0, "the sprite hides once its fade completes")
+  for _ = 1, 10 do
+    task:stepSourceTick({ tick = 1 })
+    Assert.isTrue(task:status() ~= "complete", "the restore flash holds completion")
+  end
+  task:stepSourceTick({ tick = 1 })
+  Assert.equal(task:status(), "complete", "the assault completes after the restore flash")
+  Assert.equal(#services.scene:effectViews(), 0, "completion releases every transient record")
+  Assert.isNil(services.scene:pictureState(defender), "completion restores the defender picture")
+  Assert.equal(#journal.released, #journal.acquired, "completion releases every staged lease once")
+  task:dispose()
+end
+
+function T.zigzag_slash_cancels_without_stranding_state()
+  local services, journal = zigzagServices()
+  local defender = { combatant = 3, activation = 3 }
+  local task = assert(BattleEffectTasks.create(ZIGZAG_SLASH_KIND, zigzagArgs(), occurrenceContext(), services))
+  for _ = 1, 10 do
+    task:stepSourceTick({ tick = 1 })
+  end
+  task:cancel("superseded")
+  Assert.equal(task:status(), "cancelled", "cancellation lands on cancelled")
+  task:stepSourceTick({ tick = 1 })
+  Assert.equal(task:status(), "cancelled", "cancelled assaults never resume")
+  Assert.equal(#services.scene:effectViews(), 0, "cancellation releases every transient record")
+  Assert.isNil(services.scene:pictureState(defender), "cancellation restores the defender picture")
+  task:dispose()
+  Assert.equal(#journal.released, #journal.acquired, "cancellation releases every holding once")
+end
+
+function T.zigzag_slash_without_sprite_roles_fails_closed()
+  local scene = sceneWithPair()
+  local services, journal = journalServices(scene)
+  local ok, failure = pcall(
+    BattleEffectTasks.create,
+    ZIGZAG_SLASH_KIND,
+    { taskContext = "pokemon-picture", parameters = {} },
+    occurrenceContext(),
+    services
+  )
+  Assert.isTrue(not ok, "a role-less zigzag spawn never constructs")
+  Assert.isTrue(string.find(tostring(failure), ZIGZAG_SLASH_KIND, 1, true) ~= nil, "the refusal names its kind")
+  Assert.equal(#scene:effectViews(), 0, "the refused construction publishes nothing")
+  Assert.equal(#journal.released, #journal.acquired, "the refused construction leaks no lease")
+end
+
+local SHAKE_TARGETS_KIND = BattleEffectTasks.BLEND_TRANSITION_KIND
+
+local function shakeTargetsArgs()
+  return {
+    callback = "battle-background-position-transition",
+    taskContext = "battle-display",
+    parameters = {
+      offsetX = 1,
+      offsetY = 0,
+      ticksPerStep = 1,
+      steps = 2,
+      pictureSets = { "opposing-battler" },
+      pictureAttributeOffset = true,
+      managedSpriteOffset = false,
+      backgroundPositionEnabled = false,
+    },
+  }
+end
+
+function T.shake_targets_shakes_the_named_pictures_around_their_base()
+  -- Selector 36 (ShakeTargets, the Growl/Tackle impact shake) oscillates
+  -- the named battler pictures ±amp around their construction-time
+  -- offset with the native interval/count phase machine
+  -- (battle_anim_funcs.c), restoring the base at completion instead of
+  -- stranding the endpoint.
+  local scene = sceneWithPair()
+  local services, journal = journalServices(scene)
+  local defender = { combatant = 3, activation = 3 }
+  local task = assert(BattleEffectTasks.create(SHAKE_TARGETS_KIND, shakeTargetsArgs(), occurrenceContext(), services))
+  Assert.equal(task:status(), "pending", "shake targets open pending")
+  local expectedX = { 1, 0, -1, 0, 1, 0, -1 }
+  for tick = 1, 7 do
+    task:stepSourceTick({ tick = 1 })
+    Assert.isTrue(task:status() ~= "complete", "the shake outlives tick " .. tick)
+    local shown = assert(scene:pictureState(defender), "the shake owns its patch on tick " .. tick)
+    Assert.equal(shown.pictureXOffset, expectedX[tick], "shake X alternates ±amp on tick " .. tick)
+    Assert.equal(shown.pictureYOffset, 0, "shake Y holds its zero amp on tick " .. tick)
+  end
+  task:stepSourceTick({ tick = 1 })
+  Assert.equal(task:status(), "complete", "the shake completes after its count cycles")
+  Assert.isNil(scene:pictureState(defender), "completion restores the undisplaced base")
+  Assert.equal(#journal.released, #journal.acquired, "completion stages no leases")
+  task:dispose()
+end
+
+function T.shake_targets_cancel_restores_the_owned_base()
+  local scene = sceneWithPair()
+  local services, journal = journalServices(scene)
+  local defender = { combatant = 3, activation = 3 }
+  local task = assert(BattleEffectTasks.create(SHAKE_TARGETS_KIND, shakeTargetsArgs(), occurrenceContext(), services))
+  task:stepSourceTick({ tick = 1 })
+  task:stepSourceTick({ tick = 1 })
+  Assert.isTrue(scene:pictureState(defender) ~= nil, "the shake owns its patch while running")
+  task:cancel("superseded")
+  Assert.equal(task:status(), "cancelled", "cancellation lands on cancelled")
+  Assert.isNil(scene:pictureState(defender), "cancellation restores the undisplaced base")
+  task:dispose()
+  Assert.equal(#journal.released, #journal.acquired, "cancellation stages no leases")
+end
+
+function T.shake_targets_without_named_pictures_degrades_to_its_timing()
+  local scene = sceneWithPair()
+  local services, journal = journalServices(scene)
+  local defender = { combatant = 3, activation = 3 }
+  local args = shakeTargetsArgs()
+  args.parameters.pictureSets = {}
+  local task = assert(BattleEffectTasks.create(SHAKE_TARGETS_KIND, args, occurrenceContext(), services))
+  for _ = 1, 30 do
+    task:stepSourceTick({ tick = 1 })
+    Assert.isNil(scene:pictureState(defender), "no named picture means no shake patch")
+    if task:status() == "complete" then
+      break
+    end
+  end
+  Assert.equal(task:status(), "complete", "the set-less shake still retires on its timing")
+  task:dispose()
+  Assert.equal(#journal.released, #journal.acquired, "the degraded shake stages no leases")
+end
+
+-- BattleAnimFunc_AnimateSprites draws the shared battler sprite manager for
+-- its frame count, so copies stay visible through the loop and stop when it
+-- retires or is withdrawn early.
+function T.managed_sprite_frame_loop_owns_the_manager_draw_window()
+  local function stagedScene()
+    local scene = BattleScene.new()
+    scene:setAnimationSpriteManager("battler-sprite-manager", true)
+    scene:setBattlerSpriteSlot("probe:1", 0, { combatant = 1, activation = 1 }, false)
+    return scene
+  end
+  local function copyDraws(scene)
+    for _, view in ipairs(scene:effectViews()) do
+      if type(view.picture) == "table" and view.picture.spriteSlot == 0 then
+        return view.draw
+      end
+    end
+    return nil
+  end
+
+  local scene = stagedScene()
+  Assert.equal(copyDraws(scene), false, "no loop paints the copy")
+  local services = { scene = scene, audio = {}, resources = {} }
+  Assert.isTrue(
+    not pcall(BattleEffectTasks.create, "managed-sprite-draw-loop", { parameters = {} }, {}, services),
+    "a frame loop needs its source frame count"
+  )
+  local task = assert(BattleEffectTasks.create(
+    "managed-sprite-draw-loop",
+    { parameters = { frameTicks = 3 } },
+    {},
+    services
+  ))
+  Assert.equal(copyDraws(scene), true, "the loop opens its manager draw window")
+  task:stepSourceTick({ tick = 1 })
+  Assert.equal(task:status(), "running", "the loop keeps drawing through its frame count")
+  Assert.equal(copyDraws(scene), true, "the copy stays painted inside the window")
+  task:stepSourceTick({ tick = 2 })
+  Assert.equal(copyDraws(scene), true, "the last running frame keeps the window")
+  task:stepSourceTick({ tick = 3 })
+  Assert.equal(task:status(), "complete", "the loop retires on its frame count")
+  Assert.equal(copyDraws(scene), false, "the retired loop paints no copy")
+  task:dispose()
+
+  local withdrawn = stagedScene()
+  local cancelled = assert(BattleEffectTasks.create(
+    "managed-sprite-draw-loop",
+    { parameters = { frameTicks = 5 } },
+    {},
+    { scene = withdrawn, audio = {}, resources = {} }
+  ))
+  Assert.equal(copyDraws(withdrawn), true, "the loop opens its window before the withdrawal")
+  cancelled:cancel("withdrawn")
+  Assert.equal(cancelled:status(), "cancelled", "cancellation lands on cancelled")
+  Assert.equal(copyDraws(withdrawn), false, "cancellation closes the draw window")
+  cancelled:dispose()
 end
 
 return { tests = T }

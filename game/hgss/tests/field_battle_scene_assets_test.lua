@@ -601,7 +601,7 @@ function T.preparation_retains_intro_and_terrain_drawables_with_source_metadata(
   for setIndex, set in ipairs(record.encounterParticles) do
     local staged = layer.encounterParticles[setIndex]
     Assert.equal(staged.startTick, set.startTick, "set " .. setIndex .. " keeps its start tick")
-    Assert.equal(staged.seed, set.seed, "set " .. setIndex .. " keeps its seed")
+    Assert.isNil(staged.seed, "set " .. setIndex .. " carries no persisted seed")
     Assert.equal(staged.emitters, set.emitters, "set " .. setIndex .. " carries its staged emitters")
     Assert.equal(#staged.textures, #set.textures, "set " .. setIndex .. " carries every texture")
     for index, texture in ipairs(set.textures) do
@@ -808,6 +808,31 @@ function T.trainer_map_uses_context_selected_physical_palette_layout()
           },
         },
       },
+      opening = {
+        playMode = "forward",
+        loopStartFrameIdx = 0,
+        frames = {
+          {
+            drawableKey = "battle-ball-open:POKE:0",
+            image = "assets/generated/battle/balls/POKE-open-0.png",
+            width = 1,
+            height = 1,
+            durationTicks = 10,
+            sourceIndices = {
+              format = "source-index-rgba8",
+              plane = "mainObj",
+              width = 1,
+              height = 1,
+              variants = {
+                ["slot:48"] = {
+                  path = "battle/ball-open/main-obj-source-index-castle.rgba8",
+                  firstSlot = 48,
+                },
+              },
+            },
+          },
+        },
+      },
     },
     ["ball:GREAT_BALL"] = {
       fadeColor = 0,
@@ -832,11 +857,36 @@ function T.trainer_map_uses_context_selected_physical_palette_layout()
           },
         },
       },
+      opening = {
+        playMode = "forward",
+        loopStartFrameIdx = 0,
+        frames = {
+          {
+            drawableKey = "battle-ball-open:GREAT_BALL:0",
+            image = "assets/generated/battle/balls/GREAT_BALL-open-0.png",
+            width = 1,
+            height = 1,
+            durationTicks = 10,
+            sourceIndices = {
+              format = "source-index-rgba8",
+              plane = "mainObj",
+              width = 1,
+              height = 1,
+              variants = {
+                ["slot:64"] = {
+                  path = "battle/ball-great-open/main-obj-source-index-slot64.rgba8",
+                  firstSlot = 64,
+                },
+              },
+            },
+          },
+        },
+      },
     },
   }
   for selector, entry in pairs(manifest.battleBalls.entries) do
     leafRecords[BattlePresentationCache.ballPath(selector)] = {
-      schema = "g4-battle-ball-v1",
+      schema = "g4-battle-ball-v4",
       selector = selector,
       catalogIdentity = manifest.catalogIdentity,
       entry = entry,
@@ -2618,6 +2668,9 @@ function T.repeating_particle_textures_keep_repeat_samplers_from_warmup_to_draw(
   local record = sceneRecord(SCENE_KEY)
   local repeated = record.encounterParticles[1]
   repeated.emitters[1].texRepeat = { s = 1, t = 0 }
+  -- The staged header names the hardware wrap: a repeating tile must
+  -- repeat (or mirror), never clamp to its top-left quadrant.
+  repeated.textures[1].sampler = { wrapX = "repeat", wrapY = "repeat", minFilter = "nearest", magFilter = "nearest" }
   -- A schema-valid child generation referencing the same texture file:
   -- the parent repeats x2 while the child repeats x4 on the other axis.
   local template = record.encounterParticles[2].emitters[1].child
@@ -2709,6 +2762,34 @@ function T.repeating_particle_textures_keep_repeat_samplers_from_warmup_to_draw(
       drawable = function()
         return nil
       end,
+      renderPictures = function(_, drawGraphics, frame)
+        local CompositionFrameDrain = require("tests.support.CompositionFrameDrain")
+        CompositionFrameDrain.drain(drawGraphics, frame)
+        local primitives = assert(frame.primitives, "production renders its typed composition frame")
+        for _, primitive in ipairs(primitives) do
+          local handle = primitive.image or primitive.material
+          local image = type(handle) == "table" and (handle.image or handle) or handle
+          -- Repeated viewports size from the primitive UV span over the
+          -- staged texture, exactly like the shared target samples them.
+          local texW, texH = nil, nil
+          if type(image) == "table" and type(image.getDimensions) == "function" then
+            texW, texH = image:getDimensions()
+          elseif type(image) == "table" and type(image.getWidth) == "function" then
+            texW, texH = image:getWidth(), image:getHeight()
+          end
+          local maxU, maxV = 0, 0
+          for _, vertex in ipairs(primitive.vertices or {}) do
+            maxU = math.max(maxU, vertex.u or 0)
+            maxV = math.max(maxV, vertex.v or 0)
+          end
+          if type(texW) == "number" and type(texH) == "number" and (maxU > 1 or maxV > 1) then
+            drawGraphics.draw(image, drawGraphics.newQuad(0, 0, maxU * texW, maxV * texH, texW, texH), 0, 0)
+          else
+            drawGraphics.draw(image, 0, 0)
+          end
+        end
+        return { handle = "picture-composite" }
+      end,
     },
     frameKey = "default",
   }, {
@@ -2770,6 +2851,17 @@ function T.modded_trainer_and_ball_payloads_stage_without_catalog_recheck()
         image = "balls/modded.png",
       },
     },
+    opening = {
+      playMode = "forward",
+      loopStartFrameIdx = 0,
+      frames = {
+        {
+          drawableKey = "battle-ball-open:MODDED:0",
+          image = "balls/modded-open.png",
+          durationTicks = 10,
+        },
+      },
+    },
   }
   local leafRecords = {
     [BattlePresentationCache.trainerPicturePath("front:MODDED")] = {
@@ -2779,7 +2871,7 @@ function T.modded_trainer_and_ball_payloads_stage_without_catalog_recheck()
       entry = trainerEntry,
     },
     [BattlePresentationCache.ballPath("ball:MODDED")] = {
-      schema = "g4-battle-ball-v1",
+      schema = "g4-battle-ball-v4",
       selector = "ball:MODDED",
       catalogIdentity = "modded-catalog",
       entry = ballEntry,

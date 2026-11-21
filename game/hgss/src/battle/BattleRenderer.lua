@@ -12,11 +12,14 @@
 local BattleRenderer = {}
 
 local BattleBagPockets = require("game.hgss.src.battle.BattleBagPockets")
+local BattlePartyPages = require("game.hgss.src.battle.BattlePartyPages")
 local BattleChildText = require("game.hgss.src.battle.BattleChildText")
 local LogicalSurface = require("libs.ui.src.LogicalSurface")
 local BattleScene = require("libs.hgss.src.presentation.BattleScene")
 local SplParticleDraw = require("libs.hgss.src.presentation.SplParticleDraw")
 local BattleMenuPresenter = require("game.hgss.src.battle.BattleMenuPresenter")
+local BattlePicturePass = require("libs.hgss.src.presentation.BattlePicturePass")
+local ImageAssetPool = require("libs.hgss.src.presentation.ImageAssetPool")
 local BattleMenuRegions = require("game.hgss.src.battle.BattleMenuRegions")
 local BattleViewRoster = require("game.hgss.src.battle.BattleViewRoster")
 
@@ -305,7 +308,7 @@ end
 -- headless descriptors and bare test stand-ins stay drawable-shaped so
 -- recording views prove without GPU uploads, while pool leases resolve
 -- to their staged image for measurement.
----@param art table<string, unknown> resolved drawable handle under drawing
+---@param art table<string, unknown>|userdata resolved drawable handle under drawing
 ---@return table<string, unknown>|userdata|nil measurable staged image behind the handle
 local function stagedPixelsOf(art)
   if type(art.getWidth) == "function" then
@@ -430,7 +433,7 @@ end
 -- sampler when it samples, directly otherwise. Extra placement
 -- arguments forward to the draw call.
 ---@param graphics table<string, unknown> injected host graphics
----@param art table<string, unknown> resolved drawable handle under drawing
+---@param art table<string, unknown>|userdata resolved drawable handle under drawing
 ---@param quad table<string, unknown>? caller-owned viewport, nil for whole-image draws
 ---@param x number draw position x
 ---@param y number draw position y
@@ -613,6 +616,24 @@ local function numberOr(value, default)
   return type(value) == "number" and value or default
 end
 
+-- The settled visual center behind one battler picture: the frozen slot
+-- row plus the scene-published species picture height. The height is a
+-- required scene fact (every drawn picture carries its species
+-- geometry), never a guessed zero; live vertical displacement arrives
+-- through entry/shake offsets, task-owned center state and picture
+-- offsets, each consumed once by its own owner.
+---@param battler table<string, unknown> displayed battler facts under drawing
+---@param row BattleRenderer.SlotGeometry the battler's published slot row
+---@return number settled horizontal native center
+---@return number settled vertical native center
+local function settledPictureCenter(battler, row)
+  local speciesHeight = assert(
+    type(battler.sourceHeight) == "number" and battler.sourceHeight,
+    "settled pictures carry their scene-published species picture height"
+  )
+  return row.settledX, row.settledY + speciesHeight
+end
+
 ---@param tint table<string, number>? optional picture tint
 ---@return number red multiplier
 ---@return number green multiplier
@@ -718,11 +739,8 @@ local function shadowPicture(assets, battler, row)
     + numberOr(battler.entryDx, 0)
     + numberOr(battler.shakeDx, 0)
     + numberOr(battler.motionDx, 0)
-  local pictureCenterY = row.settledY
-    + numberOr(battler.height, 0)
-    + numberOr(battler.sourceHeight, 0)
-    + numberOr(battler.entryDy, 0)
-    + numberOr(battler.motionDy, 0)
+  local _, settledCenterY = settledPictureCenter(battler, row)
+  local pictureCenterY = settledCenterY + numberOr(battler.entryDy, 0) + numberOr(battler.motionDy, 0)
   local shadowX = battler.shadowAdjustX == false
       and assert(type(battler.shadowX) == "number" and battler.shadowX, "fixed shadows carry their source X")
     or pictureCenterX + numberOr(battler.pictureXOffset, 0) + numberOr(battler.shadowOffsetX, 0)
@@ -800,7 +818,6 @@ local function battlerPicture(assets, battler, row)
       palette = lease.palette
     end
   end
-  local sourceHeight = numberOr(battler.height, 0) + numberOr(battler.sourceHeight, 0)
   local scaleX = numberOr(battler.scaleX, 1)
   local scaleY = numberOr(battler.scaleY, 1)
   if battler.affineMode == true then
@@ -813,14 +830,28 @@ local function battlerPicture(assets, battler, row)
   end
   local pictureVisible = battler.pictureVisible == true
   local tintR, tintG, tintB, tintA = tintOf(battler.pictureTint --[[@as table<string, number>?]])
+  -- Native ChangeBattlerPic selects the attacker picture variant:
+  -- mode 2 loads the substitute doll (owned by the substitute flag and
+  -- its doll effect), mode 3 loads the opposite-facing mon as a
+  -- horizontal mirror, and any other mode reloads the same-facing mon.
+  -- The restore opcode drops the selector back to the base picture.
+  local flipH = battler.flipH == true
+  if battler.layoutMode == 3 then
+    flipH = not flipH
+  end
+  local settledX, settledY = settledPictureCenter(battler, row)
   local picture = {
+    combatant = battler.combatant,
+    activation = battler.activation,
     image = image.image,
     imageKind = image.imageKind,
-    centerX = row.settledX + numberOr(battler.entryDx, 0) + numberOr(battler.shakeDx, 0) + numberOr(
-      battler.motionDx,
-      0
-    ),
-    centerY = row.settledY + sourceHeight + numberOr(battler.entryDy, 0) + numberOr(battler.motionDy, 0),
+    -- The 2D object-window silhouette redraws this same portrait
+    -- through the shared sampler: pooled portrait cells are indexed
+    -- atlas windows, so the raw page image alone draws opaque and
+    -- would mask the stripe as a rectangle instead of the mon shape.
+    sampler = cell,
+    centerX = settledX + numberOr(battler.entryDx, 0) + numberOr(battler.shakeDx, 0) + numberOr(battler.motionDx, 0),
+    centerY = settledY + numberOr(battler.entryDy, 0) + numberOr(battler.motionDy, 0),
     zCenter = row.depth,
     frameX = frameX,
     frameY = frameY,
@@ -839,6 +870,7 @@ local function battlerPicture(assets, battler, row)
     tintB = tintB,
     alpha = numberOr(battler.polygonAlpha, 31) / 31 * tintA,
     paletteFade = battler.motionBlend or battler.paletteFade,
+    flipH = flipH or nil,
   }
   for field, fact in pairs(PICTURE_OFFSETS) do
     picture[field] = numberOr(battler[fact], 0)
@@ -874,25 +906,79 @@ local function effectPicture(assets, picture)
     tintG = picture.tintG or 1,
     tintB = picture.tintB or 1,
     paletteFade = picture.paletteFade,
+    paletteOffset = picture.paletteOffset,
     pictureVisible = picture.xOffset2 ~= nil or picture.yOffset2 ~= nil,
     xOffset2 = picture.xOffset2,
     yOffset2 = picture.yOffset2,
+    scaleX = picture.scaleX,
+    scaleY = picture.scaleY,
     flipH = picture.flipH,
     flipV = picture.flipV,
   }
 end
 
--- Submits every depth-ordered battler shadow and picture, then the
--- transient effect pictures, as one isolated picture pass composited
--- under the neutral tint. Vanished and undrawn battlers submit nothing.
----@param graphics table<string, unknown> injected host graphics
+-- One managed battler-sprite copy: the scene-owned immutable snapshot
+-- when the slot carries one, the legacy live clone otherwise. A bound
+-- copy resolves the creation-time portrait selector's first frame with
+-- its base palette instead of the live battler texture, so later frame,
+-- palette, form, or visibility mutations move only the source-defined
+-- follow transform, never the copy's pixels. Only that transform stays
+-- live; size, orientation, tint, fade, and visibility freeze at creation.
+-- An unresolvable frozen portrait draws nothing, never a substitute.
+---@param assets table<string, unknown> injected asset holder
+---@param picture table<string, unknown> slot picture with its follow flag and frozen source
+---@param source { battler: table<string, unknown>, row: table<string, unknown>, picture: table<string, unknown> } live source picture behind the slot
+---@return table<string, unknown>? copy picture for the picture pass
+local function battlerCopyPicture(assets, picture, source)
+  local frozenSelector = picture.frozenSelector
+  if type(frozenSelector) ~= "string" or frozenSelector == "" then
+    local copy = {}
+    for field, value in pairs(source.picture) do
+      copy[field] = value
+    end
+    copy.centerY = copy.centerY - numberOr(source.battler.shadowHeight, 0)
+    if picture.follow ~= true then
+      local _, followSettledY = settledPictureCenter(source.battler, source.row)
+      copy.centerX = source.row.settledX
+      copy.centerY = followSettledY - numberOr(source.battler.shadowHeight, 0)
+    end
+    return copy
+  end
+  local frozen = battlerPicture(assets, {
+    portraitSelector = frozenSelector,
+    pictureFrame = 0,
+    position = source.battler.position,
+    side = source.battler.side,
+    sourceHeight = source.battler.sourceHeight,
+  }, source.row)
+  if frozen == nil then
+    return nil
+  end
+  frozen.centerY = frozen.centerY - numberOr(source.battler.shadowHeight, 0)
+  if picture.follow ~= true then
+    local _, followSettledY = settledPictureCenter(source.battler, source.row)
+    frozen.centerX = source.row.settledX
+    frozen.centerY = followSettledY - numberOr(source.battler.shadowHeight, 0)
+  else
+    frozen.centerX = source.picture.centerX
+    frozen.centerY = source.picture.centerY - numberOr(source.battler.shadowHeight, 0)
+  end
+  return frozen
+end
+
+-- Collects every depth-ordered battler shadow, picture and transient
+-- effect picture as native submissions for the shared 3D target.
+-- Vanished and undrawn battlers submit nothing.
 ---@param assets table<string, unknown> injected asset holder
 ---@param view table<string, unknown> internal semantic snapshot under drawing
 ---@param players table<integer, table<string, unknown>> live player-side battler facts in slot order
 ---@param enemies table<integer, table<string, unknown>> live enemy-side battler facts in slot order
 ---@param singles boolean true while the battle keeps its single layout
-local function drawPicturePlanes(graphics, assets, view, players, enemies, singles)
+---@return table<integer, table<string, unknown>> picture submissions in native order
+---@return table<integer, table<string, unknown>> animation sprite copies in creation order
+local function collectPictureSubmissions(assets, view, players, enemies, singles)
   local pictures = {}
+  local copies = {}
   local battlerPictures = {}
   local function activationKey(activation)
     return tostring(activation.combatant) .. ":" .. tostring(activation.activation)
@@ -902,7 +988,59 @@ local function drawPicturePlanes(graphics, assets, view, players, enemies, singl
       pictures[#pictures + 1] = picture
     end
   end
-  for _, record in ipairs(pictureRecords(view, players, enemies, singles)) do
+  -- Managed copies outlive their source's live visibility: a withdrawn
+  -- or hidden battler still owns its slot row for copy resolution, so
+  -- hidden slot occupants referenced by copy slots join the source map.
+  -- Their own pictures stay suppressed by the visibility guard below;
+  -- only their copies submit. The layout decision already reached this
+  -- boundary on the live sides, so extending the lists changes no row.
+  local wanted = {}
+  for _, effect in ipairs(assert(view.effectInstances, "battle snapshots carry transient effect instances")) do
+    local slotPicture = type(effect.picture) == "table" and effect.picture or nil
+    local sourceActivation = type(slotPicture) == "table" and slotPicture.battlerActivation or nil
+    if type(sourceActivation) == "table" then
+      wanted[activationKey(sourceActivation)] = true
+    end
+  end
+  local liveKeys = {}
+  for _, battler in ipairs(players) do
+    liveKeys[activationKey(battler)] = true
+  end
+  for _, battler in ipairs(enemies) do
+    liveKeys[activationKey(battler)] = true
+  end
+  local hiddenPlayers, hiddenEnemies = {}, {}
+  if type(view.battlers) == "table" then
+    for _, battler in ipairs(view.battlers) do
+      if
+        type(battler) == "table"
+        and type(battler.combatant) == "number"
+        and type(battler.activation) == "number"
+        and wanted[activationKey(battler)] == true
+        and liveKeys[activationKey(battler)] ~= true
+      then
+        if battler.side == 1 then
+          hiddenPlayers[#hiddenPlayers + 1] = battler
+        else
+          hiddenEnemies[#hiddenEnemies + 1] = battler
+        end
+      end
+    end
+  end
+  local sourcePlayers, sourceEnemies = {}, {}
+  for _, battler in ipairs(players) do
+    sourcePlayers[#sourcePlayers + 1] = battler
+  end
+  for _, battler in ipairs(hiddenPlayers) do
+    sourcePlayers[#sourcePlayers + 1] = battler
+  end
+  for _, battler in ipairs(enemies) do
+    sourceEnemies[#sourceEnemies + 1] = battler
+  end
+  for _, battler in ipairs(hiddenEnemies) do
+    sourceEnemies[#sourceEnemies + 1] = battler
+  end
+  for _, record in ipairs(pictureRecords(view, sourcePlayers, sourceEnemies, singles)) do
     local battler = record.battler
     local picture = battlerPicture(assets, battler, record.row)
     if type(battler.combatant) == "number" and type(battler.activation) == "number" and picture ~= nil then
@@ -915,35 +1053,821 @@ local function drawPicturePlanes(graphics, assets, view, players, enemies, singl
   end
   for _, effect in ipairs(assert(view.effectInstances, "battle snapshots carry transient effect instances")) do
     local picture = effect.picture --[[@as table<string, unknown>?]]
-    if picture ~= nil then
+    -- A source slot whose draw flag a scripted SetBattlerSpriteVisible or
+    -- StopBattlerSpriteDraw cleared keeps its copy alive but hidden.
+    if picture ~= nil and effect.draw ~= false then
       local sourceActivation = picture.battlerActivation
       if type(sourceActivation) == "table" then
         local source = battlerPictures[activationKey(sourceActivation)]
         if source ~= nil then
-          local copy = {}
-          for field, value in pairs(source.picture) do
-            copy[field] = value
+          local copy = battlerCopyPicture(assets, picture, source)
+          if copy ~= nil then
+            if type(effect.priority) == "number" then
+              copy.priority = effect.priority
+            end
+            copies[#copies + 1] = copy
           end
-          copy.centerY = copy.centerY - numberOr(source.battler.shadowHeight, 0)
-          if picture.follow ~= true then
-            copy.centerX = source.row.settledX
-            copy.centerY = source.row.settledY
-              + numberOr(source.battler.height, 0)
-              + numberOr(source.battler.sourceHeight, 0)
-              - numberOr(source.battler.shadowHeight, 0)
-          end
-          submit(copy)
         end
       else
         submit(effectPicture(assets, picture))
       end
     end
   end
-  if #pictures > 0 then
-    local layer = assets:renderPictures(graphics, pictures)
+  return pictures, copies
+end
+
+-- Native clip-space extent behind one submitted picture: the shared 3D
+-- target consumes homogeneous clip vertices with identity matrices, so
+-- the submitted screen rectangle maps exactly once here.
+---@param picture table<string, unknown> collected picture submission
+---@param ordinal integer native submission ordinal behind the primitive
+---@return table<string, unknown>? ordered native polygon, nil while the staged image stays unmeasurable
+local function pictureToPrimitive(picture, ordinal)
+  local staged = picture.image
+  if type(staged.getDimensions) ~= "function" then
+    return nil
+  end
+  local function five(value)
+    local channel = math.floor((value or 1) * 31 + 0.5)
+    if channel < 0 then
+      return 0
+    elseif channel > 31 then
+      return 31
+    end
+    return channel
+  end
+  local rows = BattlePicturePass.clipVertices(picture)
+  return {
+    kind = picture.kind or "picture",
+    vertices = rows,
+    color5 = { r = five(picture.tintR), g = five(picture.tintG), b = five(picture.tintB) },
+    alpha5 = five(picture.alpha),
+    polygonId = 5,
+    image = picture.image,
+    palette = picture.palette,
+    imageKind = picture.imageKind,
+    paletteFade = picture.paletteFade,
+    sampler = { minFilter = "nearest", magFilter = "nearest", wrapX = "clamp", wrapY = "clamp" },
+    -- Every staged picture texture carries transparent texels (portrait
+    -- corners, shadow ellipses, effect cutouts): alpha-zero texels must
+    -- discard in the cutout pass instead of writing depth on the
+    -- opaque path and occluding the pictures behind their corners.
+    alphaUsage = { hasZero = true, hasOpaque = true },
+    submissionOrdinal = ordinal,
+    flags = { cullMode = "none", fogEnabled = false, translucentDepthWrite = false, depthEqual = false },
+    centerX = picture.centerX,
+    centerY = picture.centerY,
+    width = picture.width,
+    height = picture.height,
+    zCenter = picture.kind == "shadow" and BattleScene.SHADOW_DEPTH or picture.zCenter,
+    pictureVisible = picture.pictureVisible,
+    xOffset = picture.xOffset,
+    yOffset = picture.yOffset,
+    xOffset2 = picture.xOffset2,
+    yOffset2 = picture.yOffset2,
+    scaleX = picture.scaleX,
+    scaleY = picture.scaleY,
+    paletteOffset = picture.paletteOffset,
+    shadowHeight = picture.shadowHeight,
+    frameX = picture.frameX,
+    frameY = picture.frameY,
+    frameW = picture.frameW,
+    frameH = picture.frameH,
+    flipH = picture.flipH,
+    flipV = picture.flipV,
+    rotation = picture.rotation,
+    rotationX = picture.rotationX,
+    rotationY = picture.rotationY,
+    rotationZ = picture.rotationZ,
+    pivotX = picture.pivotX,
+    pivotY = picture.pivotY,
+  }
+end
+
+-- Appends native particle polygons in source submission order: move
+-- systems, then encounter, then ball. The capture already ran at the
+-- native graphics phase; drawing never advances simulation or RNG.
+-- Compiled per-texture alpha usage rides each primitive into the shared
+-- Gx classification so transparent texels discard instead of writing
+-- depth on the opaque path; textures without compiled usage keep the
+-- picture blanket, which already discards alpha-zero corners.
+---@param view table<string, unknown> internal semantic snapshot under drawing
+---@param out table<integer, table<string, unknown>> caller-owned ordered primitive array
+local function collectParticlePrimitives(view, out)
+  for _, key in ipairs({ "moveParticleSystems", "encounterParticleSystems", "ballParticleSystems" }) do
+    local systems = view[key] --[[@as table<integer, table<string, unknown>>?]]
+    if systems ~= nil then
+      for _, system in ipairs(systems) do
+        local simulation = system.simulation --[[@as table<string, unknown>?]]
+        local textures = system.textures --[[@as table<integer, table<string, unknown>>?]]
+        if simulation ~= nil and textures ~= nil then
+          local usageByTexture = system.textureAlphaUsage --[[@as table<integer, table<string, unknown>>?]]
+          local usageByMaterial = nil
+          if type(usageByTexture) == "table" then
+            usageByMaterial = {}
+            for texNo, usage in pairs(usageByTexture) do
+              local handle = textures[texNo]
+              if handle ~= nil then
+                usageByMaterial[handle] = usage
+              end
+            end
+          end
+          ---@param runtime table<string, unknown>
+          ---@param particle table<string, unknown>
+          ---@param child table<string, unknown>?
+          ---@return table<string, unknown> staged particle texture
+          local function resolveTexture(runtime, particle, child)
+            local _ = runtime
+            local texNo = child ~= nil and child.texNo or particle.texNo
+            return assert(textures[texNo], "particle texture is staged")
+          end
+          local first = #out + 1
+          SplParticleDraw.appendPrimitives(simulation, nil, resolveTexture, out)
+          for index = first, #out do
+            local primitive = out[index]
+            if usageByMaterial == nil then
+              -- Systems without a compiled usage table (legacy synthetic
+              -- rigs) keep the picture blanket, which already discards
+              -- alpha-zero corners instead of writing depth on the
+              -- opaque path.
+              primitive.alphaUsage = { hasZero = true, hasOpaque = true }
+            else
+              -- Staged textures carry their exact decoder coverage flags:
+              -- a missing entry fails loudly instead of hardening
+              -- translucent texels into the cutout/opaque classification.
+              primitive.alphaUsage =
+                assert(usageByMaterial[primitive.material], "particle texture is staged with its alpha usage")
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+-- Default engine plane priorities behind the typed frame.
+local ENGINE_PRIORITY = {
+  main = { world3d = 1, window = 0, transition = 2, battlefield = 3 },
+  sub = { menu = 1, window = 0, transition = 2, battlefield = 3 },
+}
+local ENGINE_WORLD_ROLE = { main = "world3d", sub = "menu" }
+local NATIVE_LAYOUT = { scale = 1, offsetX = 0, offsetY = 0 }
+
+---@param value unknown optional numeric coefficient
+---@return integer clamped 0..16 hardware coefficient
+local function clampCoefficient(value)
+  if type(value) ~= "number" then
+    return 0
+  end
+  if value < 0 then
+    return 0
+  elseif value > 16 then
+    return 16
+  end
+  return math.floor(value)
+end
+
+-- Normalizes one engine compositor state behind the typed frame.
+-- priorityOverride carries the selected menu layout's compiled
+-- per-plane priorities keyed by sub-engine role; the ROM records own
+-- menu order, so a fixed sub-engine map is never equivalent.
+---@param view table<string, unknown> internal semantic snapshot under drawing
+---@param engine string "main" or "sub" engine behind the frame
+---@param priorityOverride table<string, integer>? layout priorities by role behind the frame
+---@return table<string, unknown> normalized compositor animation state
+local function compositionAnimation(view, engine, priorityOverride)
+  local worldRole = assert(ENGINE_WORLD_ROLE[engine], "composition engines are main or sub")
+  local defaults = ENGINE_PRIORITY[engine]
+  local sceneAnimation = view.sceneAnimation --[[@as table<string, unknown>?]]
+  local perEngine = type(sceneAnimation) == "table" and sceneAnimation[engine] or nil
+  local compositor = type(perEngine) == "table" and type(perEngine.compositor) == "table" and perEngine.compositor or {}
+  local systemBlend = type(perEngine) == "table" and perEngine.systemBlend or nil
+  local function roleMap(source, fallback)
+    local record = {}
+    for role, default in pairs(fallback) do
+      local value = type(source) == "table" and source[role] or nil
+      record[role] = value == nil and default or value
+    end
+    return record
+  end
+  -- Blend target masks arrive as absolute register state, so scripted
+  -- keys survive even when the fallback names no role. The animation
+  -- system's default blend is the base register state; every later
+  -- scripted write overrides it per role.
+  local function targetMap(source)
+    local record = {}
+    if type(source) == "table" then
+      for role, value in pairs(source) do
+        if type(role) == "string" then
+          record[role] = value == true
+        end
+      end
+    end
+    return record
+  end
+  local function overlayTargets(target, source)
+    if type(source) == "table" then
+      for role, value in pairs(source) do
+        if type(role) == "string" then
+          target[role] = value == true
+        end
+      end
+    end
+  end
+  local visible = roleMap(compositor.visible, {
+    [worldRole] = true,
+    window = true,
+    transition = true,
+    battlefield = true,
+    objects = true,
+  })
+  local priority = roleMap(compositor.priority, defaults)
+  if type(priorityOverride) == "table" then
+    for role, value in pairs(priorityOverride) do
+      if priority[role] ~= nil and type(value) == "number" then
+        priority[role] = value
+      end
+    end
+  end
+  local firstTarget = targetMap(systemBlend ~= nil and systemBlend.firstTarget or nil)
+  local secondTarget = targetMap(systemBlend ~= nil and systemBlend.secondTarget or nil)
+  local objTargets = targetMap(systemBlend ~= nil and systemBlend.objTargets or nil)
+  overlayTargets(firstTarget, compositor.firstTarget)
+  overlayTargets(secondTarget, compositor.secondTarget)
+  overlayTargets(objTargets, compositor.objTargets)
+  local scriptedTargets = next(firstTarget) ~= nil or next(secondTarget) ~= nil
+  local blend = { mode = "none", eva = 0, evb = 0, evy = 0 }
+  if systemBlend ~= nil and type(systemBlend.blend) == "table" then
+    blend = {
+      mode = systemBlend.blend.mode or "none",
+      eva = clampCoefficient(systemBlend.blend.eva),
+      evb = clampCoefficient(systemBlend.blend.evb),
+      evy = clampCoefficient(systemBlend.blend.evy),
+    }
+  end
+  if engine == "main" then
+    local spriteBlend = view.spriteBlend --[[@as table<string, unknown>?]]
+    if type(spriteBlend) == "table" and type(spriteBlend.blendCoefficientA) == "number" then
+      blend = {
+        mode = "alpha",
+        eva = clampCoefficient(spriteBlend.blendCoefficientA),
+        evb = clampCoefficient(spriteBlend.blendCoefficientB),
+        evy = 0,
+      }
+      firstTarget[worldRole] = true
+      secondTarget.battlefield = true
+    end
+  else
+    -- Ordinary sub-engine menus blend BG1 over the planes below it
+    -- with the source EVA/EVB pair; planes above the blend cover the
+    -- result like any opaque plane. A scripted sub-screen write names
+    -- its own absolute BG0/BG1 masks instead of this default.
+    if not scriptedTargets then
+      blend = { mode = "alpha", eva = 8, evb = 12, evy = 0 }
+      firstTarget.window = true
+      secondTarget.menu = true
+      secondTarget.transition = true
+      secondTarget.battlefield = true
+    end
+  end
+  if type(compositor.blend) == "table" then
+    local source = compositor.blend --[[@as table<string, unknown>]]
+    blend = {
+      mode = source.mode or "none",
+      eva = clampCoefficient(source.eva),
+      evb = clampCoefficient(source.evb),
+      evy = clampCoefficient(source.evy),
+    }
+  end
+  local brightness = { mode = "none", coefficient = 0 }
+  if type(compositor.brightness) == "table" then
+    local source = compositor.brightness --[[@as table<string, unknown>]]
+    brightness = {
+      mode = source.mode or "none",
+      coefficient = clampCoefficient(source.coefficient),
+    }
+  end
+  local windows = {}
+  if type(compositor.windows) == "table" then
+    windows = compositor.windows
+  end
+  -- Scripted MAIN_BG palette grayscale grays the battlefield plane
+  -- through the composite resolve; the fade-buffer copy needs no
+  -- stored content because every plane re-renders from source.
+  local grayscaleBattlefield = engine == "main" and compositor.paletteGrayscale == true
+  -- Scripted MAIN_BG palette fades darken the battlefield plane toward
+  -- their target color by the interpolated amount (retail
+  -- BattleAnimFunc_FadeBgPalette over the battle BG mask); battler
+  -- pictures and HUD keep their own colors.
+  local battlefieldFade = nil
+  if engine == "main" and type(compositor.battlefieldFade) == "table" then
+    local source = compositor.battlefieldFade --[[@as table<string, unknown>]]
+    local color = type(source.color) == "table" and source.color --[[@as table<string, unknown>]] or {}
+    local function channel(value)
+      if type(value) ~= "number" or value ~= value then
+        return 0
+      end
+      local floored = math.floor(value)
+      if floored < 0 then
+        return 0
+      elseif floored > 31 then
+        return 31
+      end
+      return floored
+    end
+    battlefieldFade = {
+      colorR = channel(color.r),
+      colorG = channel(color.g),
+      colorB = channel(color.b),
+      amount = clampCoefficient(source.amount),
+    }
+  end
+  return {
+    visible = visible,
+    priority = priority,
+    firstTarget = firstTarget,
+    secondTarget = secondTarget,
+    backdrop = compositor.backdrop or { 0, 0, 0 },
+    windows = windows,
+    blend = blend,
+    brightness = brightness,
+    grayscaleBattlefield = grayscaleBattlefield,
+    battlefieldFade = battlefieldFade,
+    objTargets = objTargets,
+  }
+end
+
+-- Normalizes the published mosaic block behind the typed frame.
+---@param view table<string, unknown> internal semantic snapshot under drawing
+---@return table<string, unknown>? mosaic frame state, nil while disabled
+local function frameMosaic(view)
+  local sceneAnimation = view.sceneAnimation --[[@as table<string, unknown>?]]
+  local mosaic = type(sceneAnimation) == "table" and sceneAnimation.mosaic or nil
+  if type(mosaic) ~= "table" then
+    return nil
+  end
+  local horizontal = mosaic.horizontal or 0
+  local vertical = mosaic.vertical or 0
+  local size = math.max(horizontal, vertical)
+  if size <= 1 then
+    return nil
+  end
+  if size > 16 then
+    size = 16
+  end
+  local enabled = mosaic.bgEnabled == true
+  return {
+    size = math.floor(size),
+    layers = { battlefield = enabled, window = enabled, transition = enabled },
+  }
+end
+
+-- Selects the published scanline rows behind the typed frame.
+---@param view table<string, unknown> internal semantic snapshot under drawing
+---@return table<integer, table<string, integer>>? 192 scanline rows, nil while idle
+local function frameScanlines(view)
+  local sceneAnimation = view.sceneAnimation --[[@as table<string, unknown>?]]
+  local rows = type(sceneAnimation) == "table" and sceneAnimation.scanlines or nil
+  if type(rows) ~= "table" or #rows ~= 192 then
+    return nil
+  end
+  for index = 1, 192 do
+    local entry = rows[index]
+    if type(entry) == "table" and ((entry.x or 0) ~= 0 or (entry.y or 0) ~= 0) then
+      return rows
+    end
+  end
+  return nil
+end
+
+-- Reports whether the scripted ClearBattlerBg cleared the main-engine
+-- battler plane: the plane binding records the clear for the
+-- composition consumer in the same quantum the source program clears
+-- it, so the screen clears on its precise source tick.
+---@param view table<string, unknown> internal semantic snapshot under drawing
+---@return boolean cleared true while the battler plane stays cleared
+local function mainBattlerPlaneCleared(view)
+  local sceneAnimation = view.sceneAnimation --[[@as table<string, unknown>?]]
+  local main = type(sceneAnimation) == "table" and sceneAnimation.main or nil
+  local planes = type(main) == "table" and main.planes or nil
+  local bg2 = type(planes) == "table" and planes.bg2 or nil
+  return type(bg2) == "table" and bg2.cleared == true
+end
+
+-- Builds the object-window coverage fragment for a panel run: the
+-- affected battler's live portrait shape feeds window coverage only
+-- (never visible color), so the stripe transition shows exactly
+-- through the mon silhouette. The fragment reuses the submitted live
+-- picture geometry; stationary panel targets carry no entry offsets.
+---@param view table<string, unknown> internal semantic snapshot under drawing
+---@param submissions table<integer, table<string, unknown>> collected picture submissions under matching
+---@return table<string, unknown>? window-mode OBJ fragment, nil without a silhouette request
+local function silhouetteFragment(view, submissions)
+  local sceneAnimation = view.sceneAnimation --[[@as table<string, unknown>?]]
+  local silhouette = type(sceneAnimation) == "table" and sceneAnimation.objWindowSilhouette or nil
+  if type(silhouette) ~= "table" then
+    return nil
+  end
+  local combatant = silhouette.combatant
+  local activation = silhouette.activation
+  if type(combatant) ~= "number" or type(activation) ~= "number" then
+    return nil
+  end
+  local picture = nil
+  for _, submission in ipairs(submissions) do
+    if submission.combatant == combatant and submission.activation == activation and submission.kind ~= "shadow" then
+      picture = submission
+      break
+    end
+  end
+  if picture == nil or picture.image == nil then
+    return nil
+  end
+  local captured = picture
+  local function draw(graphics)
+    -- Silhouette coverage samples through the portrait sampler so
+    -- indexed atlas pages resolve their transparent texels exactly
+    -- like the 3D picture pass; raw page draws stay opaque.
+    local art = captured.sampler or captured.image
+    local image = captured.image
+    local width = captured.width or 80
+    local height = captured.height or 80
+    local x = (captured.centerX or 128) - width / 2
+    local y = (captured.centerY or 96) - height / 2
+    local frameW, frameH = captured.frameW, captured.frameH
+    if type(frameW) == "number" and type(frameH) == "number" then
+      local pageWidth = image.width or width
+      local pageHeight = image.height or height
+      if type(image.getDimensions) == "function" then
+        pageWidth, pageHeight = image:getDimensions()
+      end
+      local quad = graphics.newQuad(captured.frameX or 0, captured.frameY or 0, frameW, frameH, pageWidth, pageHeight)
+      if captured.flipH == true then
+        drawArtwork(graphics, art, quad, x + width, y, 0, -1, 1)
+      else
+        drawArtwork(graphics, art, quad, x, y)
+      end
+    else
+      if captured.flipH == true then
+        drawArtwork(graphics, art, nil, x + width, y, 0, -1, 1)
+      else
+        drawArtwork(graphics, art, nil, x, y)
+      end
+    end
+  end
+  return {
+    objPriority = 0,
+    submissionOrder = 1,
+    oamMode = "object-window",
+    draw = draw,
+  }
+end
+
+-- Repo-relative shader source read through the archive-or-checkout
+-- boundary every battle shader uses.
+---@param path string repo-relative shader source path
+---@return string shader source
+local function readShaderSource(path)
+  if love and love.filesystem then
+    local ok, source = pcall(love.filesystem.read, path)
+    if ok and type(source) == "string" and source ~= "" then
+      return source
+    end
+  end
+  local handle = io.open(path, "rb")
+  if handle ~= nil then
+    local source = handle:read("*a")
+    handle:close()
+    if type(source) == "string" and source ~= "" then
+      return source
+    end
+  end
+  error("cannot read battle shader source: " .. path, 0)
+end
+
+-- One shader serves every palette-faded copy on a graphics namespace.
+-- The source blend rides the shared sampling-and-fade snippets so an
+-- indexed portrait resolves through its exact palette before the 5-bit
+-- mix, exactly like the picture pass.
+local COPY_FADE_SHADER_PATH = "libs/hgss/src/presentation/shaders/battle_copy_palette_fade.glsl"
+local copyFadeShaders = setmetatable({}, { __mode = "k" })
+
+---@param graphics table<string, unknown> injected host graphics
+---@return table<string, unknown> compiled copy palette-fade shader
+local function copyFadeShader(graphics)
+  local shader = copyFadeShaders[graphics]
+  if shader == nil then
+    shader = graphics.newShader(ImageAssetPool.withSharedSnippets(readShaderSource(COPY_FADE_SHADER_PATH)))
+    copyFadeShaders[graphics] = shader
+  end
+  return shader
+end
+
+-- Draws one copy under the source palette blend toward an RGB555 target
+-- with the native integer coefficients.
+---@param graphics table<string, unknown> injected host graphics
+---@param picture table<string, unknown> resolved copy picture record
+---@param quad unknown caller-owned source viewport
+---@param x number draw position x
+---@param y number draw position y
+---@param scaleX number horizontal placement scale
+---@param scaleY number vertical placement scale
+local function drawFadedCopy(graphics, picture, quad, x, y, scaleX, scaleY)
+  local fade = picture.paletteFade --[[@as table<string, unknown>]]
+  local color = fade.targetColor
+  local intensity = fade.intensity
+  assert(type(color) == "number" and color % 1 == 0, "palette fade carries RGB555 target color")
+  assert(type(intensity) == "number" and intensity % 1 == 0, "palette fade carries integer intensity")
+  local previous = graphics.getShader()
+  local shader = copyFadeShader(graphics)
+  graphics.setShader(shader)
+  shader:send("u_fadeTarget", {
+    (color % 32) / 31,
+    (math.floor(color / 32) % 32) / 31,
+    (math.floor(color / 1024) % 32) / 31,
+  })
+  shader:send("u_fadeCoefficient", intensity)
+  if picture.imageKind == "r8" then
+    local palette = picture.palette
+    assert(palette ~= nil, "indexed copy fades require their exact palette")
+    shader:send("u_usePalette", true)
+    shader:send("u_paletteCount", palette:getWidth())
+    shader:send("u_palette", palette)
+    shader:send("u_paletteOffset", numberOr(picture.paletteOffset, 0))
+  else
+    shader:send("u_usePalette", false)
+  end
+  local ok, err = pcall(graphics.draw, picture.image, quad, x, y, 0, scaleX, scaleY)
+  graphics.setShader(previous)
+  if not ok then
+    error(err, 0)
+  end
+end
+
+-- One animation sprite copy as a native OBJ fragment. CreateBattlerSprite
+-- builds a managed sprite (2D main VRAM, bgPriority 1) drawn by
+-- SpriteSystem_DrawSprites after PokepicManager_DrawAll, so a copy
+-- composites against the planes by OBJ priority instead of sharing the
+-- picture depth buffer. The quad reuses the picture pass's own screen
+-- geometry, so a copy can never drift from the picture it duplicates.
+-- A copy that carries a 3D rotation has no OBJ expression here and stays
+-- submitted as a picture; a palette fade rides the OBJ draw so the copy
+-- keeps its native layer.
+---@param picture table<string, unknown> resolved copy picture record
+---@return table<string, unknown>? OBJ fragment drawing the copy
+local function copyFragment(picture)
+  local rotated = false
+  for _, field in ipairs({ "rotation", "rotationX", "rotationY", "rotationZ" }) do
+    if numberOr(picture[field], 0) ~= 0 then
+      rotated = true
+    end
+  end
+  if rotated then
+    return nil
+  end
+  local fade = picture.paletteFade
+  local faded = type(fade) == "table" and fade.applied == true
+  local corners = BattlePicturePass.screenVertices(picture)
+  local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+  local u0, v0, u1, v1 = math.huge, math.huge, -math.huge, -math.huge
+  for _, point in ipairs(corners) do
+    minX, maxX = math.min(minX, point[1]), math.max(maxX, point[1])
+    minY, maxY = math.min(minY, point[2]), math.max(maxY, point[2])
+    u0, u1 = math.min(u0, point[4]), math.max(u1, point[4])
+    v0, v1 = math.min(v0, point[5]), math.max(v1, point[5])
+  end
+  local width, height = maxX - minX, maxY - minY
+  if width <= 0 or height <= 0 then
+    return nil
+  end
+  local image = picture.image
+  if type(image) ~= "table" and type(image) ~= "userdata" then
+    return nil
+  end
+  local pageWidth, pageHeight = 1, 1
+  if type(image.getDimensions) == "function" then
+    pageWidth, pageHeight = image:getDimensions()
+  end
+  local uWidth, vHeight = u1 - u0, v1 - v0
+  if pageWidth <= 0 or pageHeight <= 0 or uWidth <= 0 or vHeight <= 0 then
+    return nil
+  end
+  -- Only a drawable sampler resolves palette indices; a plain staged image
+  -- samples directly. The 3D path always samples picture.image, so the
+  -- fragment must fall back to it instead of drawing a non-drawable wrapper.
+  local art = image
+  if samplerOf(picture.sampler) ~= nil then
+    art = picture.sampler
+  end
+  local flipH = picture.flipH == true
+  local flipV = picture.flipV == true
+  local alpha = numberOr(picture.alpha, 1)
+  local red = numberOr(picture.tintR, 1)
+  local green = numberOr(picture.tintG, 1)
+  local blue = numberOr(picture.tintB, 1)
+  local function draw(graphics)
+    local quad =
+      graphics.newQuad(u0 * pageWidth, v0 * pageHeight, uWidth * pageWidth, vHeight * pageHeight, pageWidth, pageHeight)
+    graphics.setColor(red, green, blue, alpha)
+    local scaleX = flipH and -1 or 1
+    local scaleY = flipV and -1 or 1
+    local x = flipH and (minX + width) or minX
+    local y = flipV and (minY + height) or minY
+    if faded then
+      drawFadedCopy(graphics, picture, quad, x, y, scaleX, scaleY)
+    else
+      drawArtwork(graphics, art, quad, x, y, 0, scaleX, scaleY)
+    end
     graphics.setColor(1, 1, 1, 1)
+  end
+  -- Native draw priority: the per-role opcode writes 1 (front) or 255
+  -- (behind), and the creation template leaves 1 in place. The OBJ
+  -- layer consumes the same 0..3 OAM priority range.
+  local priority = numberOr(picture.priority, 1)
+  if priority < 0 then
+    priority = 0
+  elseif priority > 3 then
+    priority = 3
+  end
+  return {
+    objPriority = priority,
+    submissionOrder = 0,
+    oamMode = "normal",
+    draw = draw,
+  }
+end
+
+-- Presents one main-engine frame through the screen compositor.
+---@param resources table<string, unknown> borrowed application collaborators
+---@param view table<string, unknown> internal semantic snapshot under drawing
+---@param layout table<string, unknown> world fit behind the present
+---@param planes table<string, table<string, unknown>?> 2D content per role
+---@param objects table<integer, table<string, unknown>> ordered OBJ fragments
+local function presentMainFrame(resources, view, layout, planes, objects)
+  local graphics = assert(resources.graphics, "the battle render borrows its host graphics")
+  local assets = assert(resources.assets, "the battle render borrows its asset holder")
+  local primitives = {}
+  collectParticlePrimitives(view, primitives)
+  local players, enemies = BattleViewRoster.liveSides(view)
+  local singles = not doublesFormat(view, players, enemies)
+  local submissions, copies = collectPictureSubmissions(assets, view, players, enemies, singles)
+  for _, picture in ipairs(submissions) do
+    local primitive = pictureToPrimitive(picture, #primitives + 1)
+    if primitive ~= nil then
+      primitives[#primitives + 1] = primitive
+    end
+  end
+  local frameObjects = {}
+  for _, fragment in ipairs(objects) do
+    frameObjects[#frameObjects + 1] = fragment
+  end
+  for index, copy in ipairs(copies) do
+    local fragment = copyFragment(copy)
+    if fragment ~= nil then
+      -- Native submission order: copies draw in creation order, after the
+      -- caller's own OBJ fragments at the same priority.
+      fragment.submissionOrder = index
+      frameObjects[#frameObjects + 1] = fragment
+    else
+      local primitive = pictureToPrimitive(copy, #primitives + 1)
+      if primitive ~= nil then
+        primitives[#primitives + 1] = primitive
+      end
+    end
+  end
+  local silhouette = silhouetteFragment(view, submissions)
+  if silhouette ~= nil then
+    frameObjects[#frameObjects + 1] = silhouette
+  end
+  local framePlanes = planes
+  if mainBattlerPlaneCleared(view) then
+    framePlanes = {}
+    for role, entry in pairs(planes) do
+      if role ~= "battlefield" then
+        framePlanes[role] = entry
+      end
+    end
+  end
+  local frame = {
+    sourceTick = type(view.requestId) == "number" and view.requestId or 0,
+    engine = "main",
+    animation = compositionAnimation(view, "main"),
+    primitives = primitives,
+    planes = framePlanes,
+    objects = frameObjects,
+    layout = layout,
+    scanlines = frameScanlines(view),
+    scanlineLayer = "battlefield",
+    mosaic = frameMosaic(view),
+  }
+  local r, g, b, a = saveColor(graphics)
+  graphics.setColor(1, 1, 1, 1)
+  local layer = assets:renderPictures(graphics, frame)
+  graphics.draw(layer, 0, 0)
+  restoreColor(graphics, r, g, b, a)
+end
+
+-- Maps the native menu slide snapshot onto sub-engine window state.
+-- Only the sliding BG0/BG1 roles hide outside the two strips: the
+-- BG2 backdrop stays visible over the full pane like the source
+-- window composition, instead of flashing the black backdrop.
+---@param menuWindows table<string, unknown> native slide regions and per-plane offsets
+---@return table<string, unknown> sub-engine window records
+local function slideWindowState(menuWindows)
+  local top = assert(menuWindows.outsideTop, "menu window snapshot carries the upper outside region") --[[@as table<string, number>]]
+  local bottom = assert(menuWindows.outsideBottom, "menu window snapshot carries the lower outside region") --[[@as table<string, number>]]
+  return {
+    win0 = { x = top.x, y = top.y, width = top.width, height = top.height },
+    win1 = { x = bottom.x, y = bottom.y, width = bottom.width, height = bottom.height },
+    outside = { mask = { menu = false, window = false } },
+  }
+end
+
+-- Wraps one sub-engine plane draw with the slide scroll.
+---@param graphics table<string, unknown> injected host graphics
+---@param menuWindows table<string, unknown> native slide regions and per-plane offsets
+---@param plane integer source lower BG plane behind the scroll
+---@param draw fun(graphics: table<string, unknown>) plane content behind the scroll
+local function drawSlidePlane(graphics, menuWindows, plane, draw)
+  local top = assert(menuWindows.outsideTop, "menu window snapshot carries the upper outside region")
+  local bottom = assert(menuWindows.outsideBottom, "menu window snapshot carries the lower outside region")
+  local scroll = assert(menuWindows.scroll, "menu window snapshot carries per-plane BG offsets")
+  local offset = assert(scroll[plane], "menu window snapshot carries each composited plane offset")
+  local function drawRegion(region, yOffset)
+    if region.width == 0 or region.height == 0 then
+      return
+    end
+    LogicalSurface.clip(graphics, region, function()
+      graphics.push("all")
+      graphics.translate(-offset.x, -yOffset)
+      local ok, err = pcall(draw, graphics)
+      graphics.pop()
+      if not ok then
+        error(err, 0)
+      end
+    end)
+  end
+  drawRegion(top, offset.topY)
+  drawRegion(bottom, offset.bottomY)
+end
+
+-- Presents one sub-engine frame through the screen compositor.
+---@param resources table<string, unknown> borrowed application collaborators
+---@param view table<string, unknown> semantic snapshot behind the content
+---@param planeDraws table<string, (fun(graphics: table<string, unknown>))?> content per sub-engine role
+---@param opts table<string, unknown>? presentation options
+local function presentSubFrame(resources, view, planeDraws, opts)
+  local graphics = assert(resources.graphics, "the battle render borrows its host graphics")
+  local assets = assert(resources.assets, "the battle render borrows its asset holder")
+  opts = opts or {}
+  local animation = compositionAnimation(view, "sub", opts.priority --[[@as table<string, integer>?]])
+  local slideWindows = opts.slideWindows --[[@as table<string, unknown>?]]
+  if opts.bareRole ~= nil then
+    local visible = {}
+    for _, role in ipairs({ "menu", "window", "transition", "battlefield", "objects" }) do
+      visible[role] = role == opts.bareRole
+    end
+    animation.visible = visible
+  end
+  local planes = {}
+  for _, role in ipairs({ "menu", "window", "transition", "battlefield" }) do
+    local draw = planeDraws[role]
+    if draw ~= nil then
+      if slideWindows ~= nil and (role == "menu" or role == "window") then
+        local plane = role == "menu" and 0 or 1
+        local content = draw
+        local function drawSlideContent(slideGraphics)
+          drawSlidePlane(slideGraphics, slideWindows, plane, content)
+        end
+        draw = drawSlideContent
+      end
+      planes[role] = { draw = draw }
+    end
+  end
+  if slideWindows ~= nil then
+    animation.windows = slideWindowState(slideWindows)
+  end
+  local frame = {
+    sourceTick = type(view.requestId) == "number" and view.requestId or 0,
+    engine = "sub",
+    animation = animation,
+    primitives = {},
+    planes = planes,
+    objects = opts.objects or {},
+    layout = opts.layout or NATIVE_LAYOUT,
+  }
+  local r, g, b, a = saveColor(graphics)
+  graphics.setColor(1, 1, 1, 1)
+  local layer = assets:renderPictures(graphics, frame)
+  local clip = opts.clip --[[@as table<string, unknown>?]]
+  if clip ~= nil then
+    LogicalSurface.clip(graphics, clip, function()
+      graphics.draw(layer, 0, 0)
+    end)
+  else
     graphics.draw(layer, 0, 0)
   end
+  restoreColor(graphics, r, g, b, a)
 end
 
 -- Draws one compiled sprite object from its staged tile strip: tiles lay
@@ -991,10 +1915,11 @@ local function drawKeypadCursor(graphics, assets, view, layout, regions)
   if view.cursorVisible ~= true or type(view.selection) ~= "string" then
     return
   end
-  -- The Shift prompt tracks Yes/No while the source two-option planes
-  -- name their confirm/back cells: resolve the answer onto its cell.
+  -- The Shift and use-next prompts track Yes/No while the source
+  -- two-option planes name their confirm/back cells: resolve the answer
+  -- onto its cell.
   local wanted = view.selection
-  if view.mode == "shift" and type(wanted) == "string" then
+  if (view.mode == "shift" or view.mode == "use-next") and type(wanted) == "string" then
     wanted = wanted == "yes" and "confirm" or wanted == "no" and "back" or wanted
   end
   local selected = nil
@@ -1454,10 +2379,21 @@ end
 ---@return number vertical background scroll in native pixels
 local function bgScrollOf(view)
   local scroll = view.bgScroll --[[@as table<string, unknown>?]]
-  if type(scroll) ~= "table" then
-    return 0, 0
+  local scrollX, scrollY = 0, 0
+  if type(scroll) == "table" then
+    scrollX, scrollY = numberOr(scroll.x, 0), numberOr(scroll.y, 0)
   end
-  return numberOr(scroll.x, 0), numberOr(scroll.y, 0)
+  -- Scripted SetBgScroll writes land on the main-engine compositor:
+  -- components 0/1 drive the delta registers, 2/3 the position
+  -- register, and the composition consumer adds them to the base.
+  local sceneAnimation = view.sceneAnimation --[[@as table<string, unknown>?]]
+  local main = type(sceneAnimation) == "table" and sceneAnimation.main or nil
+  local compositor = type(main) == "table" and main.compositor or nil
+  if type(compositor) == "table" then
+    scrollX = scrollX + numberOr(compositor.bgScrollDx, 0) + numberOr(compositor.bgScrollX, 0)
+    scrollY = scrollY + numberOr(compositor.bgScrollDy, 0)
+  end
+  return scrollX, scrollY
 end
 
 -- Resolves the battlefield scene layer: the snapshot's raster background
@@ -1755,9 +2691,90 @@ local function drawTrainerPictures(graphics, assets, view)
   end
 end
 
+-- The pixel extent of one staged image handle: uploaded palette rasters
+-- and test doubles expose it through different accessors.
+---@param image table<string, unknown>|userdata staged image handle under drawing
+---@return number width, number height
+local function imageCellExtent(image)
+  local source = image --[[@as table<string, unknown>]]
+  local dimensions = source.getDimensions --[[@as (fun(self: table<string, unknown>): number, number)?]]
+  if type(dimensions) == "function" then
+    return dimensions(source)
+  end
+  local getWidth = source.getWidth --[[@as (fun(self: table<string, unknown>): number)?]]
+  local getHeight = source.getHeight --[[@as (fun(self: table<string, unknown>): number)?]]
+  if type(getWidth) == "function" and type(getHeight) == "function" then
+    return getWidth(source), getHeight(source)
+  end
+  local width = source.width
+  local height = source.height
+  assert(type(width) == "number" and type(height) == "number", "a drawn ball cell exposes its pixel extent")
+  return width, height
+end
+
+-- The source send-out ball flash: the ball cell blends toward white while
+-- BallThrow_RunThrowArc's palette blend runs. One shader serves every
+-- flashing ball on a graphics namespace.
+local BALL_FLASH_SHADER_PATH = "libs/hgss/src/presentation/shaders/ball_palette_flash.glsl"
+local ballFlashShaders = setmetatable({}, { __mode = "k" })
+
+---@param graphics table<string, unknown> injected host graphics
+---@return table<string, unknown> compiled ball flash shader
+local function ballFlashShader(graphics)
+  local shader = ballFlashShaders[graphics]
+  if shader == nil then
+    shader = graphics.newShader(ImageAssetPool.withSharedSnippets(readShaderSource(BALL_FLASH_SHADER_PATH)))
+    ballFlashShaders[graphics] = shader
+  end
+  return shader
+end
+
+-- Draws the ball cell through the source palette flash when the cue carries
+-- one. Pool leases draw their staged pixels under the flash shader (the ball
+-- cells stay unindexed RGBA); plain uploaded images draw directly.
+---@param graphics table<string, unknown> injected host graphics
+---@param image table<string, unknown>|userdata staged ball drawable
+---@param flash integer|nil source blend coefficient 0..16
+---@param ... unknown placement arguments forwarded to the draw call
+local function drawBallCell(graphics, image, flash, ...)
+  if flash == nil or flash == 0 then
+    drawArtwork(graphics, image, nil, ...)
+    return
+  end
+  assert(
+    type(flash) == "number" and flash % 1 == 0 and flash >= 0 and flash <= 16,
+    "ball flash is a source blend 0..16"
+  )
+  local drawable = image
+  local sampler = samplerOf(image)
+  if sampler ~= nil then
+    assert(sampler.kind ~= "r8", "flashing ball cells are not indexed draws")
+    -- Headless descriptors stay drawable-shaped for recording; they carry
+    -- no staged pixels to unwrap. A live borrow keeps the shared exact
+    -- nearest rule the sampler would have applied.
+    local pixels = stagedPixelsOf(image)
+    if pixels ~= nil and type(pixels.setFilter) == "function" then
+      pixels:setFilter("nearest", "nearest")
+    end
+    drawable = pixels or image
+  end
+  local previous = graphics.getShader()
+  local shader = ballFlashShader(graphics)
+  graphics.setShader(shader)
+  shader:send("u_target", { 1, 1, 1 })
+  shader:send("u_coefficient", flash)
+  local ok, err = pcall(drawArtwork, graphics, drawable, nil, ...)
+  graphics.setShader(previous)
+  if not ok then
+    error(err, 0)
+  end
+end
+
 -- Draws the thrown Poke Ball sprite over the battlefield. Ball cells are
 -- 16x16 with their origin at the center, so the staged frame draws
--- centered on the sprite position and spins about it.
+-- centered on the sprite position and spins about it; the opening
+-- animation's burst cell is 32x32 and centers on its own extent. A cue
+-- carrying the source palette flash draws through the shared blend.
 ---@param graphics table<string, unknown> borrowed host graphics
 ---@param assets table<string, unknown> borrowed battle asset holder
 ---@param view table<string, unknown> internal semantic snapshot
@@ -1773,17 +2790,29 @@ local function drawThrownBall(graphics, assets, view)
   assert(ballKey ~= nil, "ball throw selectors name a semantic ball key")
   local x = assert(ball.x, "ball throw cues carry their source-pixel x") --[[@as number]]
   local y = assert(ball.y, "ball throw cues carry their source-pixel y") --[[@as number]]
-  local frame = assert(ball.frame, "ball throw cues select a source animation frame") --[[@as integer]]
-  assert(type(frame) == "number" and frame % 1 == 0 and frame >= 0, "ball frames are zero-based integers")
+  local drawableKey = assert(ball.drawableKey, "ball throw cues select their staged source cell") --[[@as string]]
   local rotation = assert(ball.rotation, "ball throw cues carry their 16-bit rotation") --[[@as integer]]
   assert(type(rotation) == "number" and rotation >= 0 and rotation < 0x10000, "ball rotation is a 16-bit angle")
   assert(type(ball.visible) == "boolean", "ball throw cues state their visibility")
   if ball.visible then
-    local key = type(ball.paletteDrawableKey) == "string" and ball.paletteDrawableKey
-      or "battle-ball:" .. ballKey .. ":" .. tostring(frame)
+    local key = type(ball.paletteDrawableKey) == "string" and ball.paletteDrawableKey or drawableKey
     local image = assets:drawable(key)
     if image ~= nil then
-      drawArtwork(graphics, image, nil, x, y, rotation / 0x10000 * 2 * math.pi, 1, 1, 8, 8)
+      -- Ball cells anchor at their own center: the throw cells are 16x16
+      -- and the opening animation's burst cell is 32x32.
+      local width, height = imageCellExtent(image)
+      drawBallCell(
+        graphics,
+        image,
+        ball.paletteFlash --[[@as integer?]],
+        x,
+        y,
+        rotation / 0x10000 * 2 * math.pi,
+        1,
+        1,
+        math.floor(width / 2),
+        math.floor(height / 2)
+      )
     end
   end
 end
@@ -1811,6 +2840,50 @@ local function drawSourceMainScene(resources, view)
   drawTrainerPictures(graphics, assets, view)
 end
 
+-- Draws one panel stripe layer on the transition plane with wrapping:
+-- the scrolled tilemap tiles across the pane so the object window can
+-- reveal it through the silhouette while the battlefield stays put.
+---@param graphics table<string, unknown> injected host graphics
+---@param assets table<string, unknown> injected asset holder
+---@param stripe { raster: table<string, unknown>, scrollX: number?, scrollY: number? } stripe snapshot under drawing
+local function drawStripes(graphics, assets, stripe)
+  if type(assets.stripeBackground) ~= "function" then
+    return
+  end
+  local image = assets:stripeBackground(stripe.raster)
+  if image == nil then
+    return
+  end
+  local periodX, periodY = 256, 256
+  if type(stripe.raster) == "table" then
+    if type(stripe.raster.width) == "number" and stripe.raster.width > 0 then
+      periodX = stripe.raster.width
+    end
+    if type(stripe.raster.height) == "number" and stripe.raster.height > 0 then
+      periodY = stripe.raster.height
+    end
+  end
+  local scrollX = numberOr(stripe.scrollX, 0)
+  local scrollY = numberOr(stripe.scrollY, 0)
+  local baseX = -(scrollX % periodX)
+  local baseY = -(scrollY % periodY)
+  local function paint(x, y)
+    if type(image.drawQuad) == "function" then
+      local width = image.width or periodX
+      local height = image.height or periodY
+      local quad = graphics.newQuad(0, 0, width, height, width, height)
+      image:drawQuad(graphics, quad, x, y)
+    else
+      graphics.draw(image, x, y)
+    end
+  end
+  for _, dx in ipairs({ 0, periodX }) do
+    for _, dy in ipairs({ 0, periodY }) do
+      paint(baseX + dx, baseY + dy)
+    end
+  end
+end
+
 ---@param resources table<string, unknown> borrowed application collaborators
 ---@param view table<string, unknown> internal semantic snapshot
 local function drawDetail(resources, view)
@@ -1824,29 +2897,60 @@ local function drawDetail(resources, view)
   -- path below.
   local r, g, b, a = saveColor(graphics)
   graphics.setColor(1, 1, 1, 1)
-  -- The shared source intro pass draws the background, terrain base and
-  -- trainer pictures; portraits and health boxes stay layer-independent.
-  drawSourceMainScene(resources, view)
-  local players, enemies = BattleViewRoster.liveSides(view)
-  local singles = not doublesFormat(view, players, enemies)
-  drawPicturePlanes(graphics, assets, view, players, enemies, singles)
-  drawThrownBall(graphics, assets, view)
-  if singles then
-    drawSinglesDetail(graphics, text, assets, view, players, enemies)
-  else
-    drawDoublesDetail(
-      graphics,
-      text,
-      assets,
-      assert(doublesHud, "the doubled battle render borrows its verified HUD sections"),
-      view,
-      players,
-      enemies
-    )
+  -- Detail composes one main-engine typed frame: the scene plane,
+  -- thrown ball and HUD/narration enter their semantic roles while
+  -- pictures and particles ride the shared 3D target once.
+  local function drawDetailBattlefield()
+    drawSourceMainScene(resources, view)
   end
-  drawNarration(resources, view)
-  drawLevelUpStats(resources, view)
+  local function drawDetailWindow()
+    drawNarration(resources, view)
+    drawLevelUpStats(resources, view)
+  end
+  local planes = {
+    battlefield = {
+      draw = drawDetailBattlefield,
+    },
+    window = {
+      draw = drawDetailWindow,
+    },
+  }
+  local stripe = view.sceneAnimation ~= nil and view.sceneAnimation.stripe or nil
+  if type(stripe) == "table" and stripe.raster ~= nil then
+    local stripeSnapshot = stripe
+    local function drawStripeTransition()
+      drawStripes(graphics, assets, stripeSnapshot)
+    end
+    planes.transition = { draw = drawStripeTransition }
+  end
+  local function drawDetailObjects()
+    drawThrownBall(graphics, assets, view)
+    local players, enemies = BattleViewRoster.liveSides(view)
+    local singles = not doublesFormat(view, players, enemies)
+    if singles then
+      drawSinglesDetail(graphics, text, assets, view, players, enemies)
+    else
+      drawDoublesDetail(
+        graphics,
+        text,
+        assets,
+        assert(doublesHud, "the doubled battle render borrows its verified HUD sections"),
+        view,
+        players,
+        enemies
+      )
+    end
+  end
+  local objects = {
+    {
+      objPriority = 0,
+      submissionOrder = 1,
+      oamMode = "normal",
+      draw = drawDetailObjects,
+    },
+  }
   restoreColor(graphics, r, g, b, a)
+  presentMainFrame(resources, view, NATIVE_LAYOUT, planes, objects)
 end
 
 ---@param view table<string, unknown> internal semantic snapshot under drawing
@@ -2014,12 +3118,13 @@ local function drawControls(resources, view, layout, regions)
         label("menu", menuText.cancel, CANCEL_ANCHOR, true, offsetY, sourcePalette(view, "menu", 2, 10, 11, 12))
       elseif
         layout == "two-option"
-        and view.mode == "shift"
+        and (view.mode == "shift" or view.mode == "use-next")
         and (id == "confirm" or id == "back")
         and type(view.twoOption) == "table"
       then
-        -- The held Shift offer names its Yes/No answers through the
-        -- source two-option planes: confirm takes Yes, back takes No.
+        -- The held Shift and use-next offers name their Yes/No answers
+        -- through the source two-option planes: confirm takes Yes, back
+        -- takes No.
         local options = view.twoOption --[[@as table<string, unknown>]]
         local content = id == "confirm" and options.top or options.bottom
         if type(content) == "string" then
@@ -2246,6 +3351,11 @@ end
 ---@param view table<string, unknown> internal semantic snapshot carrying the staged text palettes
 ---@param child table<string, unknown> detached child view under drawing
 local function drawChildFooter(text, view, child)
+  -- Party and target children own no modal footer: the native roster
+  -- and the retail wrapper pages carry their own chrome.
+  if child.kind == "party" or child.kind == "target" then
+    return
+  end
   if child.kind == "learn" then
     text.drawText("BACK", CHILD_NOTICE.x, CHILD_NOTICE.y)
     return
@@ -2271,8 +3381,6 @@ local function drawChildFooter(text, view, child)
   end
   if child.cancellable == true then
     text.drawText("BACK", CHILD_BACK_LABEL.x, CHILD_BACK_LABEL.y)
-  elseif child.kind == "party" or child.kind == "target" then
-    text.drawText("No retreat!", CHILD_BACK_LABEL.x, CHILD_BACK_LABEL.y)
   end
   local notice = child.notice
   if type(notice) ~= "string" or notice == "" then
@@ -2387,7 +3495,7 @@ local function drawBagChild(resources, view, child)
         pressBank = pocket + 8
       end
     else
-      pressBank = BattleBagPockets.buttonBank(animButton --[[@as integer]], 0)
+      pressBank = BattleBagPockets.buttonBank(math.floor(animButton), 0)
     end
     if pressBank ~= nil then
       drawButtonFace(animButton, animFrame, pressBank)
@@ -2695,116 +3803,626 @@ local function drawBagChild(resources, view, child)
   end
 end
 
--- Retail ink behind battle wrapper rows (battle_party_menu.c Print*
--- family): content labels print font 0 MAKE_TEXT_COLOR(15,14,0) while
--- their values print font 0 MAKE_TEXT_COLOR(1,2,0) out of the staged
--- party window bank. The level value keeps the label slots (15,14,0)
--- (PrintLevelAndNextExp), like the move-list PP (PrintMoveListPP) and
--- the move-detail PP (PrintMovePP). Check-moves move names and the
--- navigation buttons print font 4 MAKE_TEXT_COLOR(7,8,9); gender
--- symbols print font 0 MAKE_TEXT_COLOR(7,8,0)/(3,4,0). Origins reuse
--- the paired modal columns so paint and taps keep agreeing; only the
--- fits widen so the staged words paint whole.
-local PARTY_PAGE_LABEL_X = 44
-local PARTY_PAGE_SUB_X = 116
-local PARTY_PAGE_DETAIL_X = 156
+-- Retail ink behind battle wrapper pages (battle_party_menu.c Print*
+-- family): window text prints through its own template palette bank in
+-- the staged party palette (9 for mon-menu, move, and button windows,
+-- 13 for labels, values, and bars), the page button through the font-4
+-- menu slots (7,8,9).
 
----@param id string stable wrapper row identity under drawing
----@return boolean true for the font-4 navigation and move-name rows
-local function partyPageMenuRow(id)
-  if id == "back" then
-    return true
+---@param sprite table<string, unknown> projected wrapper sprite under drawing
+---@return string? semantic drawable key behind the sprite, nil without an established provider
+local function partyPageSpriteKey(sprite)
+  local kind = sprite.kind --[[@as string]]
+  local key = sprite.key --[[@as string?]]
+  if type(key) ~= "string" or key == "" then
+    if kind ~= "icon" then
+      return nil
+    end
   end
-  if id == "summary:prev" or id == "summary:next" or id == "summary:moves" then
-    return true
+  if kind == "icon" then
+    return "battle:icon:" .. tostring(sprite.key) .. ":frame:1"
   end
-  if id == "moves:prev" or id == "moves:next" or id == "moves:summary" then
-    return true
+  if kind == "mon-type" or kind == "move-type" then
+    return "battle:move-type-icon:" .. tostring(key):lower()
   end
-  return id:match("^move:%d+$") ~= nil
+  if kind == "category" then
+    return "battle:move-category-icon:" .. tostring(key):lower()
+  end
+  if kind == "status" then
+    return "battle:status-icon:" .. tostring(key):lower()
+  end
+  if kind == "held-item" then
+    return "battle:item-icon:" .. tostring(key)
+  end
+  -- Ball-capsule marks project from roster capsule data, but no seal
+  -- art is staged for the battle path yet: the sprite resolves to
+  -- nothing instead of an invented mark.
+  if kind == "capsule" then
+    return nil
+  end
+  return nil
 end
 
----@param page string wrapper page under drawing
----@param id string stable wrapper row identity under drawing
----@return integer, integer, integer value foreground, shadow, and background slots
-local function partyPageValueSlots(page, id)
-  if id == "summary:level" or id == "move_detail:pp" or page == "moves" then
-    return 15, 14, 0
+-- Resolves one wrapper sprite draw position: the staged anchor names
+-- the sprite origin, so drawables carrying their staged cell offset
+-- paint at anchor plus offset while bare drawables center on the anchor
+-- through their measured extent (unmeasurable stand-ins keep the
+-- compact 16-pixel default so headless recording stays drawable-shaped).
+---@param art table<string, unknown> resolved drawable under drawing
+---@param sprite table<string, unknown> projected wrapper sprite under drawing
+---@return number draw x
+---@return number draw y
+local function partyPageSpritePos(art, sprite)
+  local x = tonumber(sprite.x) or 0
+  local y = tonumber(sprite.y) or 0
+  local offset = art.offset --[[@as table<string, number>?]]
+  if type(offset) == "table" then
+    return x + (tonumber(offset.x) or 0), y + (tonumber(offset.y) or 0)
   end
-  return 1, 2, 0
+  local width, height = drawableDims(art)
+  if type(width) ~= "number" or type(height) ~= "number" then
+    width, height = 16, 16
+  end
+  return x - math.floor(width / 2), y - math.floor(height / 2)
 end
 
+-- Code window indices behind wrapper page text (battle_party_menu.c
+-- Print* call sites with windowSet 0): shared windows ride their
+-- fixed indices while per-set windows read the first set.
+local SUMMARY_BUTTON = { [0] = 12, [1] = 13, [2] = 11, [3] = 6 }
+local MOVES_BUTTON = { [0] = 14, [1] = 15, [2] = 16, [3] = 17, [4] = 12, [5] = 13, [6] = 9, [7] = 6 }
+
+-- Press-dip frame behind the staged phase (UpdateButtonAnim PRESS,
+-- HOLD, RELEASE paints PRESSED, SELECTED, NORMAL).
+local PRESS_FRAME = { [1] = 1, [2] = 2, [3] = 0 }
+
+---@param child table<string, unknown> detached wrapper child view under lookup
+---@param index integer code window index under lookup
+---@return table<string, integer>? pixel origin, extent, and palette bank, nil without a staged template
+local function pageWindowBox(child, index)
+  local boxes = child.windowBoxes --[[@as table<integer, table<string, number>>?]]
+  local box = type(boxes) == "table" and boxes[index + 1] or nil
+  if type(box) ~= "table" then
+    return nil
+  end
+  -- The template palette selects the SUB_BG bank the window prints
+  -- through (battle_party_menu.c WindowTemplate palette: 9 for the
+  -- mon-menu, move, and button windows, 13 for labels, values, and
+  -- bars). The staged party palette mirrors the hardware banks, so the
+  -- bank rides the pixel box into every ink lookup below. A box without
+  -- its template palette draws nothing, like a missing window.
+  if type(box.palette) ~= "number" then
+    return nil
+  end
+  return {
+    x = box.left * 8,
+    y = box.top * 8,
+    w = box.width * 8,
+    h = box.height * 8,
+    bank = math.floor(box.palette),
+  }
+end
+
+-- Prints one wrapper window string through its template palette bank:
+-- single-line text prints at its origin, centered, or right-aligned,
+-- while embedded line breaks (ability/move descriptions carry the ROM
+-- 0xE000 breaks as "\n") flow to the next 16-pixel row like the
+-- retail text printer (render_text.c CHAR_LF advances currentY past the
+-- row). Alignment measures each row on its own so centered wrapped
+-- text stays centered.
+---@param text table<string, unknown> borrowed text services
+---@param view table<string, unknown> internal semantic snapshot carrying the staged text palettes
+---@param role string source font role behind measurement (font 0 reads hud, font 4 reads menu)
+---@param content string text under drawing
+---@param box table<string, integer> window pixel origin, extent, and palette bank under drawing
+---@param spec table<string, unknown> in-window origin, alignment, and palette slots
+local function pageText(text, view, role, content, box, spec)
+  if content == "" then
+    return
+  end
+  local bank = box.bank --[[@as integer]]
+  local palette =
+    sourcePalette(view, "party", bank, spec.fg --[[@as integer]], spec.sh --[[@as integer]], spec.bg --[[@as integer]])
+  local baseY = box.y + (tonumber(spec.y) or 0)
+  local row = 0
+  for line in (content .. "\n"):gmatch("(.-)\n") do
+    if line ~= "" then
+      local x = box.x + (tonumber(spec.x) or 0)
+      if spec.align == "center" then
+        x = box.x + math.floor((box.w - measureRoleText(text, role, line)) / 2)
+      elseif spec.align == "right" then
+        x = box.x + box.w - measureRoleText(text, role, line) + (tonumber(spec.dx) or 0)
+      end
+      drawRoleText(text, role, line, x, baseY + row * 16, palette)
+    end
+    row = row + 1
+  end
+end
+
+-- Draws one wrapper text role through its transcribed window: single
+-- text prints at its origin, centered, or right-aligned; the HP/PP
+-- splits print their positioned parts; the gender symbol rides the
+-- mon-name window right edge in its gender ink; the HP bar fills its
+-- window in the HP color pair. Missing windows or text draw nothing.
+---@param text table<string, unknown> borrowed text services
+---@param graphics table<string, unknown> borrowed host graphics
+---@param view table<string, unknown> internal semantic snapshot carrying the staged text palettes
+---@param entry table<string, unknown> projected window content under drawing
+---@param box table<string, integer> window pixel origin and extent under drawing
+---@param spec table<string, unknown> transcribed text layout behind the role
+local function drawWrapperRole(text, graphics, view, entry, box, spec)
+  local role = spec.font == "menu" and "menu" or "hud"
+  if spec.bar == true then
+    local current = tonumber(entry.current) or 0
+    local max = tonumber(entry.max) or 0
+    if current <= 0 or max <= 0 then
+      return
+    end
+    local pixels = BattleScene.hpPixels(current, max)
+    local colorIdx = BattleScene.hpColorIdx(pixels)
+    if pixels <= 0 or colorIdx == 0 then
+      return
+    end
+    local dark, light = 1, 2
+    if colorIdx == 2 then
+      dark, light = 3, 4
+    elseif colorIdx == 1 then
+      dark, light = 5, 6
+    end
+    -- The retail HP bar fills through its own window palette
+    -- (FillWindowPixelRect on the palette-9 HP bar window), so the
+    -- fill resolves through the box bank like the tile fill.
+    local bank = box.bank --[[@as integer]]
+    local darkInk = sourcePalette(view, "party", bank, dark, dark, dark).foreground
+    local lightInk = sourcePalette(view, "party", bank, light, light, light).foreground
+    graphics.setColor(lightInk.r / 255, lightInk.g / 255, lightInk.b / 255, 1)
+    graphics.rectangle("fill", box.x, box.y + 1, pixels, 1)
+    graphics.setColor(darkInk.r / 255, darkInk.g / 255, darkInk.b / 255, 1)
+    graphics.rectangle("fill", box.x, box.y + 2, pixels, 2)
+    graphics.setColor(lightInk.r / 255, lightInk.g / 255, lightInk.b / 255, 1)
+    graphics.rectangle("fill", box.x, box.y + 4, pixels, 1)
+    graphics.setColor(1, 1, 1, 1)
+    return
+  end
+  local bank = box.bank --[[@as integer]]
+  local palette =
+    sourcePalette(view, "party", bank, spec.fg --[[@as integer]], spec.sh --[[@as integer]], spec.bg --[[@as integer]])
+  if spec.parts == "hp" then
+    -- HP prints in three centered parts (PrintHPStat): the current
+    -- value right-aligned to the slash middle, the slash centered, and
+    -- the maximum left of it.
+    local slash = tostring(entry.slash or "/")
+    local slashWidth = measureRoleText(text, role, slash)
+    local middle = math.floor((box.w - slashWidth) / 2)
+    local current = tostring(entry.current or "")
+    if current ~= "" then
+      drawRoleText(text, role, current, box.x + middle - measureRoleText(text, role, current), box.y, palette)
+    end
+    drawRoleText(text, role, slash, box.x + middle, box.y, palette)
+    local max = tostring(entry.max or "")
+    if max ~= "" then
+      drawRoleText(text, role, max, box.x + middle + slashWidth, box.y, palette)
+    end
+    return
+  end
+  if spec.parts == "move-pp" then
+    -- Move PP prints in positioned parts (PrintMoveListPP): the PP
+    -- label, the current value right-aligned, the slash, and the
+    -- maximum, instead of one stacked string.
+    local label = tostring(entry.label or "")
+    if label ~= "" then
+      drawRoleText(text, role, label, box.x + 40, box.y + 24, palette)
+    end
+    local slash = tostring(entry.slash or "/")
+    local slashWidth = measureRoleText(text, role, slash)
+    local current = tostring(entry.current or "")
+    if current ~= "" then
+      drawRoleText(text, role, current, box.x + 80 - measureRoleText(text, role, current), box.y + 24, palette)
+    end
+    drawRoleText(text, role, slash, box.x + 80, box.y + 24, palette)
+    local max = tostring(entry.max or "")
+    if max ~= "" then
+      drawRoleText(text, role, max, box.x + 80 + slashWidth, box.y + 24, palette)
+    end
+    return
+  end
+  if spec.parts == "pp" then
+    local slash = tostring(entry.slash or "/")
+    local slashWidth = measureRoleText(text, role, slash)
+    local middle = math.floor((box.w - slashWidth) / 2)
+    local current = tostring(entry.current or "")
+    if current ~= "" then
+      drawRoleText(text, role, current, box.x + middle - measureRoleText(text, role, current), box.y, palette)
+    end
+    drawRoleText(text, role, slash, box.x + middle, box.y, palette)
+    local max = tostring(entry.max or "")
+    if max ~= "" then
+      drawRoleText(text, role, max, box.x + middle + slashWidth, box.y, palette)
+    end
+    return
+  end
+  local content = tostring(entry.text or "")
+  if content == "" then
+    return
+  end
+  pageText(text, view, role, content, box, spec)
+end
+
+-- Retail gender inks behind the wrapper mon-name printers: the
+-- summary/check-moves/move-detail name printer (PrintMonName font 0)
+-- inks male (7,8,0) and female (3,4,0), while the centered mon-menu
+-- name printer (PrintMonNameCentered) inks male (10,11,0) and female
+-- (12,13,0). The projected entry carries the explicit flag so paint
+-- never sniffs the symbol text.
+---@param entry table<string, unknown> projected gender window under inking
+---@param page string wrapper page under inking
+---@return integer foreground slot
+---@return integer shadow slot
+---@return integer background slot
+local function genderInk(entry, page)
+  local female = entry.female == true
+  if page == "mon_menu" then
+    if female then
+      return 12, 13, 0
+    end
+    return 10, 11, 0
+  end
+  if female then
+    return 3, 4, 0
+  end
+  return 7, 8, 0
+end
+
+-- Draws the mon-menu name block like PrintMonNameCentered: the name
+-- centered with its gender symbol offset past it by the retail gap,
+-- the symbol in its gender ink. Eggs and genderless mons center the
+-- bare name.
 ---@param text table<string, unknown> borrowed text services
 ---@param view table<string, unknown> internal semantic snapshot carrying the staged text palettes
 ---@param child table<string, unknown> detached wrapper child view under drawing
----@param row table<string, unknown> projected wrapper row under drawing
----@param y number row top under drawing
-local function drawPartyPageRow(text, view, child, row, y)
-  local page = child.partyPage --[[@as string]]
-  local id = row.id --[[@as string]]
-  local marker = child.focusId == id and "> " or "  "
-  if partyPageMenuRow(id) then
-    local palette = sourcePalette(view, "party", 0, 7, 8, 9)
-    drawRoleText(
-      text,
-      "menu",
-      marker .. fitLabel(text, tostring(row.label or ""), 160, "menu"),
-      PARTY_PAGE_LABEL_X,
-      y,
-      palette
-    )
-  else
-    local labelPalette = sourcePalette(view, "party", 0, 15, 14, 0)
-    drawRoleText(
-      text,
-      "hud",
-      marker .. fitLabel(text, tostring(row.label or ""), 160, "hud"),
-      PARTY_PAGE_LABEL_X,
-      y,
-      labelPalette
-    )
+---@param box table<string, integer> window pixel origin and extent under drawing
+---@param nameEntry table<string, unknown> projected mon-name window under drawing
+---@param genderEntry table<string, unknown>? projected mon-gender window under drawing
+local function drawMonMenuName(text, view, child, box, nameEntry, genderEntry)
+  local _ = child
+  local name = tostring(nameEntry.text or "")
+  local symbol = ""
+  if type(genderEntry) == "table" then
+    symbol = tostring(genderEntry.text or "")
   end
-  local sub = row.sub --[[@as string?]]
-  if type(sub) == "string" and sub ~= "" then
-    local subPalette = nil
-    if sub == "♂" then
-      subPalette = sourcePalette(view, "party", 0, 7, 8, 0)
-    elseif sub == "♀" then
-      subPalette = sourcePalette(view, "party", 0, 3, 4, 0)
-    else
-      local foreground, shadow, background = partyPageValueSlots(page, id)
-      subPalette = sourcePalette(view, "party", 0, foreground, shadow, background)
+  local gap = symbol ~= "" and 8 or 0
+  local nameWidth = measureRoleText(text, "menu", name)
+  local symbolWidth = 0
+  if symbol ~= "" then
+    symbolWidth = measureRoleText(text, "hud", symbol)
+  end
+  local x = box.x + math.floor((box.w - nameWidth - symbolWidth - gap) / 2)
+  -- The mon-menu windows print through the palette-9 bank, so both the
+  -- centered name and the gender symbol resolve through the box bank.
+  local bank = box.bank --[[@as integer]]
+  if name ~= "" then
+    local palette = sourcePalette(view, "party", bank, 7, 8, 9)
+    drawRoleText(text, "menu", name, x, box.y + 7, palette)
+  end
+  if symbol ~= "" then
+    local fg, sh, bg = genderInk(genderEntry or {}, "mon_menu")
+    local palette = sourcePalette(view, "party", bank, fg, sh, bg)
+    drawRoleText(text, "hud", symbol, x + nameWidth + gap, box.y + 8, palette)
+  end
+end
+
+-- Draws the experience-bar fill like DrawExpBar: the staged per-level
+-- tile behind the filled pixels, over the 8-tile track. Missing staged
+-- tiles draw nothing, leaving the empty track the page raster carries.
+---@param assets table<string, unknown> borrowed asset holder under drawing
+---@param graphics table<string, unknown> borrowed host graphics under drawing
+---@param entry table<string, unknown> projected experience-bar window under drawing
+local function drawExpBarTiles(assets, graphics, entry)
+  local current = tonumber(entry.current) or 0
+  local max = tonumber(entry.max) or 0
+  local pixels = 0
+  if max > 0 and current > 0 then
+    pixels = math.floor(current * 64 / max)
+    if pixels < 0 then
+      pixels = 0
+    elseif pixels > 64 then
+      pixels = 64
     end
-    drawRoleText(text, "hud", sub, PARTY_PAGE_SUB_X, y, subPalette)
+    if pixels == 0 then
+      pixels = 1
+    end
   end
-  local detail = row.detail --[[@as string?]]
-  if type(detail) == "string" and detail ~= "" then
-    local foreground, shadow, background = partyPageValueSlots(page, id)
-    local detailPalette = sourcePalette(view, "party", 0, foreground, shadow, background)
-    drawRoleText(text, "hud", detail, PARTY_PAGE_DETAIL_X, y, detailPalette)
+  for column = 0, 7 do
+    local level = pixels - column * 8
+    if level < 0 then
+      level = 0
+    elseif level > 8 then
+      level = 8
+    end
+    local art = assets:drawable("party:exp:" .. tostring(level))
+    if art ~= nil then
+      drawArtwork(graphics, art, nil, 80 + column * 8, 64)
+    end
+  end
+end
+
+-- Draws the wrapper page text through the transcribed text layout:
+-- every role prints through its window template with its retail font,
+-- origin, alignment, and ink; the gender symbol takes its gender ink
+-- on the mon-name window.
+---@param wrapperAssets table<string, unknown> borrowed asset holder under drawing
+---@param text table<string, unknown> borrowed text services
+---@param graphics table<string, unknown> borrowed host graphics
+---@param view table<string, unknown> internal semantic snapshot carrying the staged text palettes
+---@param child table<string, unknown> detached wrapper child view under drawing
+local function drawWrapperText(wrapperAssets, text, graphics, view, child)
+  local page = child.partyPage --[[@as string]]
+  local layout = BattlePartyPages.textLayout(page)
+  local windows = child.pageWindows --[[@as table<integer, table<string, unknown>>?]]
+  local byRole = {} ---@type table<string, table<string, unknown>>
+  if type(windows) == "table" then
+    for _, window in ipairs(windows) do
+      if type(window) == "table" and type(window.role) == "string" then
+        byRole[window.role] = window
+      end
+    end
+  end
+  if page == "mon_menu" then
+    local nameEntry = byRole["mon-name"]
+    if nameEntry ~= nil then
+      local box = pageWindowBox(child, 0)
+      if box ~= nil then
+        drawMonMenuName(text, view, child, box, nameEntry, byRole["mon-gender"])
+      end
+    end
+  end
+  for role, spec in pairs(layout) do
+    local entry = byRole[role]
+    -- The mon-menu name block paints above as one centered unit, so
+    -- the generic loop skips both halves of it.
+    if entry ~= nil and not (page == "mon_menu" and (role == "mon-name" or role == "mon-gender")) then
+      local box = pageWindowBox(child, spec.window --[[@as integer]])
+      if box ~= nil then
+        if role == "mon-gender" then
+          local symbol = tostring(entry.text or "")
+          if symbol ~= "" then
+            local fg, sh, bg = genderInk(entry, page)
+            pageText(text, view, "hud", symbol, box, { align = "right", y = 0, fg = fg, sh = sh, bg = bg })
+          end
+        else
+          drawWrapperRole(text, graphics, view, entry, box, spec)
+        end
+      end
+    end
+  end
+  -- The experience bar paints its staged tiles instead of window
+  -- text, and the refusal message prints over the mon menu through
+  -- the message window.
+  local expEntry = byRole["exp-bar"]
+  if expEntry ~= nil then
+    drawExpBarTiles(wrapperAssets, graphics, expEntry)
+  end
+  local messageEntry = byRole["message"]
+  if messageEntry ~= nil then
+    local message = tostring(messageEntry.text or "")
+    if message ~= "" then
+      local palette = sourcePalette(view, "narration", 0, 1, 2, 15)
+      local row = 0
+      for line in message:gmatch("[^\n]+") do
+        drawRoleText(text, "narration", line, 16, 152 + row * 16, palette)
+        row = row + 1
+      end
+    end
+  end
+end
+
+-- Draws one wrapper button face at its retail tile rectangle through the
+-- staged party button art, nil art drawing nothing.
+---@param assets table<string, unknown> borrowed asset holder under drawing
+---@param graphics table<string, unknown> borrowed host graphics under drawing
+---@param child table<string, unknown> detached wrapper child view under drawing
+---@param button integer retail button identity under drawing
+---@param frame integer retail face frame under drawing
+local function drawWrapperFace(assets, graphics, child, button, frame)
+  local rects = child.pageButtonRects --[[@as table<integer, table<string, number>>?]]
+  local rect = type(rects) == "table" and rects[button] or nil
+  if rect == nil then
+    return
+  end
+  local face = assets:drawable("party:button:" .. tostring(button) .. ":" .. tostring(frame))
+  if face ~= nil then
+    drawArtwork(graphics, face, nil, rect.x * 8, rect.y * 8)
+  end
+end
+
+-- Retail mon-menu input behind its pressed face (HandleMonMenuInput
+-- through StartButtonAnim): SHIFT, SUMMARY, CHECK MOVES, cancel.
+local MONMENU_BUTTON = { [0] = 7, [1] = 8, [2] = 10, [3] = 6 }
+
+-- Repaints disabled and pressed wrapper button faces (DrawPageButtons
+-- and UpdateButtonAnim): mon-menu eggs disable SUMMARY/CHECK MOVES,
+-- prev/next disable to their face behind a single mon, empty move
+-- slots disable, the staged press dips through PRESSED/SELECTED/NORMAL,
+-- and the move-detail tab keeps its SELECTED face.
+---@param resources table<string, unknown> borrowed application collaborators
+---@param view table<string, unknown> internal semantic snapshot carrying the staged text palettes
+---@param child table<string, unknown> detached wrapper child view under drawing
+local function drawWrapperFaces(resources, view, child)
+  local assets = assert(resources.assets, "the battle wrapper borrows its asset holder")
+  local graphics = assert(resources.graphics, "the battle wrapper borrows its host graphics")
+  local _ = view
+  local page = child.partyPage --[[@as string]]
+  local press = child.pagePress --[[@as table<string, unknown>?]]
+  local pressButton = nil
+  local pressFrame = nil
+  if type(press) == "table" then
+    local button = nil
+    if page == "mon_menu" then
+      button = MONMENU_BUTTON[tonumber(press.button) or -1]
+    elseif page == "summary" then
+      button = SUMMARY_BUTTON[tonumber(press.button) or -1]
+    elseif page == "moves" then
+      button = MOVES_BUTTON[tonumber(press.button) or -1]
+    elseif page == "move_detail" and tonumber(press.button) == 4 then
+      button = 6
+    end
+    local frame = PRESS_FRAME[tonumber(press.phase) or 0]
+    if button ~= nil and frame ~= nil then
+      pressButton = button
+      pressFrame = frame
+    end
+  end
+  if page == "mon_menu" then
+    if child.pageIsEgg == true then
+      drawWrapperFace(assets, graphics, child, 8, 3)
+      drawWrapperFace(assets, graphics, child, 10, 3)
+    end
+  elseif page == "summary" then
+    if child.pageMultiMon ~= true then
+      drawWrapperFace(assets, graphics, child, 12, 3)
+      drawWrapperFace(assets, graphics, child, 13, 3)
+    end
+  elseif page == "moves" then
+    if child.pageMultiMon ~= true then
+      drawWrapperFace(assets, graphics, child, 12, 3)
+      drawWrapperFace(assets, graphics, child, 13, 3)
+    end
+    local windows = child.pageWindows --[[@as table<integer, table<string, unknown>>?]]
+    if type(windows) == "table" then
+      local known = {}
+      for _, window in ipairs(windows) do
+        local slot = type(window) == "table"
+          and type(window.role) == "string"
+          and tonumber(window.role:match("^move%-name:(%d+)$") or "")
+        if slot ~= nil and tostring(window.text or "") ~= "" then
+          known[slot] = true
+        end
+      end
+      for moveSlot = 0, 3 do
+        if known[moveSlot] ~= true and (pressButton ~= 14 + moveSlot) then
+          drawWrapperFace(assets, graphics, child, 14 + moveSlot, 3)
+        end
+      end
+    end
+  elseif page == "move_detail" then
+    local selected = math.floor(tonumber(child.pageMove) or 0)
+    if pressButton ~= 30 + selected then
+      drawWrapperFace(assets, graphics, child, 30 + selected, 2)
+    end
+  end
+  if pressButton ~= nil and pressFrame ~= nil then
+    drawWrapperFace(assets, graphics, child, pressButton, pressFrame)
+  end
+end
+
+-- Draws the d-pad cursor corners around the focused wrapper box while
+-- the cursor is active (BattleDpadCursor_SetRect over the page cursor
+-- boxes; set by keys, cleared by touch), like the bag cursor corners.
+-- A missing staged corner draws nothing instead of a text marker.
+---@param resources table<string, unknown> borrowed application collaborators
+---@param view table<string, unknown> internal semantic snapshot carrying the staged text palettes
+---@param child table<string, unknown> detached wrapper child view under drawing
+local function drawWrapperCursor(resources, view, child)
+  if child.cursorActive ~= true then
+    return
+  end
+  local boxes = child.pageCursorBoxes --[[@as table<integer, table<string, unknown>>?]]
+  local cursor = tonumber(child.pageCursor) or 0
+  local box = type(boxes) == "table" and boxes[cursor + 1] or nil
+  if type(box) ~= "table" then
+    return
+  end
+  -- The wrapper corners shimmer through the staged per-frame translate
+  -- pulse like the bag corners (BattleCursor_Update ticks every corner
+  -- each task); a focus move or page turn restarts at zero offset.
+  local frames = view.wrapperCursorFrames --[[@as table<string, table<string, unknown>>?]]
+  if type(frames) ~= "table" then
+    frames = view.bagCursorFrames --[[@as table<string, table<string, unknown>>?]]
+  end
+  local tick = tonumber(view.wrapperCursorTick) or 0
+  local function frameOffset(corner)
+    local staged = type(frames) == "table" and frames[corner] or nil
+    local list = type(staged) == "table" and staged.frames or nil
+    if type(list) ~= "table" then
+      return 0, 0
+    end
+    local total = 0
+    for _, frame in ipairs(list) do
+      total = total + (tonumber(frame.duration) or 0)
+    end
+    if total <= 0 then
+      return 0, 0
+    end
+    local at = tick % total
+    local elapsed = 0
+    for _, frame in ipairs(list) do
+      local duration = tonumber(frame.duration) or 0
+      if duration > 0 and at < elapsed + duration then
+        return tonumber(frame.x) or 0, tonumber(frame.y) or 0
+      end
+      elapsed = elapsed + duration
+    end
+    return 0, 0
+  end
+  local assets = assert(resources.assets, "the battle wrapper borrows its asset holder")
+  local graphics = assert(resources.graphics, "the battle wrapper borrows its host graphics")
+  local corners = {
+    { key = "battle:cursor-tl", corner = "tl", x = box.left, y = box.top },
+    { key = "battle:cursor-tr", corner = "tr", x = box.right, y = box.top },
+    { key = "battle:cursor-bl", corner = "bl", x = box.left, y = box.bottom },
+    { key = "battle:cursor-br", corner = "br", x = box.right, y = box.bottom },
+  }
+  for _, corner in ipairs(corners) do
+    local art = assets:drawable(corner.key)
+    if art ~= nil then
+      local width, height = drawableDims(art)
+      if type(width) ~= "number" or type(height) ~= "number" then
+        width, height = 16, 16
+      end
+      local dx, dy = frameOffset(corner.corner)
+      drawArtwork(graphics, art, nil, corner.x + dx - math.floor(width / 2), corner.y + dy - math.floor(height / 2))
+    end
   end
 end
 
 -- Draws one battle summary, move-list, or move-detail wrapper page over
--- the paired modal: every projected row paints through its retail font
--- and window colors behind the staged party bank. Rows past the sixth
--- stay unpainted like every other modal page, so paint and taps keep
--- agreeing; keyboard navigation still reaches the actions underneath.
+-- the paired modal: the staged ROM page background composites at the
+-- pane origin, every projected window prints its text through the
+-- staged party palette, and every projected sprite draws at its retail
+-- anchor through its established provider. A missing background draws
+-- nothing new (the modal chrome underneath stays), and any sprite
+-- without a resolved drawable is skipped.
 ---@param resources table<string, unknown> borrowed application collaborators
 ---@param view table<string, unknown> internal semantic snapshot carrying the staged text palettes
 ---@param child table<string, unknown> detached wrapper child view under drawing
 local function drawPartyPageChild(resources, view, child)
+  local assets = assert(resources.assets, "the battle wrapper borrows its asset holder")
+  local graphics = assert(resources.graphics, "the battle wrapper borrows its host graphics")
   local text = assert(resources.text, "the battle wrapper borrows its text services")
-  local rows = child.rows --[[@as table<integer, table<string, unknown>>?]]
-  if type(rows) ~= "table" then
+  local page = child.partyPage --[[@as string]]
+  local artKey = BattlePartyPages.pageArtKey(page) or ("party:page/" .. page)
+  local pageArt = assets:drawable(artKey)
+  if pageArt == nil then
     return
   end
-  for index, row in ipairs(rows) do
-    if index > 6 then
-      break
-    end
-    if type(row) == "table" and type(row.id) == "string" and row.empty ~= true then
-      drawPartyPageRow(text, view, child, row, CHILD_ROW_Y0 + (index - 1) * CHILD_ROW_H + 4)
+  drawArtwork(graphics, pageArt, nil, 0, 0)
+  drawWrapperFaces(resources, view, child)
+  drawWrapperText(assets, text, graphics, view, child)
+  drawWrapperCursor(resources, view, child)
+  local sprites = child.pageSprites --[[@as table<integer, table<string, unknown>>?]]
+  if type(sprites) ~= "table" then
+    return
+  end
+  for _, sprite in ipairs(sprites) do
+    if type(sprite) == "table" and type(sprite.kind) == "string" then
+      local key = partyPageSpriteKey(sprite)
+      if key ~= nil then
+        local art = assets:drawable(key)
+        if art ~= nil then
+          local drawX, drawY = partyPageSpritePos(art, sprite)
+          drawArtwork(graphics, art, nil, drawX, drawY)
+        end
+      end
     end
   end
 end
@@ -2832,22 +4450,22 @@ local function drawChild(resources, view, child)
     drawChildFooter(text, view, child)
     return
   end
-  text.drawText(fitLabel(text, BattleChildText.title(child), CHILD_TITLE.maxWidth), CHILD_TITLE.x, CHILD_TITLE.y)
-  local occupancy = BattleChildText.occupancy(child)
-  if occupancy ~= nil then
-    text.drawText(occupancy, 216, CHILD_TITLE.y)
-  end
-  -- Summary, move-list, and move-detail wrapper pages paint through
-  -- their retail fonts and window colors; the list and mon-menu pages
-  -- keep the established tabular treatment.
-  if (child.kind == "party" or child.kind == "target") and type(child.partyPage) == "string" then
-    local wrapper = child.partyPage --[[@as string]]
-    if wrapper == "summary" or wrapper == "moves" or wrapper == "move_detail" then
-      drawPartyPageChild(resources, view, child)
-      drawChildFooter(text, view, child)
-      return
+  -- Party and target lists paint through the native party renderer
+  -- alone, and the mon-menu/summary/move pages paint through their
+  -- retail page painter alone: the barrier projects no invented rows,
+  -- so without native paint the modal stays blank like the pending
+  -- picker instead of inventing a modal list.
+  if child.kind == "party" or child.kind == "target" then
+    if type(child.partyPage) == "string" then
+      local wrapper = child.partyPage --[[@as string]]
+      if wrapper == "mon_menu" or wrapper == "summary" or wrapper == "moves" or wrapper == "move_detail" then
+        drawPartyPageChild(resources, view, child)
+        return
+      end
     end
+    return
   end
+  text.drawText(fitLabel(text, BattleChildText.title(child), CHILD_TITLE.maxWidth), CHILD_TITLE.x, CHILD_TITLE.y)
   local rows = child.rows --[[@as table<integer, table<string, unknown>>?]]
   if type(rows) == "table" then
     local drawRow = child.kind == "learn" and drawLearnRow or drawTabularRow
@@ -2877,6 +4495,16 @@ function BattleRenderer.drawNativeChild(resources, child, _)
     return false
   end
   if child.kind == "party" or child.kind == "target" then
+    -- Battle mon-menu, summary, move-list, and move-detail wrapper
+    -- pages own the modal: the native roster stays hidden so the
+    -- wrapper rows paint.
+    local wrapper = type(child.partyPage) == "string" and child.partyPage or nil
+    if wrapper == nil and type(native.page) == "string" then
+      wrapper = native.page
+    end
+    if wrapper == "mon_menu" or wrapper == "summary" or wrapper == "moves" or wrapper == "move_detail" then
+      return false
+    end
     local party = menus.party --[[@as table<string, unknown>?]]
     if type(party) ~= "table" or type(party.renderer) ~= "table" then
       return false
@@ -2898,10 +4526,18 @@ end
 ---@param view table<string, unknown> internal semantic snapshot
 ---@param child table<string, unknown> confirmed learning child view with source labels
 local function drawTwoOptionConfirmation(resources, view, child)
-  local graphics = assert(resources.graphics, "the battle render borrows its host graphics")
-  local assets = assert(resources.assets, "the battle render borrows its asset holder")
+  assert(resources.graphics, "the battle render borrows its host graphics")
+  assert(resources.assets, "the battle render borrows its asset holder")
   local text = assert(resources.text, "the battle render borrows its text services")
-  local pressed = BattleMenuPresenter.drawChildTwoOption(graphics, assets, view)
+  -- The armed child control selects its source option through the same
+  -- child-to-source mapping the presented two-option pane uses.
+  local pressed = (function()
+    local armed = view.armed --[[@as table<string, unknown>?]]
+    if type(armed) == "table" and armed.scope == "child" then
+      return BattleMenuPresenter.CHILD_TWO_OPTION[armed.id]
+    end
+    return nil
+  end)()
   local labels = assert(child.twoOption, "learning confirmation carries source-selected labels") --[[@as table<string, unknown>]]
   local top = assert(labels.top, "the top option has its staged source label") --[[@as string]]
   local bottom = assert(labels.bottom, "the bottom option has its staged source label") --[[@as string]]
@@ -2928,6 +4564,22 @@ end
 
 -- Menu layer sections by drawable menu layout.
 local MENU_SECTIONS = { command = "command", moves = "moves", target = "target", ["two-option"] = "twoOption" }
+
+-- Derives the sub-engine priority map from the selected menu layout's
+-- compiled screen descriptors: lower numeric values win, exactly the
+-- ROM-published per-plane priorities. Roles with no staged plane keep
+-- the engine default so inactive planes never disturb selection.
+---@param layers table<integer, table<string, unknown>> compiled screen records carrying plane and priority
+---@return table<string, integer> priority by sub-engine role
+local function subPriorities(layers)
+  local overrides = {}
+  for _, layer in ipairs(layers) do
+    if type(layer) == "table" and type(layer.plane) == "number" and type(layer.priority) == "number" then
+      overrides[BattleMenuPresenter.roleForPlane(layer.plane)] = layer.priority
+    end
+  end
+  return overrides
+end
 
 ---@param resources table<string, unknown> borrowed application collaborators
 ---@param view table<string, unknown> internal semantic snapshot
@@ -2957,219 +4609,227 @@ local function drawInteraction(resources, view, content, placement)
   local layers = assert(menuLayers[MENU_SECTIONS[layout]], "the battle view carries layers for its selected menu") --[[@as table[] ]]
   local regions = assert(BattleMenuRegions.forLayout(layout), "the active battle menu has native source regions")
   local menuWindows = type(view.menuWindows) == "table" and view.menuWindows or nil
+  -- The held Shift and use-next offers arm their cells under their own
+  -- input scope while the shared source two-option planes name the
+  -- confirm/back cells, so both the pressed feedback and the source plane
+  -- blend resolve against the drawn layout.
+  local menuView = view
+  if view.mode == "shift" or view.mode == "use-next" then
+    menuView = {}
+    for key, value in pairs(view) do
+      menuView[key] = value
+    end
+    local armed = view.armed --[[@as table<string, unknown>?]]
+    if type(armed) == "table" and type(armed.id) == "string" then
+      menuView.armed = { scope = "two-option", id = armed.id, pointerId = armed.pointerId }
+    end
+  end
   -- The menu tilemaps stay up behind the encounter fade (their sampled
   -- palettes carry the flash), but the controls belong to command input:
   -- intro, narration, resolution, and outcome panes show gauges alone,
-  -- so the reveal never replays over already-visible controls.
-  local inputMode = view.mode == "command" or view.mode == "moves" or view.mode == "target"
+  -- so the reveal never replays over already-visible controls. The held
+  -- offers own their two-option controls the same way.
+  local inputMode = view.mode == "command"
+    or view.mode == "moves"
+    or view.mode == "target"
+    or view.mode == "shift"
+    or view.mode == "use-next"
   -- Retail hides every plane but SUB_2 while no menu is open
   -- (BattleInput_ShowOnlySubBgLayer2): the plain backdrop without
   -- the button tilemaps.
-  BattleMenuPresenter.draw(graphics, assets, layout, layers, view, menuWindows, not inputMode)
+  local grouped = {}
+  for index, layer in ipairs(layers) do
+    if inputMode or layer.plane == 2 then
+      local role = BattleMenuPresenter.roleForPlane(layer.plane)
+      if grouped[role] == nil then
+        grouped[role] = {}
+      end
+      grouped[role][#grouped[role] + 1] = { index = index, layer = layer }
+    end
+  end
+  local planeDraws = {}
+  for role, entries in pairs(grouped) do
+    local function drawInteractionPlane(planeGraphics)
+      for _, entry in ipairs(entries) do
+        BattleMenuPresenter.drawPlane(planeGraphics, assets, layout, menuView, entry)
+      end
+    end
+    planeDraws[role] = drawInteractionPlane
+  end
+  local objects = {}
   if inputMode then
     local function drawOverlay()
-      -- Multi-actor turns name the acting battler above the menu so staged
-      -- choices are never mistaken for the previous entry's selection.
       local acting = BattleViewRoster.actingName(view)
       if acting ~= nil then
         drawRoleText(text, "menu", fitLabel(text, acting, 44, "menu"), 128, 8)
       end
-      drawControls(resources, view, layout, regions)
-      drawKeypadCursor(graphics, assets, view, layout, regions)
+      drawControls(resources, menuView, layout, regions)
+      drawKeypadCursor(graphics, assets, menuView, layout, regions)
     end
-    -- OBJ controls obey the same slide windows as the BG planes: the top
-    -- controls wipe horizontally with W0 while the strip below the W1 edge
-    -- stays revealed. Clipping to the full reveal height alone would pop
-    -- the top buttons in early, which reads as flicker.
     local top = type(menuWindows) == "table" and menuWindows.outsideTop or nil
     local bottom = type(menuWindows) == "table" and menuWindows.outsideBottom or nil
+    local overlay = drawOverlay
     if type(top) == "table" and type(bottom) == "table" then
-      if top.width ~= 0 and top.height ~= 0 then
-        LogicalSurface.clip(graphics, top, drawOverlay)
+      local function drawClippedOverlay()
+        if top.width ~= 0 and top.height ~= 0 then
+          LogicalSurface.clip(graphics, top, drawOverlay)
+        end
+        if bottom.width ~= 0 and bottom.height ~= 0 then
+          LogicalSurface.clip(graphics, bottom, drawOverlay)
+        end
       end
-      if bottom.width ~= 0 and bottom.height ~= 0 then
-        LogicalSurface.clip(graphics, bottom, drawOverlay)
-      end
+      overlay = drawClippedOverlay
     else
       local revealEdge = view.menuRevealEdge
       if type(revealEdge) == "number" then
-        LogicalSurface.clip(graphics, { x = 0, y = 0, width = 256, height = revealEdge }, drawOverlay)
-      else
-        drawOverlay()
-      end
-    end
-  end
-  drawGauges(resources, view)
-end
-
----@param graphics table<string, unknown> injected host graphics
----@param assets table<string, unknown> injected asset holder
----@param view table<string, unknown> internal semantic snapshot
----@param spots table<integer, table<string, unknown>> compact sprite anchors keyed by native position
-local function drawCompactSlots(graphics, assets, view, spots)
-  -- One sprite per declared slot, matched by the opaque native
-  -- position in the plan's paint order. Hidden, benched and historic
-  -- records own no slot; a missing portrait draws nothing under the
-  -- existing pending path, never a fallback picture. Draw never
-  -- mutates engine or cue state.
-  local players, enemies = BattleViewRoster.liveSides(view)
-  local live = {}
-  for _, side in ipairs({ players, enemies }) do
-    for _, battler in ipairs(side) do
-      if type(battler.position) == "number" then
-        assert(
-          live[battler.position] == nil,
-          "compact slot "
-            .. tostring(battler.position)
-            .. " is visibly claimed twice (combatant "
-            .. tostring(battler.combatant)
-            .. ")"
-        )
-        live[battler.position] = battler
-      end
-    end
-  end
-  for _, spot in ipairs(spots) do
-    local battler = live[spot.position]
-    local image = battler ~= nil and battlerImage(assets, battler) or nil
-    if image ~= nil and battler.visible ~= false then
-      local dx = numberOr(battler.shakeDx, 0)
-      local crop = battler.pictureVisible == true
-      local pictureWidth = crop and numberOr(battler.pictureWidth, 80) or 80
-      local pictureHeight = crop and numberOr(battler.pictureHeight, 80) or 80
-      local pictureX = numberOr(battler.pictureXOffset, 0)
-      local pictureY = numberOr(battler.pictureYOffset, 0)
-      local scale = assert(spot.scale, "compact doubles portraits carry their authored presentation scale")
-      local allocation = { x = spot.x, y = spot.y, width = spot.width, height = spot.height }
-      LogicalSurface.clip(graphics, allocation, function()
-        -- Lease-paired cells draw through the shared sampler so the
-        -- recorded draw carries the staged cell exactly; owned and
-        -- test images draw directly.
-        local x = spot.x + (dx + pictureX) * scale
-        local y = spot.y + pictureY * scale
-        if crop then
-          LogicalSurface.clip(graphics, {
-            x = x,
-            y = y,
-            width = pictureWidth * scale,
-            height = pictureHeight * scale,
-          }, function()
-            drawArtwork(graphics, image, image.quad, x, y, 0, scale, scale)
-          end)
-        else
-          drawArtwork(graphics, image, image.quad, x, y, 0, scale, scale)
+        local function drawRevealOverlay()
+          LogicalSurface.clip(graphics, { x = 0, y = 0, width = 256, height = revealEdge }, drawOverlay)
         end
-      end)
+        overlay = drawRevealOverlay
+      end
     end
+    objects[#objects + 1] = { objPriority = 0, submissionOrder = 1, oamMode = "normal", draw = overlay }
   end
+  local function drawInteractionGauges()
+    drawGauges(resources, view)
+  end
+  objects[#objects + 1] = {
+    objPriority = 0,
+    submissionOrder = 2,
+    oamMode = "normal",
+    draw = drawInteractionGauges,
+  }
+  presentSubFrame(
+    resources,
+    view,
+    planeDraws,
+    { objects = objects, slideWindows = menuWindows, priority = subPriorities(layers) }
+  )
 end
 
--- Draws one visible singles battler portrait at its compact center with
--- its transient shake.
----@param graphics table<string, unknown> injected host graphics
----@param assets table<string, unknown> injected asset holder
----@param battler table<string, unknown>? first battler facts on the side
----@param center table<string, number> compact image center under drawing
-local function drawCompactSingle(graphics, assets, battler, center)
-  if battler == nil or battler.visible == false then
-    return
-  end
-  local image = battlerImage(assets, battler)
-  if image ~= nil then
-    local crop = battler.pictureVisible == true
-    local x = center.x + numberOr(battler.shakeDx, 0) + numberOr(battler.pictureXOffset, 0)
-    local y = center.y + numberOr(battler.pictureYOffset, 0)
-    if crop then
-      LogicalSurface.clip(graphics, {
-        x = x,
-        y = y,
-        width = numberOr(battler.pictureWidth, 80),
-        height = numberOr(battler.pictureHeight, 80),
-      }, function()
-        drawArtwork(graphics, image, image.quad, x, y)
-      end)
-    else
-      drawArtwork(graphics, image, image.quad, center.x + numberOr(battler.shakeDx, 0), center.y)
-    end
-  end
-end
-
--- Draws live SPL particle systems over the main screen. The 3D layer sits
--- above the faded BG and OBJ planes, so particles are not tinted by the
--- encounter fade and draw over the battler pictures.
----@param graphics table<string, unknown> injected host graphics
----@param systems table<integer, { simulation: SplParticleSimulation, textures: table<integer, table<string, unknown>> }>|nil live systems in creation order
-local function drawParticleSystems(graphics, systems)
-  if systems == nil then
-    return
-  end
-  for _, system in ipairs(systems) do
-    ---@param _ table<string, unknown>
-    ---@param particle table<string, unknown>
-    ---@param child table<string, unknown>|nil
-    ---@return table<string, unknown>|userdata staged texture handle behind the particle
-    local function resolveTexture(_, particle, child)
-      local texNo = child ~= nil and child.texNo or particle.texNo
-      return assert(system.textures[texNo], "particle texture is staged")
-    end
-    SplParticleDraw.draw(graphics, system.simulation, { centerX = 128, centerY = 96, resolveTexture = resolveTexture })
-  end
-end
-
--- Draws the live main-screen 3D/SPL systems over the faded 2D planes in
--- native order: move particles, encounter particles, then ball particles.
--- The encounter snapshot never recolors these draws. Draw never steps.
----@param graphics table<string, unknown> injected host graphics
----@param view table<string, unknown> internal semantic snapshot
-local function drawSourceMainParticles(graphics, view)
-  graphics.push("all")
-  graphics.setColor(1, 1, 1, 1)
-  drawParticleSystems(graphics, view.moveParticleSystems)
-  drawParticleSystems(graphics, view.encounterParticleSystems)
-  drawParticleSystems(graphics, view.ballParticleSystems)
-  graphics.pop()
-end
-
--- Draws one compact scene inside the single-pane viewport: the same
--- selected source scene with the battler pictures at the plan's compact
--- image centers, clipped to the compact scene viewport without scaling.
--- The plan may supply compact centers; without them the native centers
--- apply. The auxiliary selection arrow and party gauges stay hidden in
--- compact mode because the text cursor and Party action provide the
--- corresponding interaction. The compact HUD draws its own region wording
--- through the text services at the plan anchors; this scene path draws
--- images only, never text or bars.
+-- Draws one compact scene through the same composition frame as detail:
+-- the entire native battlefield shares one uniform fit inside the
+-- scene rectangle while compact HUD and narration callbacks arrive at
+-- their planned target coordinates.
 ---@param resources table<string, unknown> borrowed application collaborators
 ---@param view table<string, unknown> internal semantic snapshot
----@param content table<string, unknown> canonical plan content carrying the compact anchors
-local function drawCompactScene(resources, view, content)
-  local graphics = assert(resources.graphics, "the battle render borrows its host graphics")
-  local assets = assert(resources.assets, "the battle render borrows its asset holder")
-  local viewport = type(content.scene) == "table" and content.scene or { x = 0, y = 0, width = 256, height = 136 }
-  local playerCenter = type(content.playerCenter) == "table" and content.playerCenter or BattleRenderer.PLAYER_CENTER
-  local enemyCenter = type(content.enemyCenter) == "table" and content.enemyCenter or BattleRenderer.ENEMY_CENTER
-  -- Compact images use ordinary alpha composition under an isolated
-  -- neutral image tint, then restore the caller's complete graphics state.
-  -- The compact viewport evaluates the same source intro state as detail
-  -- (scene, terrain, trainers, live particles) at native main-screen
-  -- coordinates, clipped to the compact scene viewport without moving
-  -- emitter origins to the crop center.
-  graphics.push("all")
-  graphics.setBlendMode("alpha", "alphamultiply")
-  graphics.setColor(1, 1, 1, 1)
-  LogicalSurface.clip(graphics, viewport, function()
+---@param content table<string, unknown> canonical plan content carrying the scene rectangle
+---@param compactUI table<string, unknown>? compact interface callbacks behind the frame
+local function drawCompactScene(resources, view, content, compactUI)
+  local scene = type(content.scene) == "table" and content.scene or { x = 0, y = 0, width = 256, height = 136 }
+  local transform = content.worldTransform
+  local layout
+  if type(transform) == "table" then
+    layout = {
+      scale = transform.scale,
+      offsetX = transform.offsetX,
+      offsetY = transform.offsetY,
+      worldRect = scene,
+    }
+  else
+    local scale = math.min(scene.width / 256, scene.height / 192)
+    layout = {
+      scale = scale,
+      offsetX = scene.x + (scene.width - 256 * scale) / 2,
+      offsetY = scene.y + (scene.height - 192 * scale) / 2,
+      worldRect = scene,
+    }
+  end
+  local ui = compactUI or {}
+  local function drawCompactBattlefield()
     drawSourceMainScene(resources, view)
-    local spots = content.spriteCenters
-    if type(spots) == "table" then
-      drawCompactSlots(graphics, assets, view, spots --[[@as table<integer, table<string, unknown>>]])
-    else
-      local player, enemy = BattleViewRoster.firstPerSide(view)
-      drawCompactSingle(graphics, assets, enemy, enemyCenter)
-      drawCompactSingle(graphics, assets, player, playerCenter)
+  end
+  local planes = {
+    battlefield = {
+      draw = drawCompactBattlefield,
+    },
+  }
+  if type(ui.window) == "function" then
+    local windowDraw = ui.window --[[@as fun()]]
+    planes.window = { draw = windowDraw }
+  end
+  -- Compact HUD rides at its planned target coordinates after the
+  -- shared present: the world fit applies only to source geometry,
+  -- never to HUD placement. During live effects the HUD still enters
+  -- through the compositor via the typed frame; static command views
+  -- carry no active blend or window state, so direct target drawing
+  -- preserves placement without clipping into the world padding.
+  presentMainFrame(resources, view, layout, planes, {})
+  if type(ui.hud) == "function" then
+    local hudDraw = ui.hud --[[@as fun()]]
+    hudDraw()
+  end
+end
+
+-- Presents one compact dock through the sub engine with its own menu
+-- state, then only inside the dock rectangle.
+---@param resources table<string, unknown> borrowed application collaborators
+---@param view table<string, unknown> semantic snapshot behind the content
+---@param dock table<string, unknown> dock content and placement behind the present
+function BattleRenderer.drawCompactDock(resources, view, dock)
+  assert(type(dock) == "table", "compact docks carry their content")
+  local draw = assert(dock.draw, "compact docks draw their content")
+  local rect = assert(dock.rect, "compact docks carry their dock rectangle")
+  presentSubFrame(resources, view, {
+    menu = draw --[[@as fun(graphics: table<string, unknown>)]],
+  }, {
+    clip = rect,
+    bareRole = "menu",
+  })
+end
+
+-- Presents the learning confirmation two-option planes through the
+-- sub engine with the armed child control selecting its source option.
+---@param resources table<string, unknown> borrowed application collaborators
+---@param view table<string, unknown> semantic snapshot carrying the menu layers and armed control
+---@param overlay (fun(pressed: string?))? label content behind the planes
+---@return string? pressed source option identity, nil while no child control is armed
+function BattleRenderer.drawTwoOptionPane(resources, view, overlay)
+  local menuLayers = assert(view.menuLayers, "the battle view carries generated menu screen layers")
+  local layers = assert(menuLayers.twoOption, "the battle view carries source two-option layers") --[[@as table[] ]]
+  local pressed = (function()
+    local armed = view.armed --[[@as table<string, unknown>?]]
+    if type(armed) == "table" and armed.scope == "child" then
+      return BattleMenuPresenter.CHILD_TWO_OPTION[armed.id]
     end
-    drawSourceMainParticles(graphics, view)
-  end)
-  graphics.pop()
+    return nil
+  end)()
+  local subView = {}
+  for key, value in pairs(view) do
+    subView[key] = value
+  end
+  subView.selection = pressed
+  subView.armed = pressed ~= nil and { scope = "two-option", id = pressed } or nil
+  local planeDraws = {}
+  for index, layer in ipairs(layers) do
+    local role = BattleMenuPresenter.roleForPlane(layer.plane)
+    if planeDraws[role] == nil then
+      planeDraws[role] = {}
+    end
+    -- Screen positions are the staged drawable identity, so the role
+    -- grouping keeps the original screen index instead of renumbering.
+    planeDraws[role][#planeDraws[role] + 1] = { index = index, layer = layer }
+  end
+  local draws = {}
+  for role, roleLayers in pairs(planeDraws) do
+    local function drawTwoOptionRole(graphics)
+      for _, entry in ipairs(roleLayers) do
+        BattleMenuPresenter.drawPlane(
+          graphics,
+          assert(resources.assets, "the battle render borrows its asset holder"),
+          "two-option",
+          subView,
+          entry
+        )
+      end
+      if role == "menu" and overlay ~= nil then
+        overlay(pressed)
+      end
+    end
+    draws[role] = drawTwoOptionRole
+  end
+  presentSubFrame(resources, subView, draws, { priority = subPriorities(layers) })
+  return pressed
 end
 
 ---@param assets table<string, unknown> battle image owner
@@ -3207,6 +4867,28 @@ local function drawEvolutionSummary(resources, state, pane)
   local renderer = assert(resources.summaryRenderer, "evolution Summary borrows the field renderer")
   local bundle = assert(status.resources, "ready evolution Summary carries its resource bundle")
   renderer:drawPane(status, pane, bundle)
+end
+
+-- Draws live SPL particle systems over the evolution pane through the
+-- retained sibling overlay wrapper. The battle-composed main scene owns
+-- its own primitive path; this child pane keeps the overlay draw.
+---@param graphics table<string, unknown> injected host graphics
+---@param systems table<integer, { simulation: SplParticleSimulation, textures: table<integer, table<string, unknown>> }>|nil live systems in creation order
+local function drawParticleSystems(graphics, systems)
+  if systems == nil then
+    return
+  end
+  for _, system in ipairs(systems) do
+    ---@param _ table<string, unknown>
+    ---@param particle table<string, unknown>
+    ---@param child table<string, unknown>|nil
+    ---@return table<string, unknown>|userdata staged texture handle behind the particle
+    local function resolveTexture(_, particle, child)
+      local texNo = child ~= nil and child.texNo or particle.texNo
+      return assert(system.textures[texNo], "particle texture is staged")
+    end
+    SplParticleDraw.draw(graphics, system.simulation, { centerX = 128, centerY = 96, resolveTexture = resolveTexture })
+  end
 end
 
 ---@param resources table<string, unknown> borrowed application collaborators
@@ -3444,7 +5126,8 @@ end
 ---@param paneId string resolved pane identity
 ---@param content table<string, unknown> canonical plan content carrying the layout
 ---@param placement LayoutGeometry.Placement resolved placement the pane draws under
-function BattleRenderer.drawPane(resources, view, paneId, content, placement)
+---@param compactUI table<string, unknown>? compact interface callbacks behind the compact frame
+function BattleRenderer.drawPane(resources, view, paneId, content, placement, compactUI)
   assert(type(resources) == "table", "pane drawing borrows its resources")
   assert(type(view) == "table", "pane drawing reads its snapshot")
   local child = view.mode == "child" and view.childView or nil
@@ -3461,12 +5144,9 @@ function BattleRenderer.drawPane(resources, view, paneId, content, placement)
       drawEvolutionWaiting(assert(resources.graphics, "the battle render borrows its host graphics"))
     end
   elseif paneId == "compact" then
-    drawCompactScene(resources, view, content or {})
+    drawCompactScene(resources, view, content or {}, compactUI)
   elseif paneId == "detail" then
     drawDetail(resources, view)
-    -- No fullscreen wash covers the composed main scene: the 3D systems
-    -- draw above the scene planes untinted.
-    drawSourceMainParticles(assert(resources.graphics, "the battle render borrows its host graphics"), view)
   elseif paneId == "interaction" then
     drawInteraction(resources, view, content or {}, placement)
   end

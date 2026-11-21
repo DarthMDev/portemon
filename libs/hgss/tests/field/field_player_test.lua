@@ -4,6 +4,7 @@
 local Assert = require("tests.support.Assert")
 local Errors = require("libs.errors.src.Errors")
 local FieldPlayer = require("libs.hgss.src.actors.FieldPlayer")
+local MovementCalibration = require("libs.hgss.src.script.tasks.MovementCalibration")
 local TerrainSurface = require("libs.hgss.src.world.TerrainSurface")
 
 local T = {}
@@ -503,21 +504,75 @@ function T.scripted_walk_over_an_uncovered_tile_keeps_height_without_a_surface()
   })
   local p = player(map, 0, 4, 0)
   local startY = p.worldY
-  p:beginScriptedAction({ action = "walk", direction = "east", speed = "normal" })
-  for _ = 1, FieldPlayer.WALK_STEP_TICKS do
-    p:updateFixed({})
+  local function scriptedWalk()
+    p:beginScriptedAction({ action = "walk", direction = "east", speed = "normal" })
+    for progress = 1, FieldPlayer.WALK_STEP_TICKS do
+      p:advanceScriptedAction(progress, FieldPlayer.WALK_STEP_TICKS)
+    end
+    p:commitScriptedAction()
   end
-  p:commitScriptedAction()
+  scriptedWalk()
   Assert.equal(p.fieldX, 1)
   Assert.isNil(p.surfaceId, "no plate means no surface")
   Assert.equal(p.worldY, startY, "the player keeps its height")
-  p:beginScriptedAction({ action = "walk", direction = "east", speed = "normal" })
-  for _ = 1, FieldPlayer.WALK_STEP_TICKS do
-    p:updateFixed({})
-  end
-  p:commitScriptedAction()
+  scriptedWalk()
   Assert.equal(p.fieldX, 2)
   Assert.equal(p.surfaceId, 1, "covered terrain resolves a surface again")
+end
+
+-- A scripted action belongs to the script movement task that began it: the
+-- ordinary field update must not advance the same action a second time, and
+-- it must not erase the action's calibrated pose cadence. Advancing scripted
+-- motion through the field update used to double the step rate, end the tile
+-- early, and leave the movement task faulting on a motion it no longer owned.
+function T.scripted_motion_is_advanced_by_its_script_owner_not_the_field_update()
+  for _, case in ipairs({
+    { speed = "normal", poseDelta = 1 },
+    { speed = "fast", poseDelta = 2 },
+  }) do
+    local duration = assert(MovementCalibration.SPEED_TICKS[case.speed], "the walk speed must be calibrated")
+    local p = player(runtimeMap(), 0, 4, 0, "east")
+    p:beginScriptedAction({ action = "walk", direction = "east", speed = case.speed })
+    for progress = 1, duration do
+      p:advanceScriptedAction(progress, duration)
+      Assert.equal(
+        p:presentationState().scriptedPoseDelta,
+        case.poseDelta,
+        "the " .. case.speed .. " walk advances its own pose frames per scripted tick"
+      )
+      p:updateFixed({})
+      Assert.equal(p.motion, "walking", "the field update never completes a scripted step")
+      Assert.equal(p.fieldX, 0, "the scripted tile commits only through its owner")
+    end
+    Assert.equal(
+      p:presentationState().scriptedPoseDelta,
+      case.poseDelta,
+      "the field update preserves the scripted cadence for the presentation clock"
+    )
+    p:commitScriptedAction()
+    Assert.equal(p.fieldX, 1, "the scripted owner commits the tile")
+    Assert.equal(p.motion, "idle")
+  end
+end
+
+-- The script movement owner cancels its own scripted action; cancelling when
+-- no scripted action exists must not touch an ordinary field step. The old
+-- unconditional reset froze the physical interpolation mid-tile while the
+-- logical tile stayed behind, so the next step started from a corrupted
+-- world point.
+function T.cancelling_an_absent_scripted_motion_keeps_an_ordinary_step()
+  local p = player(runtimeMap(), 0, 4, 0, "east")
+  tick(p, "east", "east")
+  tick(p, "east")
+  tick(p, "east")
+  p:cancelScriptedMovement()
+  Assert.equal(p.motion, "walking", "a script cancel must not stop an ordinary step")
+  Assert.equal(p.fieldX, 0, "the ordinary step has committed nothing yet")
+  for _ = 1, 5 do
+    tick(p, "east")
+  end
+  Assert.equal(p.fieldX, 1, "the ordinary step still commits its destination tile")
+  Assert.equal(p.motion, "idle")
 end
 
 function T.ambiguous_terrain_failure_is_not_a_blocked_step()
@@ -1610,12 +1665,11 @@ function T.traverse_action_runs_planned_motion_at_walk_cadence()
   p:setTraversalMode("surfing")
   p:beginScriptedAction({ action = "traverse", direction = "south", speed = "normal", mode = "surfing" })
   Assert.isTrue(p:isScriptedMoving())
-  for _ = 1, FieldPlayer.WALK_STEP_TICKS - 1 do
-    p:updateFixed({})
+  for progress = 1, FieldPlayer.WALK_STEP_TICKS - 1 do
+    p:advanceScriptedAction(progress, FieldPlayer.WALK_STEP_TICKS)
     Assert.isTrue(p:isScriptedMoving())
   end
-  p:updateFixed({})
-  Assert.isFalse(p:isScriptedMoving())
+  p:advanceScriptedAction(FieldPlayer.WALK_STEP_TICKS, FieldPlayer.WALK_STEP_TICKS)
   p:commitScriptedAction()
   Assert.equal(p.fieldX, 2)
   Assert.equal(p.fieldZ, 4)
@@ -1652,8 +1706,8 @@ function T.traverse_action_honors_an_explicit_planned_surface()
   local p = player(map, 2, 3, 0, "south")
   p:setTraversalMode("walking")
   p:beginScriptedAction({ action = "traverse", direction = "south", speed = "normal", mode = "walking", surfaceId = 7 })
-  for _ = 1, FieldPlayer.WALK_STEP_TICKS do
-    p:updateFixed({})
+  for progress = 1, FieldPlayer.WALK_STEP_TICKS do
+    p:advanceScriptedAction(progress, FieldPlayer.WALK_STEP_TICKS)
   end
   p:commitScriptedAction()
   Assert.equal(p.surfaceId, 7)
@@ -1664,7 +1718,7 @@ function T.traverse_cancellation_restores_the_committed_tile()
   local p = player(shoreWaterMap(), 2, 3, 0, "south")
   p:setTraversalMode("surfing")
   p:beginScriptedAction({ action = "traverse", direction = "south", speed = "normal", mode = "surfing" })
-  p:updateFixed({})
+  p:advanceScriptedAction(1, FieldPlayer.WALK_STEP_TICKS)
   p:cancelScriptedMovement()
   Assert.equal(p.motion, "idle")
   Assert.equal(p.fieldX, 2)

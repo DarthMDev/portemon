@@ -282,13 +282,16 @@ function T.malformed_nested_economy_is_not_repaired_by_normalization()
 end
 
 function T.future_schemas_reject_while_known_envelopes_stay_listable()
+  -- The future schema derives from the current one so the rejection pin
+  -- survives normal version bumps instead of becoming the next current.
+  local futureSchema = GameSave.SCHEMA .. "-future"
   returnsCode("GAME_SAVE_SCHEMA_UNSUPPORTED", function()
     local value = currentRecord()
-    value.schema = "g4-game-save-v12"
+    value.schema = futureSchema
     return GameSave.normalize(value)
   end)
   local envelope, envelopeErr = GameSave.metadata({
-    schema = "g4-game-save-v12",
+    schema = futureSchema,
     saveId = "save-00000001",
     versionId = "heartgold",
     playTimeSeconds = 0,
@@ -647,7 +650,7 @@ function T.v10_migration_converts_the_mask_to_retail_keys()
   -- Bits 0 (zephyr), 3 (fog), and 15 (earth), in native order.
   source.playerData.profile.badges = 2 ^ 0 + 2 ^ 3 + 2 ^ 15
   local migrated = GameSave.migrateV10(source)
-  Assert.equal(migrated.schema, GameSave.SCHEMA, "the v10 step advances the envelope")
+  Assert.equal(migrated.schema, GameSave.LEGACY_V11_SCHEMA, "the v10 step advances the envelope")
   Assert.equal(source.schema, GameSave.LEGACY_V10_SCHEMA, "migration leaves its input untouched")
   Assert.equal(source.playerData.profile.badges, 2 ^ 0 + 2 ^ 3 + 2 ^ 15, "migration never mutates its source mask")
   Assert.deepEqual(
@@ -670,6 +673,56 @@ function T.v10_migration_converts_the_mask_to_retail_keys()
   local normalized = assert(GameSave.normalize(v10record()))
   Assert.equal(normalized.schema, GameSave.SCHEMA, "normalization chains v10 through the badge-set step")
   Assert.deepEqual(normalized.playerData.profile.badges, {}, "normalization converts the v10 mask")
+end
+
+-- The v11 step adds only the SysInfo mystery-gift bucket: v11 records
+-- predate the durable flag, so they initialize it inactive while every
+-- other field and bucket passes through untouched.
+function T.v11_migration_adds_only_the_sys_info_bucket()
+  local SysInfoState = require("libs.hgss.src.save.SysInfoState")
+  local source = GameSave.migrateV10(v10record())
+  Assert.equal(source.schema, GameSave.LEGACY_V11_SCHEMA)
+  Assert.isNil(source.sysInfo, "v11 records carry no sysInfo state")
+  local migrated = GameSave.migrateV11(source)
+  Assert.equal(migrated.schema, GameSave.LEGACY_V12_SCHEMA, "the v11 step advances the envelope")
+  Assert.equal(source.schema, GameSave.LEGACY_V11_SCHEMA, "migration leaves its input untouched")
+  Assert.isNil(source.sysInfo, "migration never mutates its source record")
+  Assert.deepEqual(migrated.sysInfo, SysInfoState.empty(), "v11 saves initialize the flag inactive")
+  Assert.deepEqual(migrated.world, source.world, "migration preserves world state exactly")
+  Assert.deepEqual(
+    migrated.playerData.profile.badges,
+    source.playerData.profile.badges,
+    "migration preserves the converted badge set"
+  )
+  local normalized = assert(GameSave.normalize(v10record()))
+  Assert.equal(normalized.schema, GameSave.SCHEMA, "normalization chains v10 through the sysInfo step")
+  Assert.deepEqual(normalized.sysInfo, SysInfoState.empty(), "normalization installs the sysInfo bucket")
+end
+
+-- The v12 step adds only the field-poison step counter: v12 records predate
+-- the overworld poison cadence, so they initialize it on phase zero while
+-- every other field and bucket passes through untouched. Pre-poison saves
+-- resume without shifting the damage cadence.
+function T.v12_migration_adds_only_the_poison_counter()
+  local FieldPoisonSave = require("libs.hgss.src.save.FieldPoisonSave")
+  local source = GameSave.migrateV11(GameSave.migrateV10(v10record()))
+  Assert.equal(source.schema, GameSave.LEGACY_V12_SCHEMA)
+  Assert.isNil(source.fieldPoison, "v12 records carry no poison counter")
+  local migrated = GameSave.migrateV12(source)
+  Assert.equal(migrated.schema, GameSave.SCHEMA, "the v12 step advances the envelope")
+  Assert.equal(source.schema, GameSave.LEGACY_V12_SCHEMA, "migration leaves its input untouched")
+  Assert.isNil(source.fieldPoison, "migration never mutates its source record")
+  Assert.deepEqual(migrated.fieldPoison, FieldPoisonSave.initial(), "v12 saves initialize the counter on phase zero")
+  Assert.deepEqual(migrated.sysInfo, source.sysInfo, "migration preserves the sysInfo bucket")
+  Assert.deepEqual(migrated.world, source.world, "migration preserves world state exactly")
+  Assert.deepEqual(
+    migrated.playerData.profile.badges,
+    source.playerData.profile.badges,
+    "migration preserves the converted badge set"
+  )
+  local normalized = assert(GameSave.normalize(source))
+  Assert.equal(normalized.schema, GameSave.SCHEMA, "normalization chains v12 through the poison step")
+  Assert.deepEqual(normalized.fieldPoison, FieldPoisonSave.initial(), "normalization installs the poison bucket")
 end
 
 function T.v10_migration_rejects_malformed_profiles_and_masks()

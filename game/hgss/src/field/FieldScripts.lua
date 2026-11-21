@@ -5,6 +5,7 @@
 
 local Bindings = require("libs.hgss.src.script.Bindings")
 local Errors = require("libs.errors.src.Errors")
+local PlayerData = require("libs.hgss.src.save.PlayerData")
 local ScriptErrors = require("libs.script.src.errors")
 local ScriptActorWorld = require("libs.hgss.src.script.ScriptActorWorld")
 local ScriptDialogueHost = require("libs.hgss.src.script.ScriptDialogueHost")
@@ -24,6 +25,8 @@ local FieldScriptSymbols = require("libs.assets.src.field.FieldScriptSymbols")
 local MapInitScriptController = require("libs.hgss.src.field.MapInitScriptController")
 local FollowerInteractionEngine = require("libs.hgss.src.field.FollowerInteractionEngine")
 local FieldMoveCue = require("game.hgss.src.field.FieldMoveCue")
+local FieldMoneyBox = require("game.hgss.src.field.FieldMoneyBox")
+local FieldFloorWindow = require("game.hgss.src.field.FieldFloorWindow")
 
 -- The player facade the script services consume: position/facing/gender/name
 -- plus the mutation hooks the movement tasks use (the player can be a
@@ -32,6 +35,7 @@ local FieldMoveCue = require("game.hgss.src.field.FieldMoveCue")
 ---@class ScriptPlayerFacade
 ---@field private _player FieldPlayer|nil
 ---@field private _profile table<string, unknown>|nil { gender: integer, name: string, rivalName: string }
+---@field private _charmap table<string, unknown> the generated field font charmap live name writes are validated against
 ---@field private _avatarState table<string, unknown>|nil avatar transition owner for queue/apply consumers
 ---@field private _avatarApplier fun(): table<string, unknown>|nil materializes pending transitions through the owning runtime composition
 local ScriptPlayerFacade = {}
@@ -58,11 +62,14 @@ local PLAYER_STATE_CODE = {
 }
 
 ---@param player FieldPlayer
+---@param charmap table<string, unknown> the generated field font charmap live name writes are validated against
 ---@return ScriptPlayerFacade
-local function playerFacade(player)
+local function playerFacade(player, charmap)
+  assert(type(charmap) == "table", "field scripts require the generated field charmap")
   return setmetatable({
     _player = player,
     _profile = nil,
+    _charmap = charmap,
   }, ScriptPlayerFacade)
 end
 
@@ -164,6 +171,23 @@ function ScriptPlayerFacade:rivalName()
   return profile --[[@as { rivalName: string }]].rivalName
 end
 
+-- Store the accepted rival name on the live profile the rival battle, the
+-- message substitution, and the save capture already read. The naming screen
+-- owns input, so an accepted name is already made of glyphs the generated
+-- charmap encodes; this boundary re-checks the saved-profile name contract
+-- (string, 1..7 glyphs, field-charmap encodable) before publishing, so a
+-- rejected name leaves the live profile untouched.
+---@param name string
+function ScriptPlayerFacade:setRivalName(name)
+  local profile = self._profile
+  if profile == nil then
+    Errors.raise(ScriptErrors.SCRIPT_SERVICE_MISSING, "no player profile is wired; the rival name cannot be stored", {})
+  end
+  ---@cast profile table<string, unknown>
+  PlayerData.validateName(name, "rival", self._charmap)
+  profile.rivalName = name
+end
+
 function ScriptPlayerFacade:stateCode()
   local avatar = self._avatarState
   assert(avatar and type(avatar.status) == "function", "field scripts require a player avatar state owner")
@@ -215,6 +239,65 @@ function ScriptPlayerFacade:isScriptedMoving()
   return player:isScriptedMoving()
 end
 
+-- The script money operations: source arithmetic over the one borrowed live
+-- profile and window mutations delegated to the field money box. The facade
+-- never copies the balance, and the money box reads the same profile, so the
+-- mart, battle rewards, Trainer Card and the save all observe one wallet.
+---@class MoneyService
+---@field private _profile table<string, unknown>
+---@field private _box FieldMoneyBox
+local MoneyService = {}
+MoneyService.__index = MoneyService
+
+---@param amount unknown
+local function checkSourceAmount(amount)
+  assert(
+    type(amount) == "number" and amount % 1 == 0 and amount >= 0,
+    "a source money amount must be a non-negative integer"
+  )
+end
+
+---@param profile table<string, unknown>
+---@param box FieldMoneyBox
+---@return MoneyService
+function MoneyService.new(profile, box)
+  return setmetatable({ _profile = profile, _box = box }, MoneyService)
+end
+
+---@param amount integer
+function MoneyService:add(amount)
+  checkSourceAmount(amount)
+  self._profile.money = math.min(PlayerData.MAX_MONEY, self._profile.money + amount)
+end
+
+---@param amount integer
+function MoneyService:subtract(amount)
+  checkSourceAmount(amount)
+  self._profile.money = math.max(0, self._profile.money - amount)
+end
+
+---@param amount integer
+---@return boolean
+function MoneyService:hasEnough(amount)
+  checkSourceAmount(amount)
+  local money = self._profile.money --[[@as integer]]
+  return money >= amount
+end
+
+---@param tileX integer
+---@param tileY integer
+function MoneyService:showBox(tileX, tileY)
+  self._box:show(tileX, tileY)
+end
+
+function MoneyService:updateBox()
+  self._box:update()
+end
+
+function MoneyService:hideBox()
+  self._box:hide()
+end
+
 ---@class FieldScriptsOptions
 ---@field cacheFs CacheFs
 ---@field overrideFs table<string, unknown> read-shaped filesystem for data/scripts/overrides
@@ -225,7 +308,7 @@ end
 ---@field dialogue FieldDialogueController
 ---@field messageProvider FieldMessageProvider
 ---@field layout fun(formatted: table<string, unknown>): table<string, unknown>
----@field fontDef table<string, unknown>
+---@field fontDef table<string, unknown> the generated field font: glyph metrics and the charmap both dialogue and name writes resolve
 ---@field frameIndex integer|nil player-selected HGSS user-frame index for dialogue requests
 ---@field signpost FieldSignpostController the fixed-tick signpost controller the host advances
 ---@field windowStyles FieldWindowStyles the immutable per-runtime window style catalogue the high-level sign ops resolve appearances against
@@ -257,10 +340,11 @@ end
 ---@field partySelection table<string, unknown>|nil the modal script-party surface the blocking selection task opens and closes (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field mart table<string, unknown>|nil the script-owned mart child host (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field travel table<string, unknown>|nil the durable travel owner for spawn updates (absent -> SCRIPT_SERVICE_MISSING on use)
+---@field gameStats table<string, unknown>|nil the live game-stats owner behind script score events (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field fieldMoves table<string, unknown>|nil the field-move runtime for task execution (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field fieldMoveAftermath table<string, unknown>|nil the Rock Smash / Headbutt aftermath service (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field sweetScent table<string, unknown>|nil the Sweet Scent host seam for the scent task (absent -> SCRIPT_SERVICE_MISSING on use)
----@field monNaming table<string, unknown>|nil the script-owned Pokemon Naming Screen host
+---@field monNaming table<string, unknown>|nil the shared field naming host behind nickname and rival naming commands (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field followingMon table<string, unknown>|nil the live following-mon controller for follower script operations (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field celebiCinematic table<string, unknown>|nil runtime-owned Celebi scene service used by the time-travel task
 ---@field legendCutscene table<string, unknown>|nil runtime-owned legend cutscene command state
@@ -274,11 +358,14 @@ end
 ---@field pcApplications table<string, unknown> the script-owned PC application host
 ---@field pcTerminal table<string, unknown> source PC terminal effects
 ---@field pokegearApplications table<string, unknown>|nil the script-owned companion host behind calls and town-map opens (absent -> SCRIPT_SERVICE_MISSING on use)
+---@field phoneCalls table<string, unknown>|nil the field's phone call manager behind staged and forced calls (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field phoneContactIndex table<string, unknown>|nil the compiled phonebook index { byId, byTrainer } for number resolution (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field pokegearState table<string, unknown>|nil the durable companion state behind card and trigger writes (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field phoneGifts table<string, unknown>|nil the contact and parent gift query adapter (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field radioMusic table<string, unknown>|nil the audio-derived radio music query (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field battle table<string, unknown>|nil the battle host for script battle tasks (absent -> SCRIPT_SERVICE_MISSING on use)
+---@field versionId string|nil the selected game version (heartgold/soulsilver) behind GetGameVersion
+---@field sysInfo table<string, unknown>|nil the live sysInfo owner behind SetMysteryGiftActive (absent -> SCRIPT_SERVICE_MISSING on use)
 ---@field timeOfDay table<string, unknown> RTC-derived time-of-day service
 ---@field trainerCardStars table<string, unknown> source-derived Trainer Card star query
 ---@field apricorn table<string, unknown> source tree and Apricorn inventory adapter
@@ -312,8 +399,10 @@ end
 ---@field taskRegistry TaskRegistry the live registered-task registry
 ---@field initController MapInitScriptController
 ---@field blackoutFlow FieldBlackoutFlow?
+---@field moneyBox FieldMoneyBox the one transient source money window the field draw renders
 ---@field mapSource RuntimeFieldMap the active runtime map map-scoped script state is bound to
 ---@field propAnimations table<string, unknown>|nil
+---@field floorWindow FieldFloorWindow the source floor box the field presents and releases
 local FieldScripts = {}
 FieldScripts.__index = FieldScripts
 
@@ -322,6 +411,65 @@ FieldScripts.__index = FieldScripts
 -- environment inside the loader regardless of this callback.
 local function trustedRequire(name)
   return require(name)
+end
+
+-- The naming screen carries its own message bank: `NamingScreen_SetDefaultName`
+-- (src/naming_screen.c) reads FIRST_DEFAULT_NAME_RIVAL from bank 254 when the
+-- player commits an empty rival name -- row 84 under HEARTGOLD and row 85
+-- otherwise. Reading the bank needs no map header or field script bank, so the
+-- producer lists it explicitly.
+local NAMING_SCREEN_MESSAGE_BANK_ID = 254
+local RIVAL_DEFAULT_NAME_HEARTGOLD_MESSAGE_ID = 84
+local RIVAL_DEFAULT_NAME_SOULSILVER_MESSAGE_ID = 85
+
+-- The generated default-name row the selected edition reads. The retail split
+-- is compile-time (`#ifdef HEARTGOLD`), so every non-HeartGold edition reads
+-- the 85 row.
+---@param versionId string
+---@return integer
+local function rivalDefaultNameMessageId(versionId)
+  if versionId == "heartgold" then
+    return RIVAL_DEFAULT_NAME_HEARTGOLD_MESSAGE_ID
+  end
+  return RIVAL_DEFAULT_NAME_SOULSILVER_MESSAGE_ID
+end
+
+-- Read one generated message as display text with scoped bank ownership: the
+-- bank is released after a successful read and also released before rethrowing
+-- the provider's original fault, so a missing bank or row surfaces its
+-- structured error instead of a substitute literal.
+---@param provider FieldMessageProvider
+---@param bankId integer
+---@param messageId integer
+---@return string
+local function scopedMessageText(provider, bankId, messageId)
+  local acquired, acquireErr = provider:acquireBank(bankId)
+  if not acquired then
+    error(acquireErr, 0)
+  end
+  local template, templateErr = provider:get(bankId, messageId)
+  if not template then
+    provider:releaseBank(bankId)
+    error(templateErr, 0)
+  end
+  provider:releaseBank(bankId)
+  return template.text
+end
+
+-- The generated default name the naming screen stores for an empty entry. The
+-- naming task asks for it once, when rival naming starts, so the bank read
+-- stays lazy: a composition that never runs rival naming never acquires the
+-- naming screen's bank, and a missing bank or row surfaces the provider's
+-- structured error instead of a literal.
+---@param provider FieldMessageProvider
+---@param versionId string
+---@return fun(): string
+local function rivalDefaultNameResolver(provider, versionId)
+  local messageId = rivalDefaultNameMessageId(versionId)
+  local function resolveDefaultName()
+    return scopedMessageText(provider, NAMING_SCREEN_MESSAGE_BANK_ID, messageId)
+  end
+  return resolveDefaultName
 end
 
 -- opts.overrideFs: love.filesystem-shaped read access for the repo
@@ -371,7 +519,7 @@ function FieldScripts.new(opts)
     },
     seed = opts.seedText or opts.cacheFs.versionId,
   })
-  local player = playerFacade(opts.player)
+  local player = playerFacade(opts.player, opts.fontDef.charmap)
   -- The real player profile (gender and name) is wired when the game owns
   -- one; without it, profile-dependent operations fault instead of
   -- fabricating values.
@@ -462,6 +610,42 @@ function FieldScripts.new(opts)
     controller = opts.signpost,
     resolveMessage = resolveMessage,
   })
+  -- The source floor box: one non-modal window whose lifetime is the script
+  -- variable the command names. The host observes that variable each script
+  -- tick and on field teardown; the scheduler-facing service adds the live map
+  -- whose floor label applies and the calling script's buffered text, which the
+  -- ordinary floor label substitutes into its message.
+  local function floorWindowGetVar(id)
+    return worldState:getVar(id)
+  end
+  local function floorWindowResolveMessage(ref, textArgs)
+    return dialogueHost:resolveMessage(ref, {}, textArgs)
+  end
+  local floorWindowHost = FieldFloorWindow.new({
+    getVar = floorWindowGetVar,
+    resolveMessage = floorWindowResolveMessage,
+  })
+
+  -- The transient source money window and its script facade. The box borrows
+  -- the live profile for the displayed balance; the facade moves that same
+  -- profile. Without a profile no facade is synthesized, so money commands
+  -- keep their missing-service fault instead of writing a scratch wallet.
+  local moneyBox = FieldMoneyBox.new({
+    profile = opts.profile,
+    messages = opts.messageProvider,
+  })
+  local moneyService = nil
+  if opts.profile ~= nil then
+    moneyService = MoneyService.new(opts.profile, moneyBox)
+  end
+
+  -- The generated rival default name is wired only when the runtime knows the
+  -- selected edition: without one there is no row to read, and the naming task
+  -- keeps its missing-service fault.
+  local rivalDefaultName = nil
+  if opts.versionId ~= nil then
+    rivalDefaultName = rivalDefaultNameResolver(opts.messageProvider, opts.versionId)
+  end
 
   ---@class FieldScriptsPlatform: FieldScripts
   ---@field initController MapInitScriptController
@@ -481,6 +665,8 @@ function FieldScripts.new(opts)
     player = player,
     mapSource = opts.sourceMap,
     propAnimations = opts.propAnimations,
+    moneyBox = moneyBox,
+    floorWindow = floorWindowHost,
   }, FieldScripts)
   if opts.propAnimations ~= nil then
     opts.propAnimations:bindMap(opts.sourceMap)
@@ -518,6 +704,7 @@ function FieldScripts.new(opts)
 
   local scheduler
   local function advanceAsync()
+    floorWindowHost:poll()
     opts.auxiliaryUi:advance()
     dialogueHost:advance(scheduler:currentInput())
     -- The signpost controller is pure and fixed-tick: exactly one step per
@@ -527,6 +714,19 @@ function FieldScripts.new(opts)
   local function resolveComposition(id)
     return composition:effective(id)
   end
+  -- The scheduler-facing floor-box service adds the live map whose floor label
+  -- table applies to the placement the command names, and the script's buffered
+  -- text the floor label message expands.
+  local function floorWindowShow(_, request)
+    floorWindowHost:show({
+      map = platform.mapSource.mapSymbol,
+      tileX = request.tileX,
+      tileY = request.tileY,
+      floor = request.floor,
+      textArgs = request.textArgs or {},
+      result = request.result,
+    })
+  end
   scheduler = Scheduler.new({
     services = {
       world = worldState,
@@ -534,6 +734,8 @@ function FieldScripts.new(opts)
       player = player,
       dialogue = dialogueHost,
       maps = mapsService,
+      clock = opts.clock,
+      floorWindow = { show = floorWindowShow },
       overworld = opts.overworld,
       propAnimations = opts.propAnimations,
       -- Optional backends: an absent service faults the operation that
@@ -564,12 +766,15 @@ function FieldScripts.new(opts)
       starterChoice = opts.starterChoice,
       partySelection = opts.partySelection,
       mart = opts.mart,
+      money = moneyService,
       travel = opts.travel,
+      gameStats = opts.gameStats,
       fieldMoves = opts.fieldMoves,
       fieldMoveAftermath = opts.fieldMoveAftermath,
       sweetScent = opts.sweetScent,
       fieldMoveCue = FieldMoveCue.new(),
       monNaming = opts.monNaming,
+      rivalDefaultName = rivalDefaultName,
       followingMon = opts.followingMon,
       celebiCinematic = opts.celebiCinematic,
       legendCutscene = opts.legendCutscene,
@@ -586,11 +791,15 @@ function FieldScripts.new(opts)
       pcApplications = opts.pcApplications,
       pcTerminal = opts.pcTerminal,
       pokegearApplications = opts.pokegearApplications,
+      phoneCalls = opts.phoneCalls,
       phoneContactIndex = opts.phoneContactIndex,
       pokegearState = opts.pokegearState,
       phoneGifts = opts.phoneGifts,
       radioMusic = opts.radioMusic,
       battle = opts.battle,
+      gameVersion = opts.versionId,
+      versionId = opts.versionId,
+      sysInfo = opts.sysInfo,
       easyChatService = easyChatService,
       easyChatScriptHost = opts.easyChatScriptHost,
       advanceAsync = advanceAsync,
@@ -639,11 +848,14 @@ local function rebindMapContext(self, sourceMap)
 end
 
 -- Rebind the facade and warp source after a map swap (the player and the
--- current map are replaced by the transition).
+-- current map are replaced by the transition). The transient source money
+-- window belongs to the map that opened it, so a swap closes it exactly once
+-- before the destination map publishes.
 ---@param player FieldPlayer
 ---@param sourceMap RuntimeFieldMap
 function FieldScripts:onMapSwap(player, sourceMap)
   self.player:setPlayer(player)
+  self.moneyBox:dispose()
   rebindMapContext(self, sourceMap)
 end
 

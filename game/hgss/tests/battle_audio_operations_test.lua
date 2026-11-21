@@ -210,6 +210,8 @@ local function validEntry(versionId)
     },
     fieldTravel = { lastHealSpawn = "SPAWN_NEW_BARK" },
     fashionCase = require("libs.hgss.src.save.FashionCaseState").empty(),
+    sysInfo = require("libs.hgss.src.save.SysInfoState").empty(),
+    fieldPoison = require("libs.hgss.src.save.FieldPoisonSave").initial(),
     playTime = PlayTime.new(),
     worldState = FieldEventState.new(),
     mons = require("tests.support.MonBucket").emptyForVersion(versionId),
@@ -290,6 +292,7 @@ local function bindEnvelope(runtime, versionId, measurement, audio)
   local doubles = { audio = audio, windows = recordingWindows(), text = recordingText() }
   doubles.leaves = selectedLeafHost()
   local envelope = FieldBattlePresentation.new({
+    splRandomState = { state = 0 },
     cacheFs = CacheFs.forVersion(versionId),
     windows = doubles.windows,
     text = doubles.text,
@@ -778,6 +781,7 @@ local function bootColdEnvelope()
   end
   local cache = CacheFs.forVersion("heartgold", FakeCache.new())
   local envelope = FieldBattlePresentation.new({
+    splRandomState = { state = 0 },
     cacheFs = cache,
     windows = recordingWindows(),
     text = recordingText(),

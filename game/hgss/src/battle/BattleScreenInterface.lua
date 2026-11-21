@@ -60,8 +60,17 @@ local function childRegions(child)
     return nil
   end
   local native = child.native --[[@as table<string, unknown>?]]
+  -- The native roster resolves through the full-surface native tap:
+  -- wrapper pages own their transcribed hitbox regions instead, since
+  -- the child answers wrapper taps by stable identity, not coordinates.
+  local wrapperPage = type(child.partyPage) == "string" and child.partyPage or nil
+  local isWrapper = wrapperPage == "mon_menu"
+    or wrapperPage == "summary"
+    or wrapperPage == "moves"
+    or wrapperPage == "move_detail"
   if
-    (child.kind == "bag" or child.kind == "party" or child.kind == "target")
+    not isWrapper
+    and (child.kind == "bag" or child.kind == "party" or child.kind == "target")
     and type(native) == "table"
     and type(native.layout) == "table"
   then
@@ -72,6 +81,22 @@ local function childRegions(child)
   end
   if child.kind == "bag" and child.empty ~= true then
     return retailBagHitRegions(child)
+  end
+  -- Wrapper pages resolve through their transcribed hitbox regions
+  -- with the shared cancel rect; without resolved regions taps name
+  -- nothing instead of inventing modal rows.
+  if isWrapper then
+    local regions = child.pageRegions --[[@as table<integer, table<string, unknown>>?]]
+    if type(regions) ~= "table" then
+      return nil
+    end
+    return regions
+  end
+  -- The native renderer paints the roster through the staged layout,
+  -- so list taps ride the native hit path alone: without it taps name
+  -- nothing instead of inventing modal rows.
+  if child.kind == "party" or child.kind == "target" then
+    return nil
   end
   local regions = {}
   local rows = child.rows --[[@as table<integer, table<string, unknown>>?]]
@@ -231,6 +256,10 @@ local function regionsFor(view)
     return targetRegions(view)
   elseif mode == "child" then
     return childRegions(view.childView --[[@as table<string, unknown>?]])
+  elseif mode == "shift" or mode == "use-next" then
+    -- The held Shift offer and the wild replacement offer answer through
+    -- the source Yes/No planes behind their staged questions.
+    return BattleMenuRegions.forLayout("two-option")
   end
   return nil
 end
@@ -248,8 +277,22 @@ local function scopeFor(view)
     if child.kind == "learn" and type(child.confirmation) == "table" then
       return "two-option"
     end
+  elseif mode == "shift" or mode == "use-next" then
+    return "two-option"
   end
   return "command"
+end
+
+-- Prompt answers keep their own input scope while drawing the shared
+-- source two-option planes: each offer settles through its own mode.
+---@param view table<string, unknown>
+---@return string input scope behind the current mode
+local function inputScopeFor(view)
+  local mode = view.mode
+  if mode == "shift" or mode == "use-next" then
+    return mode --[[@as string]]
+  end
+  return scopeFor(view)
 end
 
 ---@param event table<string, unknown> session-inverted logical input
@@ -266,13 +309,17 @@ local function mapPointer(event, view, regions)
     if region == nil then
       return nil
     end
-    return { type = "battle_press", control = { scope = scopeFor(view), id = region.id }, pointerId = event.pointerId }
+    return {
+      type = "battle_press",
+      control = { scope = inputScopeFor(view), id = region.id },
+      pointerId = event.pointerId,
+    }
   end
   if eventType == "pointer_move" and type(event.x) == "number" and type(event.y) == "number" then
     local region = hitRegion(regions, event.x --[[@as number]], event.y --[[@as number]])
     local control = nil
     if region ~= nil then
-      control = { scope = scopeFor(view), id = region.id }
+      control = { scope = inputScopeFor(view), id = region.id }
     end
     return { type = "battle_slide", control = control, pointerId = event.pointerId }
   end
@@ -280,7 +327,7 @@ local function mapPointer(event, view, regions)
     local region = hitRegion(regions, event.x --[[@as number]], event.y --[[@as number]])
     local control = nil
     if region ~= nil then
-      control = { scope = scopeFor(view), id = region.id }
+      control = { scope = inputScopeFor(view), id = region.id }
     end
     return { type = "battle_activate", control = control, pointerId = event.pointerId }
   end
@@ -339,10 +386,14 @@ local function renderBattle(resources, view, plan)
   local graphics = assert(resources.graphics, "the battle render borrows its host graphics")
   local panes = assert(plan.panes, "the battle plan carries its panes")
   for _, pane in ipairs(panes) do
-    local placement = assert(pane.placement, "battle panes carry placements")
-    LogicalSurface.draw(graphics, placement, function()
-      BattleRenderer.drawPane(resources, view, pane.id --[[@as string]], plan.content, placement)
-    end)
+    if os.getenv("PORTEMON_PROBE_PANES") == "21" and pane.id == "detail" then
+      -- Skip the detail pane: isolate the interaction render.
+    else
+      local placement = assert(pane.placement, "battle panes carry placements")
+      LogicalSurface.draw(graphics, placement, function()
+        BattleRenderer.drawPane(resources, view, pane.id --[[@as string]], plan.content, placement)
+      end)
+    end
   end
 end
 

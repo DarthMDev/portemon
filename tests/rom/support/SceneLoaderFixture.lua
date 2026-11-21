@@ -168,9 +168,10 @@ function SceneLoaderFixture.newHarness(versionId, opts)
       end
       return true
     end,
-    transitionEnvironment = function(_, mapId)
+    requestTransitionEnvironment = function(_, mapId)
       local map = assert(maps[mapId], "map " .. tostring(mapId))
-      return assert(map.fieldData.transitionEnvironment, "map transition environment " .. tostring(mapId))
+      local environment = assert(map.fieldData.transitionEnvironment, "map transition environment " .. tostring(mapId))
+      return true, environment
     end,
     protectMap = function() end,
   }
@@ -249,6 +250,9 @@ function SceneLoaderFixture.newHarness(versionId, opts)
   local actors = {
     beginFixedStep = function() end,
     step = function() end,
+    takeCommittedSteps = function()
+      return nil
+    end,
     cameraTargetId = function()
       return nil
     end,

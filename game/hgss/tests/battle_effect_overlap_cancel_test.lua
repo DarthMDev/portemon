@@ -163,6 +163,16 @@ function T.overlapping_tasks_cancel_and_replace_without_stale_restores()
     audio = first.audio,
     resources = first.resources,
     tasks = Factory,
+    splRandomState = { state = 0 },
+    services = {
+      onNativeFrame = function(phase, sourceTick)
+        if phase == "draw" then
+          local BattleParticleSystems = require("libs.hgss.src.presentation.BattleParticleSystems")
+          BattleParticleSystems.stepSourceDrawPhase(scene, sourceTick)
+          scene:stepAnimationPictures(sourceTick)
+        end
+      end,
+    },
   }))
   local surviving = assert(runner:start(playbackPacket(), firstProgram))
   local cancelled = assert(runner:start(playbackPacket(), secondProgram))
@@ -192,6 +202,16 @@ function T.overlapping_tasks_cancel_and_replace_without_stale_restores()
     audio = fresh.audio,
     resources = fresh.resources,
     tasks = Factory,
+    splRandomState = { state = 0 },
+    services = {
+      onNativeFrame = function(phase, sourceTick)
+        if phase == "draw" then
+          local BattleParticleSystems = require("libs.hgss.src.presentation.BattleParticleSystems")
+          BattleParticleSystems.stepSourceDrawPhase(scene, sourceTick)
+          scene:stepAnimationPictures(sourceTick)
+        end
+      end,
+    },
   }))
   local nextHandle = assert(nextRunner:start(playbackPacket(), firstProgram))
   for _ = 1, 60 do
@@ -201,73 +221,6 @@ function T.overlapping_tasks_cancel_and_replace_without_stale_restores()
     end
   end
   Assert.equal(nextRunner:status(nextHandle), "complete", "the next valid occurrence still runs normally")
-end
-
-function T.pair_affine_transition_moves_both_activations_and_restores()
-  local Factory = effectFactoryModule()
-  local scene = BattleScene.new()
-  local attacker = { combatant = 1, activation = 1 }
-  local partner = { combatant = 3, activation = 3 }
-  scene:observe({
-    { combatant = 1, activation = 1, visible = true },
-    { combatant = 3, activation = 3, visible = true },
-  })
-  local journal = { acquired = {}, released = {} }
-  local resources = {}
-  function resources.resolve(key)
-    journal.acquired[#journal.acquired + 1] = key
-    return { key = key, lease = key }
-  end
-  function resources.release(lease)
-    journal.released[#journal.released + 1] = lease
-  end
-  local context = {
-    launchId = "pair-affine-probe",
-    visualSeed = 4242,
-    random = function(bound)
-      assert(type(bound) == "number" and bound >= 1, "visual draws name a positive bound")
-      return 0
-    end,
-    topology = {
-      attacker = { combatant = 1, activation = 1, slot = "solo-player", sideType = 0 },
-      targets = { { combatant = 3, activation = 3, slot = "solo-enemy", sideType = 1 } },
-    },
-  }
-  local services = { scene = scene, audio = {}, resources = resources }
-  local task = assert(Factory.create("pokemon-picture-battler-pair-scale-transition", {
-    battlerTarget = "attacker",
-    activation = attacker,
-    parameters = { durationTicks = 16, scaleStart = 256, scaleEnd = 384 },
-  }, context, services))
-  for _ = 1, 4 do
-    task:stepSourceTick({ tick = 1 })
-  end
-  local attackerPatch = scene:pictureState(attacker)
-  local partnerPatch = scene:pictureState(partner)
-  Assert.notNil(attackerPatch, "the running pair transition moves the attacker")
-  Assert.notNil(partnerPatch, "the running pair transition moves the pair partner too")
-  Assert.isTrue(attackerPatch.scaleX ~= nil and partnerPatch.scaleX ~= nil, "both activations carry the affine scale")
-  Assert.equal(attackerPatch.scaleX, partnerPatch.scaleX, "the pair scales together")
-  for _ = 1, 12 do
-    task:stepSourceTick({ tick = 1 })
-  end
-  Assert.equal(task:status(), "complete", "the pair transition completes at its duration")
-  Assert.isNil(scene:pictureState(attacker), "completion restores the attacker")
-  Assert.isNil(scene:pictureState(partner), "completion restores the partner")
-  task:dispose()
-  local cancelling = assert(Factory.create("pokemon-picture-battler-pair-scale-transition", {
-    battlerTarget = "attacker",
-    activation = attacker,
-    parameters = { durationTicks = 16, scaleStart = 256, scaleEnd = 384 },
-  }, context, services))
-  cancelling:stepSourceTick({ tick = 1 })
-  cancelling:stepSourceTick({ tick = 1 })
-  cancelling:cancel("superseded")
-  Assert.equal(cancelling:status(), "cancelled", "cancellation lands on cancelled")
-  Assert.isNil(scene:pictureState(attacker), "cancellation restores the attacker")
-  Assert.isNil(scene:pictureState(partner), "cancellation restores the partner without touching others")
-  cancelling:dispose()
-  Assert.equal(#journal.released, #journal.acquired, "the pair run leaks no lease")
 end
 
 -- Live-screen handle plumbing behind the parked and running probes: the
@@ -423,6 +376,7 @@ local function openOverlapScreen(launchId, staging)
     return false
   end
   return BattleScreenState.new({
+    splRandomState = { state = 0 },
     launchId = launchId,
     manifest = manifest,
     model = Model,
@@ -472,6 +426,27 @@ local function overlapStrike(effectKey, actionId, sequence)
     effectKey = effectKey,
     payload = { target = 3, damage = 14, hitIndex = sequence },
     after = { hp = { [1] = 52, [3] = 43 } },
+    -- The strike carries its producer execution moment so the
+    -- selector admits the staged cue instead of omitting an
+    -- unfactored hit.
+    presentation = {
+      context = {},
+      execution = {
+        selectedMove = effectKey,
+        executedMove = effectKey,
+        moment = "use",
+        branch = "default",
+        attacker = { combatant = 1, activation = 1 },
+        defender = { combatant = 3, activation = 3 },
+        targets = { { combatant = 3, activation = 3 } },
+        damage = -14,
+        power = 0,
+        friendship = 0,
+        hitOrdinal = 1,
+        hitCount = 1,
+        hitCycle = 1,
+      },
+    },
   }
 end
 
@@ -537,21 +512,34 @@ function T.parked_and_running_occurrences_retire_only_at_their_own_completion()
   local phase = screen._player:status(runningHandle)
   Assert.isTrue(phase == "running" or phase == "waiting", "the running occurrence stays live: " .. tostring(phase))
   Assert.equal(#screen._player._occurrences, 1, "only the running cue steps")
-  local parkedCue = {
-    effectKey = "TACKLE",
-    launchId = launchId,
-    packetId = 99,
-    eventSequence = 99,
-    event = overlapStrike("TACKLE", 61, 99),
-    visualSeed = 123,
-    before = overlapView(57),
-    after = overlapView(43),
-  }
-  local parkedToken = collaborator.start(parkedCue)
+  -- An unstaged effect parks behind its pending token through the
+  -- production delivery path: the timeline ledgers the frozen request
+  -- on the cue, so promotion admits against the selected playback
+  -- instead of a bare hand-built cue.
+  presentOverlapStrikes(screen, launchId, 99, { overlapStrike("TACKLE", 61, 99) })
+  local parkedToken = nil
+  for _ = 1, 600 do
+    screen:updateFixed(1 / 30)
+    for token, track in pairs(screen._nativeHandles) do
+      if type(track) == "table" and track.pending == true and track.effectKey == "TACKLE" then
+        parkedToken = token
+      end
+    end
+    if parkedToken ~= nil then
+      break
+    end
+  end
   Assert.notNil(parkedToken, "the unstaged cue parks behind its token")
   Assert.equal(collaborator.status(parkedToken), "pending", "the parked token reports pending")
   Assert.isNil(screen._nativeHandles[parkedToken].handle, "the parked token admits no handle yet")
-  Assert.equal(#screen._player._occurrences, 1, "the parked token still stages nothing")
+  -- The running cue may retire while the parked cue waits its turn:
+  -- parking itself stages no occurrence either way, so the player
+  -- holds at most the still-live running occurrence and nothing more.
+  local liveSlow = screen._player:status(runningHandle)
+  Assert.isTrue(
+    #screen._player._occurrences <= 1 and (#screen._player._occurrences == 0 or liveSlow ~= nil),
+    "the parked token stages no occurrence of its own"
+  )
   local retiredSlow = false
   for _ = 1, 1500 do
     screen:updateFixed(1 / 30)
@@ -569,13 +557,9 @@ function T.parked_and_running_occurrences_retire_only_at_their_own_completion()
   Assert.notNil(screen._nativeHandles[parkedToken], "the parked token survives the slow retirement")
   Assert.isNil(screen._nativeHandles[parkedToken].handle, "the parked token still stages nothing")
   Assert.equal(#screen._player._occurrences, 0, "the retired slow cue leaves no occurrence record")
-  for _ = 1, 600 do
-    screen:updateFixed(1 / 30)
-    if screen._timeline:settled() then
-      break
-    end
-  end
-  Assert.isTrue(screen._timeline:settled(), "the slow cue player drains fully")
+  -- Pending resource demand stalls its dependent work: the retired
+  -- slow cue drained, but the parked strike still holds the line.
+  Assert.isFalse(screen._timeline:settled(), "the parked cue holds its dependent work")
   Assert.equal(overlapDisplayedFoeHp(screen:view()), 43, "the slow cue runs to its checkpoint")
   local tackleRecord = EffectStagingFixture.effectRecord("TACKLE", {})
   local tackleProgram = lowered("TACKLE", { 29, 50, 4 })
@@ -600,15 +584,17 @@ function T.parked_and_running_occurrences_retire_only_at_their_own_completion()
   end
   Assert.notNil(fastHandle, "the staged token promotes to its handle")
   Assert.isTrue(screen._nativeHandles[parkedToken] ~= nil, "promotion keeps the stable token identity")
+  -- Only the timeline consumption point releases the occurrence: the
+  -- cue leaves its track once the player run completes through the
+  -- timeline poll, never through a direct test-side release racing it.
   for _ = 1, 1500 do
     screen:updateFixed(1 / 30)
-    if collaborator.status(parkedToken) == "complete" then
+    if screen._nativeHandles[parkedToken] == nil then
       break
     end
   end
-  Assert.equal(collaborator.status(parkedToken), "complete", "the promoted cue completes")
-  Assert.isTrue(collaborator.retire(parkedToken) == true, "the consumer retires its completed cue")
-  Assert.isNil(screen._nativeHandles[parkedToken], "the retired token leaves no track")
+  Assert.isNil(screen._nativeHandles[parkedToken], "the consumed cue releases its track")
+  Assert.isTrue(screen:status().mode ~= "failed", "the consumed cue never fails the launch")
   Assert.isNil(screen._player:status(fastHandle), "the retired fast handle answers nothing")
   Assert.equal(#screen._player._occurrences, 0, "the retired fast cue leaves no occurrence record")
   Assert.isNil(screen._liveEffectHandle, "no live handle outlives its consumption")

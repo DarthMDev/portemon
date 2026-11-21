@@ -55,6 +55,9 @@ Schema.ENUMS = {
   signpost_command = { "nop", "show", "wipe_out", "wipe_in", "hide" },
   mart_kind = { "standard", "special", "seal", "decoration", "athlete", "data_cards", "custom", "sell" },
   mart_query = { "athlete_available", "card_prefix" },
+  -- The source money family's two mutations and three box commands.
+  money_action = { "add", "subtract" },
+  money_box_action = { "show", "update", "hide" },
   pc_application = { "storage", "mailbox", "photoAlbum" },
   -- The foreground phone call direction across the shared menu/script
   -- application lane; numeric source selectors never appear past the
@@ -116,6 +119,10 @@ Schema.ENUMS = {
   -- Union avatar choice projections: the trainer class behind opcode 288
   -- or the native sprite behind 558.
   union_avatar_attribute = { "class", "sprite" },
+  -- Menu families a script builder may name. The touchscreen list family is
+  -- the historical default and keeps its absent discriminator; the foreground
+  -- multichoice family carries native window geometry.
+  menu_kind = { "multichoice" },
 }
 
 Schema.ACTOR_SPECIALS = { "player", "self", "last_talked", "partner", "camera_target" }
@@ -143,7 +150,10 @@ Schema.VALUES = {
   var = { fields = { id = { type = "string", required = true } } },
   ["local"] = { fields = { name = { type = "string", required = true } } },
   arg = { fields = { name = { type = "string", required = true } } },
-  flag_value = { fields = { flag = { type = "id_or_var", required = true } } },
+  -- Flag reads accept a value that resolves to a flag id, so a source
+  -- trainer number stays a live operand instead of a compile-time id.
+  flag_value = { fields = { flag = { type = "flag_id", required = true } } },
+  trainer_flag_id = { fields = { trainer = { type = "scalar_or_value", required = true } } },
   player_gender_value = { fields = {} },
   friend_sprite_value = { fields = {} },
   object_id = { fields = { ref = { type = "actor", required = true } } },
@@ -196,6 +206,10 @@ Schema.TEXT_VALUES = {
   trainer_class_name = { fields = { value = { type = "scalar_or_value", required = true } } },
   trainer_class_name_indefinite = { fields = { value = { type = "scalar_or_value", required = true } } },
   starter_species_name = { fields = {} },
+  -- The source storey label of one department-store floor, read from the
+  -- generated floor-label bank (src/message_format.c::BufferDeptStoreFloorNo):
+  -- floor 0 is the basement, floors 1..6 are 1F..6F.
+  dept_store_floor_no = { fields = { floor = { type = "integer", required = true } } },
   map_name = { fields = { value = { type = "scalar_or_value", required = true } } },
   easy_chat_word = {
     fields = {
@@ -383,14 +397,15 @@ Schema.OPERATIONS = {
   -- Staged foreground phone call setup: evaluates its operands and stores
   -- one pending source request on the calling script session without
   -- taking the feature lease or blocking. The run operation below consumes
-  -- it. Contact, direction, and kind accept evaluated value references so
-  -- intervening commands observe the staging order; runtime revalidates
-  -- evaluated enum operands against the closed vocabulary.
+  -- it. Contact, scripted marker, and predefined script identity accept
+  -- evaluated value references so intervening commands observe the staging
+  -- order. The source stores the caller parameters on the ring manager and
+  -- always launches the call as incoming, so no direction operand exists.
   phone_set_call = {
     fields = {
       contact = { type = "scalar_or_value", required = true },
-      direction = { type = "scalar_or_value", required = true },
-      kind = { type = "scalar_or_value", required = true },
+      scriptedCall = { type = "scalar_or_value", required = true },
+      callScriptID = { type = "scalar_or_value", required = true },
     },
   },
   -- Blocking foreground phone call run: consumes the pending request
@@ -495,6 +510,13 @@ Schema.OPERATIONS = {
     },
   },
   mom_gift_take = { fields = {} },
+  -- Mystery Gift queue query: this product distributes no Mystery Gifts, so
+  -- the source waiting-gift check always writes the FALSE convention.
+  mystery_gift_has_gift = {
+    fields = {
+      result = { type = "writable_value", required = true },
+    },
+  },
   -- Broadcast password service: writes the first of three consecutive
   -- password-word message entries and the winning choice index.
   buena_password = {
@@ -608,8 +630,8 @@ Schema.OPERATIONS = {
     },
   },
   next = { fields = {} },
-  set_flag = { fields = { flag = { type = "id_or_var", required = true } } },
-  clear_flag = { fields = { flag = { type = "id_or_var", required = true } } },
+  set_flag = { fields = { flag = { type = "flag_id", required = true } } },
+  clear_flag = { fields = { flag = { type = "flag_id", required = true } } },
   set_var = {
     fields = {
       variable = { type = "id_or_var", required = true },
@@ -743,7 +765,7 @@ Schema.OPERATIONS = {
       appearance = { type = "string", default = "trainer_tip" },
     },
   },
-  -- Opcode 61 (ScrCmd_061, std_signpost's hide-branch tail): no operands.
+  -- Opcode 61 (ScrCmd_ReopenStartMenuOnEnd, std_signpost's hide-branch tail): no operands.
   -- Ends the script context and requests the Start Menu reopen hook
   -- through the startMenuReopen service; a missing service is an
   -- attributed fault, never a silent close.
@@ -795,6 +817,11 @@ Schema.OPERATIONS = {
   -- use `choose`; these preserve the source protocol's message-bank details.
   menu_begin = {
     fields = {
+      -- Absent for the auxiliary touchscreen list family; the foreground
+      -- multichoice family names its native tile position.
+      kind = { type = "enum:menu_kind" },
+      tileX = { type = "integer" },
+      tileY = { type = "integer" },
       messageSource = { type = "serializable", required = true },
       initialCursor = { type = "integer", required = true },
       cancellable = { type = "boolean", required = true },
@@ -808,11 +835,17 @@ Schema.OPERATIONS = {
   menu_add = {
     fields = {
       messageId = { type = "scalar_or_value", required = true },
-      vanillaMetadata = { type = "scalar_or_value", required = true },
+      -- The list family's help-message selector; the foreground multichoice
+      -- family has no item help metadata and leaves it absent.
+      vanillaMetadata = { type = "scalar_or_value" },
       value = { type = "scalar_or_value", required = true },
     },
   },
   menu_exec = { fields = {} },
+  -- ScrCmd_MultichoiceSetAnchorRight: the anchor selector for the pending
+  -- foreground builder. The source command returns TRUE, so the operation
+  -- itself is a run-phase boundary.
+  menu_anchor_right = { fields = { enabled = { type = "boolean", required = true } } },
   buffer_text = {
     fields = {
       slot = { type = "buffer_slot", required = true },
@@ -858,13 +891,14 @@ Schema.OPERATIONS = {
   set_object_facing = {
     fields = {
       actor = { type = "actor", required = true },
-      direction = { type = "enum:direction", required = true },
+      direction = { type = "direction_or_value", required = true },
     },
   },
   set_object_movement_type = {
     fields = {
       actor = { type = "actor", required = true },
       movementType = { type = "string", required = true },
+      changeMovement = { type = "boolean" },
     },
   },
   get_player_coords = {
@@ -994,6 +1028,34 @@ Schema.OPERATIONS = {
   weekday = { fields = { result = { type = "id_or_var", required = true } } },
   discard_value = { fields = { value = { type = "scalar_or_value", required = true } } },
   trainer_card_stars = { fields = { result = { type = "id_or_var", required = true } } },
+  -- The source money family (scrcmd_money.c) moves the one live profile
+  -- wallet, reports affordability into a result variable, and drives the
+  -- transient source money window. Amounts and box coordinates are source
+  -- integers or value references; the money family validates the operand
+  -- shapes its actions allow (Validator).
+  money_change = {
+    fields = {
+      action = { type = "enum:money_action", required = true },
+      amount = { type = "scalar_or_value", required = true },
+    },
+  },
+  money_check = {
+    fields = {
+      amount = { type = "scalar_or_value", required = true },
+      result = { type = "writable_value", required = true },
+    },
+  },
+  money_box = {
+    fields = {
+      action = { type = "enum:money_box_action", required = true },
+      tileX = { type = "scalar_or_value" },
+      tileY = { type = "scalar_or_value" },
+    },
+  },
+  -- The source AddSpecialGameStat command (opcode 515): the node names one
+  -- score event from the game-stats owner's authoritative table and the
+  -- owner resolves its weight, so no script carries a score amount.
+  game_score_event = { fields = { event = { type = "integer", required = true } } },
   prop_animation_load = {
     fields = {
       fieldX = { type = "scalar_or_value", required = true },
@@ -1024,6 +1086,38 @@ Schema.OPERATIONS = {
       direction = { type = "enum:direction", required = true },
     },
   },
+  set_dynamic_warp = {
+    fields = {
+      map = { type = "scalar_or_value", required = true },
+      warpId = { type = "scalar_or_value", required = true },
+      fieldX = { type = "scalar_or_value", required = true },
+      fieldZ = { type = "scalar_or_value", required = true },
+      direction = { type = "direction_or_value", required = true },
+    },
+  },
+  get_dynamic_warp_floor = { fields = { result = { type = "value", required = true } } },
+  move_warp_event = {
+    fields = {
+      warpId = { type = "scalar_or_value", required = true },
+      fieldX = { type = "scalar_or_value", required = true },
+      fieldZ = { type = "scalar_or_value", required = true },
+    },
+  },
+  floor_window_show = {
+    fields = {
+      tileX = { type = "integer", required = true },
+      tileY = { type = "integer", required = true },
+      floor = { type = "scalar_or_value", required = true },
+      result = { type = "value", required = true },
+    },
+  },
+  elevator_anim = {
+    fields = {
+      direction = { type = "scalar_or_value", required = true },
+      length = { type = "scalar_or_value", required = true },
+    },
+  },
+  field_clock_hour = { fields = { result = { type = "value", required = true } } },
   shake_camera = {
     fields = {
       amplitudeX = { type = "number", required = true },
@@ -1607,6 +1701,13 @@ Schema.OPERATIONS = {
       result = { type = "value", required = true },
     },
   },
+  -- Rival naming blocks the parent script on the shared field naming screen
+  -- and returns the source no-input result to the destination variable.
+  rival_naming = {
+    fields = {
+      result = { type = "value", required = true },
+    },
+  },
   -- Field-task request. The pending form claims the runtime-owned queue
   -- for the menu-to-field builtin; the explicit form carries a source
   -- move key plus the zero-based mon slot for source lowering. No
@@ -1682,6 +1783,14 @@ Schema.OPERATIONS = {
   },
   follower_transition = { fields = {} },
   follower_recall = { fields = {} },
+  follower_move_to_player = { fields = {} },
+  game_version = {
+    fields = {
+      result = { type = "value", required = true },
+    },
+  },
+  set_mystery_gift_active = { fields = {} },
+  load_event_sound_effects = { fields = {} },
   -- Field-move cue operations. The cut-in blocks until the cue service
   -- reports its blocking cue finished; the effect cue clears the done
   -- variable and the service completes it, the script only polls it.
@@ -2031,7 +2140,7 @@ Schema.CONSTRUCTORS = {
       {
         signature = "S.phoneSetCall(spec)",
         canonical = "op=phone_set_call",
-        notes = "spec={contact,direction,kind}; direction is incoming or outgoing, kind is ordinary, rematch, predefined, or incoming. Each operand accepts an evaluated value reference.",
+        notes = "spec={contact,scriptedCall,callScriptID}; the source caller number, its isScriptedCall marker (2 opens the caller's map-script branch) and predefined phone-script identity. The launch is always incoming. Each operand accepts an evaluated value reference.",
       },
       {
         signature = "S.phoneRunCall(spec=nil)",
